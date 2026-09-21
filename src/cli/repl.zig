@@ -4,12 +4,12 @@
 //! and database management commands.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const compat = @import("compat");
 const lattice = @import("lattice");
 const output = @import("output.zig");
 const args_mod = @import("args.zig");
 const history_mod = @import("history.zig");
+const key_mod = @import("key.zig");
+const term = @import("term.zig");
 
 const Database = lattice.storage.database.Database;
 const QueryResult = lattice.storage.database.QueryResult;
@@ -28,125 +28,44 @@ const LineReadAction = enum {
     eof,
 };
 
-/// Puts the terminal in raw mode for the duration of a line edit, so the
-/// editor sees each keystroke instead of a finished line.
-const RawTerminalMode = if (builtin.os.tag == .windows) WindowsRawMode else PosixRawMode;
-
-const PosixRawMode = struct {
-    enabled: bool = false,
-    original: std.posix.termios = undefined,
-
-    fn enableIfTty() !PosixRawMode {
-        if (!stdinIsTty()) {
-            return .{};
-        }
-
-        const original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
-        var raw = original;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        // Keep ISIG enabled so Ctrl-C still behaves as expected.
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
-        return .{
-            .enabled = true,
-            .original = original,
-        };
-    }
-
-    fn restore(self: *PosixRawMode) void {
-        if (!self.enabled) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
-        self.enabled = false;
-    }
-};
-
-/// Console flags and calls Windows needs for the same job. `std.os.windows`
-/// spells out the output-side flag but neither the input flags nor the two
-/// console mode calls, so they are declared here.
-const win = struct {
-    const windows = std.os.windows;
-
-    const ENABLE_LINE_INPUT: windows.DWORD = 0x0002;
-    const ENABLE_ECHO_INPUT: windows.DWORD = 0x0004;
-    const ENABLE_VIRTUAL_TERMINAL_INPUT: windows.DWORD = 0x0200;
-
-    extern "kernel32" fn GetConsoleMode(handle: windows.HANDLE, mode: *windows.DWORD) callconv(.winapi) windows.BOOL;
-    extern "kernel32" fn SetConsoleMode(handle: windows.HANDLE, mode: windows.DWORD) callconv(.winapi) windows.BOOL;
-
-    /// The current console mode, or null when the handle is not a console.
-    fn getMode(handle: windows.HANDLE) ?windows.DWORD {
-        var mode: windows.DWORD = 0;
-        if (!GetConsoleMode(handle, &mode).toBool()) return null;
-        return mode;
-    }
-
-    fn setMode(handle: windows.HANDLE, mode: windows.DWORD) bool {
-        return SetConsoleMode(handle, mode).toBool();
-    }
-};
-
-const WindowsRawMode = struct {
-    enabled: bool = false,
-    original_input: win.windows.DWORD = 0,
-    original_output: win.windows.DWORD = 0,
-    output_changed: bool = false,
-
-    fn enableIfTty() !WindowsRawMode {
-        const input = compat.fs.stdin().handle();
-        // Doubles as the tty check: a redirected stdin has no console mode.
-        const original_input = win.getMode(input) orelse return .{};
-
-        // Line assembly and echo become our job, and virtual terminal input
-        // delivers the arrow keys as the escape sequences the editor parses.
-        var raw = original_input & ~(win.ENABLE_LINE_INPUT | win.ENABLE_ECHO_INPUT);
-        raw |= win.ENABLE_VIRTUAL_TERMINAL_INPUT;
-        if (!win.setMode(input, raw)) return .{};
-
-        var self = WindowsRawMode{ .enabled = true, .original_input = original_input };
-
-        // The editor redraws the line with ANSI escapes, which the classic
-        // console swallows until it is told to interpret them.
-        const out = compat.fs.stdoutFile().handle();
-        if (win.getMode(out)) |original_output| {
-            const with_vt = original_output | win.windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            if (with_vt != original_output and win.setMode(out, with_vt)) {
-                self.original_output = original_output;
-                self.output_changed = true;
-            }
-        }
-
-        return self;
-    }
-
-    fn restore(self: *WindowsRawMode) void {
-        if (!self.enabled) return;
-        _ = win.setMode(compat.fs.stdin().handle(), self.original_input);
-        if (self.output_changed) {
-            _ = win.setMode(compat.fs.stdoutFile().handle(), self.original_output);
-        }
-        self.enabled = false;
-    }
-};
-
-fn stdinIsTty() bool {
-    return compat.fs.stdin().isTty();
+/// One byte from standard input, whatever the platform calls that.
+fn readByteStdin() !?u8 {
+    var source = term.Source{};
+    return source.readByte();
 }
 
-fn readByteStdin() !?u8 {
-    var buf: [1]u8 = undefined;
-    while (true) {
-        const n = compat.fs.stdin().readSome(&buf) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => return err,
-        };
-        if (n != 0) return buf[0];
+/// Where the character before `cursor` starts.
+///
+/// Continuation bytes have their top two bits set to 10, so walking back over
+/// them lands on the byte that begins the character. Stepping back one byte
+/// instead would leave the cursor inside a character and corrupt it on the next
+/// edit.
+fn prevCharBoundary(line: []const u8, cursor: usize) usize {
+    if (cursor == 0) return 0;
+    var i = cursor - 1;
+    while (i > 0 and line[i] & 0xc0 == 0x80) i -= 1;
+    return i;
+}
+
+/// Where the character at `cursor` ends.
+fn nextCharBoundary(line: []const u8, cursor: usize) usize {
+    if (cursor >= line.len) return line.len;
+    const len = std.unicode.utf8ByteSequenceLength(line[cursor]) catch 1;
+    return @min(cursor + len, line.len);
+}
+
+/// How many terminal columns `slice` occupies.
+///
+/// Counted as characters rather than bytes, because that is what the terminal
+/// moves the cursor by. Characters that draw two columns wide — CJK, some
+/// emoji — still count as one here, so the cursor can sit a column out on those;
+/// correcting it needs a width table, which is a larger piece of work than this.
+fn columnCount(slice: []const u8) usize {
+    var n: usize = 0;
+    for (slice) |b| {
+        if (b & 0xc0 != 0x80) n += 1;
     }
+    return n;
 }
 
 fn readLineFromStdin(line_buf: *ManagedArrayList(u8), max_len: usize) !void {
@@ -161,6 +80,12 @@ fn readLineFromStdin(line_buf: *ManagedArrayList(u8), max_len: usize) !void {
     return error.StreamTooLong;
 }
 
+/// Drop `line[from..to]`, which is one character's worth of bytes.
+fn removeRange(line_buf: *ManagedArrayList(u8), from: usize, to: usize) void {
+    var i = from;
+    while (i < to) : (i += 1) _ = line_buf.orderedRemove(from);
+}
+
 fn setLineBuffer(line_buf: *ManagedArrayList(u8), value: []const u8) !void {
     line_buf.items.len = 0;
     try line_buf.appendSlice(value);
@@ -173,7 +98,8 @@ fn refreshInputLine(stdout: anytype, prompt: []const u8, line: []const u8, curso
     try stdout.writeAll("\x1b[K");
 
     if (cursor <= line.len) {
-        const move_left = line.len - cursor;
+        // In columns, not bytes: a multi-byte character is one column.
+        const move_left = columnCount(line[cursor..]);
         if (move_left > 0) {
             try stdout.print("\x1b[{d}D", .{move_left});
         }
@@ -317,7 +243,7 @@ pub const Repl = struct {
         const prompt = promptFor(in_multiline);
         line_buf.items.len = 0;
 
-        if (!stdinIsTty()) {
+        if (!term.stdinIsTty()) {
             try stdout.writeAll(prompt);
             readLineFromStdin(line_buf, 65536) catch |err| {
                 if (err == error.EndOfStream) return .eof;
@@ -330,7 +256,7 @@ pub const Repl = struct {
     }
 
     fn readLineInteractive(self: *Self, prompt: []const u8, line_buf: *ManagedArrayList(u8), stdout: anytype) !LineReadAction {
-        var raw_mode = try RawTerminalMode.enableIfTty();
+        var raw_mode = try term.RawMode.enableIfTty();
         defer raw_mode.restore();
 
         try stdout.writeAll(prompt);
@@ -341,115 +267,130 @@ pub const Repl = struct {
         var browsing_history = false;
         defer if (history_scratch) |scratch| self.allocator.free(scratch);
 
+        // Bytes come from the platform; keys come from the decoder. Everything
+        // below deals in keys, so a Windows byte source drops in underneath
+        // without touching any of it.
+        var source = term.Source{};
+        var keys = key_mod.Reader(term.Source).init(&source);
+
         while (true) {
-            const key = (try readByteStdin()) orelse return .eof;
-            switch (key) {
-                '\r', '\n' => {
+            switch (try keys.readKey()) {
+                .eof => return .eof,
+                .enter => {
                     try stdout.writeAll("\r\n");
                     return .line;
                 },
-                7 => { // Ctrl-G: cancel current line
-                    line_buf.items.len = 0;
-                    try refreshInputLine(stdout, prompt, line_buf.items, 0);
-                    try stdout.writeAll("\r\n");
-                    return .canceled;
+                .ctrl => |c| switch (c) {
+                    'g' => { // Ctrl-G: cancel current line
+                        line_buf.items.len = 0;
+                        try refreshInputLine(stdout, prompt, line_buf.items, 0);
+                        try stdout.writeAll("\r\n");
+                        return .canceled;
+                    },
+                    'd' => { // Ctrl-D: EOF on empty input, else delete under cursor
+                        if (line_buf.items.len == 0) return .eof;
+                        if (cursor < line_buf.items.len) {
+                            removeRange(line_buf, cursor, nextCharBoundary(line_buf.items, cursor));
+                            try refreshInputLine(stdout, prompt, line_buf.items, cursor);
+                        }
+                    },
+                    'a' => { // Ctrl-A: start of line
+                        if (cursor > 0) {
+                            try moveCursorLeft(stdout, columnCount(line_buf.items[0..cursor]));
+                            cursor = 0;
+                        }
+                    },
+                    'e' => { // Ctrl-E: end of line
+                        if (cursor < line_buf.items.len) {
+                            try moveCursorRight(stdout, columnCount(line_buf.items[cursor..]));
+                            cursor = line_buf.items.len;
+                        }
+                    },
+                    else => {},
                 },
-                4 => { // Ctrl-D: EOF on empty input, otherwise delete under cursor
-                    if (line_buf.items.len == 0) return .eof;
-                    if (cursor < line_buf.items.len) {
-                        _ = line_buf.orderedRemove(cursor);
+                .backspace => {
+                    if (cursor > 0) {
+                        const start_of_char = prevCharBoundary(line_buf.items, cursor);
+                        removeRange(line_buf, start_of_char, cursor);
+                        cursor = start_of_char;
                         try refreshInputLine(stdout, prompt, line_buf.items, cursor);
                     }
                 },
-                1 => { // Ctrl-A
+                .delete => {
+                    if (cursor < line_buf.items.len) {
+                        removeRange(line_buf, cursor, nextCharBoundary(line_buf.items, cursor));
+                        try refreshInputLine(stdout, prompt, line_buf.items, cursor);
+                    }
+                },
+                .left => {
                     if (cursor > 0) {
-                        try moveCursorLeft(stdout, cursor);
+                        cursor = prevCharBoundary(line_buf.items, cursor);
+                        try moveCursorLeft(stdout, 1);
+                    }
+                },
+                .right => {
+                    if (cursor < line_buf.items.len) {
+                        cursor = nextCharBoundary(line_buf.items, cursor);
+                        try moveCursorRight(stdout, 1);
+                    }
+                },
+                .home => {
+                    if (cursor > 0) {
+                        try moveCursorLeft(stdout, columnCount(line_buf.items[0..cursor]));
                         cursor = 0;
                     }
                 },
-                5 => { // Ctrl-E
+                .end => {
                     if (cursor < line_buf.items.len) {
-                        try moveCursorRight(stdout, line_buf.items.len - cursor);
+                        try moveCursorRight(stdout, columnCount(line_buf.items[cursor..]));
                         cursor = line_buf.items.len;
                     }
                 },
-                8, 127 => { // Backspace
-                    if (cursor > 0) {
-                        _ = line_buf.orderedRemove(cursor - 1);
-                        cursor -= 1;
-                        if (cursor == line_buf.items.len) {
-                            try stdout.writeByte('\x08');
-                            try stdout.writeAll("\x1b[K");
-                        } else {
-                            try refreshInputLine(stdout, prompt, line_buf.items, cursor);
-                        }
+                .up => { // previous history entry
+                    if (!browsing_history) {
+                        history_scratch = try self.allocator.dupe(u8, line_buf.items);
+                        browsing_history = true;
                     }
-                },
-                27 => { // Escape sequence
-                    const b1 = (try readByteStdin()) orelse continue;
-                    if (b1 != '[') continue;
-                    const b2 = (try readByteStdin()) orelse continue;
-                    switch (b2) {
-                        'A' => { // Up: previous history entry
-                            if (!browsing_history) {
-                                history_scratch = try self.allocator.dupe(u8, line_buf.items);
-                                browsing_history = true;
-                            }
-                            if (self.history.previous()) |entry| {
-                                try setLineBuffer(line_buf, entry);
-                                cursor = line_buf.items.len;
-                                try refreshInputLine(stdout, prompt, line_buf.items, cursor);
-                            }
-                        },
-                        'B' => { // Down: next history entry
-                            if (browsing_history) {
-                                if (self.history.next()) |entry| {
-                                    try setLineBuffer(line_buf, entry);
-                                } else if (history_scratch) |scratch| {
-                                    try setLineBuffer(line_buf, scratch);
-                                    browsing_history = false;
-                                } else {
-                                    line_buf.items.len = 0;
-                                    browsing_history = false;
-                                }
-                                cursor = line_buf.items.len;
-                                try refreshInputLine(stdout, prompt, line_buf.items, cursor);
-                            }
-                        },
-                        'C' => { // Right
-                            if (cursor < line_buf.items.len) {
-                                cursor += 1;
-                                try moveCursorRight(stdout, 1);
-                            }
-                        },
-                        'D' => { // Left
-                            if (cursor > 0) {
-                                cursor -= 1;
-                                try moveCursorLeft(stdout, 1);
-                            }
-                        },
-                        '3' => { // Delete: ESC [ 3 ~
-                            const b3 = (try readByteStdin()) orelse continue;
-                            if (b3 == '~' and cursor < line_buf.items.len) {
-                                _ = line_buf.orderedRemove(cursor);
-                                try refreshInputLine(stdout, prompt, line_buf.items, cursor);
-                            }
-                        },
-                        else => {},
-                    }
-                },
-                else => {
-                    if (key < 32) continue;
-                    if (cursor == line_buf.items.len) {
-                        try line_buf.append(key);
-                        cursor += 1;
-                        try stdout.writeByte(key);
-                    } else {
-                        try line_buf.insert(cursor, key);
-                        cursor += 1;
+                    if (self.history.previous()) |entry| {
+                        try setLineBuffer(line_buf, entry);
+                        cursor = line_buf.items.len;
                         try refreshInputLine(stdout, prompt, line_buf.items, cursor);
                     }
                 },
+                .down => { // next history entry
+                    if (browsing_history) {
+                        if (self.history.next()) |entry| {
+                            try setLineBuffer(line_buf, entry);
+                        } else if (history_scratch) |scratch| {
+                            try setLineBuffer(line_buf, scratch);
+                            browsing_history = false;
+                        } else {
+                            line_buf.items.len = 0;
+                            browsing_history = false;
+                        }
+                        cursor = line_buf.items.len;
+                        try refreshInputLine(stdout, prompt, line_buf.items, cursor);
+                    }
+                },
+                .char => |cp| {
+                    var utf8: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &utf8) catch continue;
+                    if (cursor == line_buf.items.len) {
+                        try line_buf.appendSlice(utf8[0..n]);
+                        cursor += n;
+                        try stdout.writeAll(utf8[0..n]);
+                    } else {
+                        for (utf8[0..n], 0..) |b, i| {
+                            try line_buf.insert(cursor + i, b);
+                        }
+                        cursor += n;
+                        try refreshInputLine(stdout, prompt, line_buf.items, cursor);
+                    }
+                },
+                // Nothing is bound to these yet. They are named rather than left
+                // to a catch-all so that adding a binding is a compile error
+                // away, not a silent omission.
+                .tab, .escape, .page_up, .page_down, .unknown => {},
             }
         }
     }
