@@ -103,17 +103,12 @@ jobs:
       - name: Build
         run: zig build -Dtarget=x86_64-windows-gnu
 
-      # Linking the test binaries here rather than inside "Run unit tests" keeps
-      # Zig from starting one test process while the others are still being
-      # compiled. Starved of a four-core runner, a test runner can miss the 60
-      # second startup handshake Zig allows it, and every result it had already
-      # reported is then thrown away.
-      - name: Compile the test binaries
-        run: zig build test-build -Dtarget=x86_64-windows-gnu
-
-      # A backstop, not the fix. Without it the between-test allowance is a
-      # fixed 60 seconds; with it a runner that really is stuck fails against a
-      # number this file states, and the slowest test here takes about 75s.
+      # "zig build test" starts four test binaries at once and Zig kills any of
+      # them that takes more than 60 seconds to send its first message,
+      # discarding every result it had already reported. That limit is not
+      # configurable except through this flag. The unit binary keeps the disk
+      # busy for over three minutes on its own, which is long enough to starve
+      # the other three out of their startup handshake on a four-core runner.
       - name: Run unit tests
         run: zig build test -Dtarget=x86_64-windows-gnu --test-timeout 10m
 

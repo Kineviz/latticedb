@@ -206,18 +206,6 @@ pub fn build(b: *std.Build) void {
     const install_cli = b.addInstallArtifact(cli, .{});
     cli_step.dependOn(&install_cli.step);
 
-    // Compiling the test binaries and running them in one invocation lets Zig
-    // start a test process while the other binaries are still linking. A test
-    // runner that cannot finish its startup handshake within 60 seconds is
-    // killed and every result it had already reported is discarded, so on a cold
-    // cache the binaries that do the least work are the ones that lose the race.
-    // Compiling them first costs nothing when the cache is warm.
-    const test_build_step = b.step("test-build", "Compile the unit test binaries without running them");
-    test_build_step.dependOn(&unit_tests.step);
-    test_build_step.dependOn(&lib_tests.step);
-    test_build_step.dependOn(&cli_args_tests.step);
-    test_build_step.dependOn(&cli_key_tests.step);
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_lib_tests.step);
