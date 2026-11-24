@@ -1,6 +1,10 @@
 package latticedb
 
-import cgobridge "github.com/jeffhajewski/latticedb/bindings/go/internal/cgo"
+import (
+	"errors"
+
+	cgobridge "github.com/jeffhajewski/latticedb/bindings/go/internal/cgo"
+)
 
 type Tx struct {
 	db       *DB
@@ -22,7 +26,10 @@ func (tx *Tx) Commit() error {
 		return ErrInactiveTx
 	}
 	err := wrapError(tx.raw.Commit())
-	if err == nil {
+	// A commit that fails with ErrorTxnAborted has retired the native handle,
+	// so there is nothing left to roll back. Any other failure leaves the
+	// transaction open for Rollback.
+	if err == nil || errors.Is(err, &Error{Code: ErrorTxnAborted}) {
 		tx.raw = nil
 		tx.active = false
 	}
@@ -41,6 +48,8 @@ func (tx *Tx) Rollback() error {
 	return err
 }
 
+// CreateNode creates a node. A property whose value is nil is left out, as in
+// Cypher's CREATE.
 func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 	if err := tx.ensureWritable(); err != nil {
 		return Node{}, err
@@ -72,15 +81,29 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 	return Node{
 		ID:         NodeID(nodeID),
 		Labels:     append([]string(nil), opts.Labels...),
-		Properties: cloneValueMap(opts.Properties),
+		Properties: storedValues(opts.Properties),
 	}, nil
 }
 
+// DeleteNode deletes a node. A node that still has relationships is not
+// deleted: the call returns ErrorHasRelationships, as Cypher's DELETE does,
+// since deleting it alone would leave edges pointing at nothing. Use
+// DetachDeleteNode to delete them with it. Deleting a node that does not exist
+// does nothing.
 func (tx *Tx) DeleteNode(nodeID NodeID) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
 	return wrapError(tx.raw.DeleteNode(uint64(nodeID)))
+}
+
+// DetachDeleteNode deletes a node and every relationship it has, as Cypher's
+// DETACH DELETE does. All of it is part of the transaction.
+func (tx *Tx) DetachDeleteNode(nodeID NodeID) error {
+	if err := tx.ensureWritable(); err != nil {
+		return err
+	}
+	return wrapError(tx.raw.DetachDeleteNode(uint64(nodeID)))
 }
 
 func (tx *Tx) NodeExists(nodeID NodeID) (bool, error) {
@@ -116,6 +139,9 @@ func (tx *Tx) GetNode(nodeID NodeID) (*Node, error) {
 	}, nil
 }
 
+// SetProperty sets a property on a node. A nil value removes the property, as
+// Cypher's SET n.x = null does; removing one the node does not have does
+// nothing. (Up to 0.18.0 it stored the nil as a null property.)
 func (tx *Tx) SetProperty(nodeID NodeID, key string, value Value) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
@@ -123,11 +149,51 @@ func (tx *Tx) SetProperty(nodeID NodeID, key string, value Value) error {
 	return wrapError(tx.raw.SetNodeProperty(uint64(nodeID), key, value))
 }
 
+// SetVector sets the node's vector. key must be "embedding" or "". It
+// returns ErrorUnsupported when the database was created without a vector
+// index, or for another key, and ErrorInvalidArg for a vector without the
+// index's dimensions or with a NaN or infinite element.
 func (tx *Tx) SetVector(nodeID NodeID, key string, vector []float32) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
-	return wrapError(tx.raw.SetNodeVector(uint64(nodeID), key, vector))
+	err := tx.raw.SetNodeVector(uint64(nodeID), key, vector)
+	// Another key is refused as unsupported before the index is looked at.
+	if key != "embedding" && key != "" {
+		return wrapError(err)
+	}
+	return wrapVectorError(err, "set a vector")
+}
+
+// GetVector returns the node's vector as this transaction sees it, with ok
+// false when the node has none. key must be "embedding" or "", as in
+// SetVector. A node that does not exist returns ErrorNotFound.
+//
+// Under the cosine metric, the default, a committed vector reads back scaled
+// to unit length: {3, 4} reads back as {0.6, 0.8}. The direction, and so every
+// cosine distance, is unchanged. Under the euclidean and dot-product metrics it
+// reads back as stored. A vector set earlier in this transaction reads back as
+// written.
+func (tx *Tx) GetVector(nodeID NodeID, key string) ([]float32, bool, error) {
+	if err := tx.ensureActive(); err != nil {
+		return nil, false, err
+	}
+	vector, err := tx.raw.GetNodeVector(uint64(nodeID), key)
+	if err != nil {
+		return nil, false, wrapError(err)
+	}
+	return vector, vector != nil, nil
+}
+
+// RemoveVector removes the node's vector. The node keeps its labels and
+// properties; vector search no longer returns it. Removing a vector the node
+// does not have does nothing. A node that does not exist returns
+// ErrorNotFound.
+func (tx *Tx) RemoveVector(nodeID NodeID, key string) error {
+	if err := tx.ensureWritable(); err != nil {
+		return err
+	}
+	return wrapError(tx.raw.RemoveNodeVector(uint64(nodeID), key))
 }
 
 func (tx *Tx) GetProperty(nodeID NodeID, key string) (Value, bool, error) {
@@ -160,6 +226,8 @@ func (tx *Tx) FindNodesByLabelProperty(
 	return out, nil
 }
 
+// CreateEdge creates an edge. It returns ErrorNotFound if either node does not
+// exist as this transaction sees it. A property whose value is nil is left out.
 func (tx *Tx) CreateEdge(sourceID, targetID NodeID, edgeType string, opts CreateEdgeOptions) (Edge, error) {
 	if err := tx.ensureWritable(); err != nil {
 		return Edge{}, err
@@ -181,7 +249,7 @@ func (tx *Tx) CreateEdge(sourceID, targetID NodeID, edgeType string, opts Create
 		SourceID:   sourceID,
 		TargetID:   targetID,
 		Type:       edgeType,
-		Properties: cloneValueMap(opts.Properties),
+		Properties: storedValues(opts.Properties),
 	}, nil
 }
 
@@ -192,6 +260,8 @@ func (tx *Tx) DeleteEdge(sourceID, targetID NodeID, edgeType string) error {
 	return wrapError(tx.raw.DeleteEdge(uint64(sourceID), uint64(targetID), edgeType))
 }
 
+// SetEdgeProperty sets a property on an edge. A nil value removes the
+// property, as SetProperty does.
 func (tx *Tx) SetEdgeProperty(edgeID EdgeID, key string, value Value) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
@@ -281,13 +351,15 @@ func (tx *Tx) GetIncomingEdgesByType(nodeID NodeID, edgeType string, limit uint)
 }
 
 // BatchInsertVectors inserts multiple vector-bearing nodes in a single call.
+// It returns ErrorUnsupported, and creates no node, when the database was
+// created without a vector index.
 func (tx *Tx) BatchInsertVectors(label string, vectors [][]float32) ([]NodeID, error) {
 	if err := tx.ensureWritable(); err != nil {
 		return nil, err
 	}
 	nodeIDs, err := tx.raw.BatchInsert(label, vectors)
 	if err != nil {
-		return nil, wrapError(err)
+		return nil, wrapVectorError(err, "insert nodes with vectors")
 	}
 	out := make([]NodeID, len(nodeIDs))
 	for i, nodeID := range nodeIDs {
@@ -296,7 +368,7 @@ func (tx *Tx) BatchInsertVectors(label string, vectors [][]float32) ([]NodeID, e
 	return out, nil
 }
 
-// Deprecated: use BatchInsertVectors. Earliest removal is v0.6.0.
+// Deprecated: use BatchInsertVectors.
 func (tx *Tx) BatchInsert(label string, vectors [][]float32) ([]NodeID, error) {
 	return tx.BatchInsertVectors(label, vectors)
 }
@@ -375,13 +447,14 @@ func edgeRecordsToEdges(records []cgobridge.EdgeRecord) []Edge {
 	return edges
 }
 
-func cloneValueMap(values map[string]Value) map[string]Value {
-	if len(values) == 0 {
-		return map[string]Value{}
-	}
-	cloned := make(map[string]Value, len(values))
+// storedValues copies the properties a create call stores: a nil value
+// stores nothing, as in Cypher, so the returned node or edge leaves it out.
+func storedValues(values map[string]Value) map[string]Value {
+	stored := make(map[string]Value, len(values))
 	for key, value := range values {
-		cloned[key] = value
+		if value != nil {
+			stored[key] = value
+		}
 	}
-	return cloned
+	return stored
 }

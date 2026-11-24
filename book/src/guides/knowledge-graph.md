@@ -51,6 +51,7 @@ with db.write() as txn:
     txn.create_edge(doc.id, topic.id, "ABOUT")
 
     # Create a chain of chunks
+    chunk_texts = ["First passage...", "Second passage...", "Third passage..."]
     chunks = []
     for i, text in enumerate(chunk_texts):
         chunk = txn.create_node(labels=["Chunk"], properties={"text": text, "position": i})
@@ -67,11 +68,11 @@ with db.write() as txn:
 ### Finding Collaborators
 
 ```cypher
--- Direct collaborators
+// Direct collaborators
 MATCH (a:Person {name: "Alice"})-[:COLLABORATES_WITH]->(b:Person)
 RETURN b.name
 
--- Collaborators of collaborators
+// Collaborators of collaborators
 MATCH (a:Person {name: "Alice"})-[:COLLABORATES_WITH*2]->(c:Person)
 RETURN DISTINCT c.name
 ```
@@ -79,7 +80,7 @@ RETURN DISTINCT c.name
 ### Path Queries
 
 ```cypher
--- How are two people connected?
+// How are two people connected?
 MATCH (a:Person {name: "Alice"})-[*1..4]->(b:Person {name: "Dave"})
 RETURN a.name, b.name
 ```
@@ -87,7 +88,7 @@ RETURN a.name, b.name
 ### Aggregating Over Relationships
 
 ```cypher
--- Authors with the most documents about ML
+// Authors with the most documents about ML
 MATCH (p:Person)<-[:AUTHORED_BY]-(d:Document)-[:ABOUT]->(t:Topic {name: "Machine Learning"})
 RETURN p.name, count(d) AS papers
 ORDER BY papers DESC
@@ -104,9 +105,18 @@ Post -[:TAGGED]-> Topic
 ```
 
 ```cypher
--- Find friends who share interests
-MATCH (me:Person {name: "Alice"})-[:KNOWS]->(friend:Person)
-MATCH (me)-[:FOLLOWS]->(topic:Topic)<-[:FOLLOWS]-(friend)
+// Find people who share Alice's interests
+MATCH (me:Person {name: "Alice"})-[:FOLLOWS]->(topic:Topic)<-[:FOLLOWS]-(other:Person)
+RETURN other.name, collect(topic.name) AS shared_interests
+```
+
+Naming a variable again, in a second comma-separated pattern or a later `MATCH`,
+means the same node, so "friends of Alice who also share her interests" is one
+query:
+
+```cypher
+MATCH (me:Person {name: "Alice"})-[:KNOWS]->(friend:Person),
+      (me)-[:FOLLOWS]->(topic:Topic)<-[:FOLLOWS]-(friend)
 RETURN friend.name, collect(topic.name) AS shared_interests
 ```
 

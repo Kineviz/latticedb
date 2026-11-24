@@ -382,3 +382,433 @@ test "page_manager: data persists across reopen" {
         try std.testing.expectEqual(@as(u8, 0xFF), buf[200]);
     }
 }
+
+// ============================================================================
+// Contract: Page count is kept in memory
+// ============================================================================
+
+/// Passes everything through to another VFS, counting how often a file is
+/// asked for its size. Only one file may be open through it at a time.
+const SizeCountingVfs = struct {
+    inner: vfs.Vfs,
+    file: vfs.File = undefined,
+    size_calls: usize = 0,
+
+    const Self = @This();
+
+    fn get(self: *Self) vfs.Vfs {
+        return .{ .ptr = self, .vtable = &vfs_vtable };
+    }
+
+    const vfs_vtable = vfs.Vfs.VTable{
+        .open = open,
+        .delete = delete,
+        .exists = exists,
+    };
+
+    const file_vtable = vfs.File.VTable{
+        .read = read,
+        .write = write,
+        .sync = sync,
+        .truncate = truncate,
+        .size = size,
+        .close = close,
+        .lock = lock,
+        .tryLock = tryLock,
+        .unlock = unlock,
+    };
+
+    fn from(ptr: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn open(ptr: *anyopaque, path: []const u8, flags: vfs.OpenFlags) vfs.VfsError!vfs.File {
+        const self = from(ptr);
+        self.file = try self.inner.open(path, flags);
+        return .{ .ptr = self, .vtable = &file_vtable };
+    }
+    fn delete(ptr: *anyopaque, path: []const u8) vfs.VfsError!void {
+        return from(ptr).inner.delete(path);
+    }
+    fn exists(ptr: *anyopaque, path: []const u8) bool {
+        return from(ptr).inner.exists(path);
+    }
+    fn read(ptr: *anyopaque, offset: u64, buf: []u8) vfs.VfsError!usize {
+        return from(ptr).file.read(offset, buf);
+    }
+    fn write(ptr: *anyopaque, offset: u64, data: []const u8) vfs.VfsError!void {
+        return from(ptr).file.write(offset, data);
+    }
+    fn sync(ptr: *anyopaque) vfs.VfsError!void {
+        return from(ptr).file.sync();
+    }
+    fn truncate(ptr: *anyopaque, new_size: u64) vfs.VfsError!void {
+        return from(ptr).file.truncate(new_size);
+    }
+    fn size(ptr: *anyopaque) vfs.VfsError!u64 {
+        const self = from(ptr);
+        self.size_calls += 1;
+        return self.file.size();
+    }
+    fn close(ptr: *anyopaque) void {
+        from(ptr).file.close();
+    }
+    fn lock(ptr: *anyopaque, mode: vfs.LockMode) vfs.VfsError!void {
+        return from(ptr).file.lock(mode);
+    }
+    fn tryLock(ptr: *anyopaque, mode: vfs.LockMode) vfs.VfsError!bool {
+        return from(ptr).file.tryLock(mode);
+    }
+    fn unlock(ptr: *anyopaque) void {
+        from(ptr).file.unlock();
+    }
+};
+
+/// The page count the file itself implies, which the cached one must match.
+fn pagesOnDisk(pm: *PageManager) !u32 {
+    return @intCast((try pm.file.size()) / pm.getPageSize());
+}
+
+test "page_manager: page checks do not ask the file for its size" {
+    // Every HNSW neighbour list and every vector read checks its page id
+    // against the page count. A syscall per check made vector search several
+    // times slower, so the count has to come from memory.
+    const allocator = std.testing.allocator;
+
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+    var counting = SizeCountingVfs{ .inner = memory.vfs() };
+
+    var pm = try PageManager.init(allocator, counting.get(), "sizecalls.db", .{ .create = true });
+    defer pm.deinit();
+
+    counting.size_calls = 0;
+
+    for (0..8) |_| _ = try pm.allocatePage();
+    try pm.freePage(3);
+    _ = try pm.allocatePage();
+
+    for (0..1000) |i| {
+        _ = pm.isValidPage(@intCast(i % 16));
+        _ = pm.pageCount();
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), counting.size_calls);
+}
+
+test "page_manager: page count follows the file as it grows and shrinks" {
+    const allocator = std.testing.allocator;
+
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+    const vfs_impl = memory.vfs();
+
+    const page_alignment = comptime std.mem.Alignment.fromByteUnits(4096);
+    const buf = try allocator.alignedAlloc(u8, page_alignment, types.DEFAULT_PAGE_SIZE);
+    defer allocator.free(buf);
+    @memset(buf, 0);
+    const header: *lattice.storage.page.PageHeader = @ptrCast(@alignCast(buf.ptr));
+    header.* = lattice.storage.page.PageHeader.init(.btree_leaf);
+
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "grow.db", .{ .create = true });
+        defer pm.deinit();
+
+        // A new file is just its header.
+        try std.testing.expectEqual(@as(u32, 1), pm.pageCount());
+        try std.testing.expectEqual(try pagesOnDisk(&pm), pm.pageCount());
+
+        // Growing at the end of the file.
+        for (0..4) |_| _ = try pm.allocatePage();
+        try std.testing.expectEqual(@as(u32, 5), pm.pageCount());
+        try std.testing.expectEqual(try pagesOnDisk(&pm), pm.pageCount());
+
+        // Freeing a page, and reusing it, leaves the file alone.
+        try pm.freePage(2);
+        try std.testing.expectEqual(@as(u32, 5), pm.pageCount());
+        try std.testing.expectEqual(@as(types.PageId, 2), try pm.allocatePage());
+        try std.testing.expectEqual(@as(u32, 5), pm.pageCount());
+
+        // Recovery replays pages the file may not reach yet, when the crash
+        // came before the extended file was synced. Writing past the end
+        // grows the file to cover the page.
+        try pm.writePage(9, buf);
+        try std.testing.expectEqual(@as(u32, 10), pm.pageCount());
+        try std.testing.expectEqual(try pagesOnDisk(&pm), pm.pageCount());
+        try std.testing.expect(pm.isValidPage(9));
+
+        // A write inside the file does not move the end.
+        for (1..5) |page_id| try pm.writePage(@intCast(page_id), buf);
+        try std.testing.expectEqual(@as(u32, 10), pm.pageCount());
+
+        // Pages 5 to 8 were never written, so they read as free, and 9 is
+        // live. Free 9 and the whole tail from 5 goes.
+        try pm.freePage(9);
+        const stats = try pm.truncateFreeTail();
+        try std.testing.expectEqual(@as(u32, 5), stats.pages_after);
+        try std.testing.expectEqual(@as(u32, 5), pm.pageCount());
+        try std.testing.expectEqual(try pagesOnDisk(&pm), pm.pageCount());
+        try std.testing.expect(!pm.isValidPage(5));
+        try std.testing.expect(!pm.isValidPage(9));
+
+        // Growth resumes at the new end.
+        try std.testing.expectEqual(@as(types.PageId, 5), try pm.allocatePage());
+        try std.testing.expectEqual(@as(u32, 6), pm.pageCount());
+        try std.testing.expectEqual(try pagesOnDisk(&pm), pm.pageCount());
+    }
+
+    // Reopening reads the count from the file.
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "grow.db", .{});
+        defer pm.deinit();
+        try std.testing.expectEqual(@as(u32, 6), pm.pageCount());
+    }
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "grow.db", .{ .read_only = true });
+        defer pm.deinit();
+        try std.testing.expectEqual(@as(u32, 6), pm.pageCount());
+    }
+}
+
+test "page_manager: valid pages are those between the header and the end" {
+    const allocator = std.testing.allocator;
+
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+
+    var pm = try PageManager.init(allocator, memory.vfs(), "bounds.db", .{ .create = true });
+    defer pm.deinit();
+
+    try std.testing.expect(!pm.isValidPage(0));
+    try std.testing.expect(!pm.isValidPage(1));
+
+    for (0..3) |_| _ = try pm.allocatePage();
+
+    try std.testing.expect(!pm.isValidPage(0));
+    try std.testing.expect(pm.isValidPage(1));
+    try std.testing.expect(pm.isValidPage(3));
+    try std.testing.expect(!pm.isValidPage(4));
+    try std.testing.expect(!pm.isValidPage(std.math.maxInt(types.PageId)));
+}
+
+// ============================================================================
+// Contract: the freelist never hands out a page that is not free
+// ============================================================================
+
+const TempPm = struct {
+    posix_vfs: PosixVfs,
+    path: []u8,
+    pm: PageManager,
+
+    fn init(self: *TempPm, allocator: std.mem.Allocator, name: []const u8) !void {
+        self.posix_vfs = PosixVfs.init(allocator);
+        self.path = try createTempPath(allocator, name);
+        errdefer allocator.free(self.path);
+        self.pm = try PageManager.init(allocator, self.posix_vfs.vfs(), self.path, .{ .create = true });
+    }
+
+    fn deinit(self: *TempPm, allocator: std.mem.Allocator) void {
+        self.pm.deinit();
+        self.posix_vfs.vfs().delete(self.path) catch {};
+        allocator.free(self.path);
+    }
+
+    fn setFreelistHead(self: *TempPm, head: types.PageId) !void {
+        var header = self.pm.getHeader().*;
+        header.freelist_page = head;
+        try self.pm.updateHeader(&header);
+    }
+};
+
+test "page_manager: a freelist head past the end of the file is dropped, not fatal" {
+    const allocator = std.testing.allocator;
+    var t: TempPm = undefined;
+    try t.init(allocator, "freelist_past_eof");
+    defer t.deinit(allocator);
+
+    _ = try t.pm.allocatePage();
+    const count = t.pm.pageCount();
+    try t.setFreelistHead(count + 100);
+
+    // The database can still grow, and the bad head is gone.
+    const page_id = try t.pm.allocatePage();
+    try std.testing.expectEqual(count, page_id);
+    try std.testing.expectEqual(types.NULL_PAGE, t.pm.getHeader().freelist_page);
+    try std.testing.expectEqual(count + 1, try t.pm.allocatePage());
+}
+
+test "page_manager: a freelist head that is not a free page is never handed out" {
+    const allocator = std.testing.allocator;
+    var t: TempPm = undefined;
+    try t.init(allocator, "freelist_live_head");
+    defer t.deinit(allocator);
+
+    const live = try t.pm.allocatePage();
+    var buf: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+    const header: *lattice.storage.page.PageHeader = @ptrCast(@alignCast(&buf));
+    header.* = lattice.storage.page.PageHeader.init(.btree_leaf);
+    buf[100] = 0xAB;
+    try t.pm.writePage(live, &buf);
+
+    // A stale header still naming the page as the freelist head, as a crash
+    // or a stray write could leave it.
+    try t.setFreelistHead(live);
+
+    const page_id = try t.pm.allocatePage();
+    try std.testing.expect(page_id != live);
+    try std.testing.expectEqual(types.NULL_PAGE, t.pm.getHeader().freelist_page);
+
+    var check: [4096]u8 align(4096) = undefined;
+    try t.pm.readPage(live, &check);
+    try std.testing.expectEqual(@as(u8, 0xAB), check[100]);
+}
+
+test "page_manager: a free page whose next pointer is out of range ends the freelist" {
+    const allocator = std.testing.allocator;
+    var t: TempPm = undefined;
+    try t.init(allocator, "freelist_bad_next");
+    defer t.deinit(allocator);
+
+    const a = try t.pm.allocatePage();
+    const b = try t.pm.allocatePage();
+    try t.pm.freePage(a);
+
+    // Rewrite `a` as a free page whose next pointer runs past the file.
+    var buf: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+    const header: *lattice.storage.page.PageHeader = @ptrCast(@alignCast(&buf));
+    header.* = lattice.storage.page.PageHeader.init(.free);
+    std.mem.writeInt(u32, buf[8..12], t.pm.pageCount() + 50, .little);
+    try t.pm.writePage(a, &buf);
+
+    try std.testing.expectEqual(a, try t.pm.allocatePage());
+    try std.testing.expectEqual(types.NULL_PAGE, t.pm.getHeader().freelist_page);
+    const next = try t.pm.allocatePage();
+    try std.testing.expect(next != a and next != b);
+}
+
+test "page_manager: freeing the freelist head again is refused" {
+    const allocator = std.testing.allocator;
+    var t: TempPm = undefined;
+    try t.init(allocator, "freelist_double_free");
+    defer t.deinit(allocator);
+
+    const a = try t.pm.allocatePage();
+    try t.pm.freePage(a);
+    try std.testing.expectError(PageManagerError.InvalidPageId, t.pm.freePage(a));
+    try std.testing.expectError(PageManagerError.InvalidPageId, t.pm.freePage(t.pm.pageCount()));
+
+    // Two allocations get two different pages, not the same one twice.
+    const first = try t.pm.allocatePage();
+    const second = try t.pm.allocatePage();
+    try std.testing.expectEqual(a, first);
+    try std.testing.expect(second != first);
+}
+
+// ============================================================================
+// Contract: a zero checksum passes only for a page nothing has written
+// ============================================================================
+
+test "page_manager: ldur a zero checksum does not excuse a page with data in it" {
+    const allocator = std.testing.allocator;
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+    const vfs_impl = memory.vfs();
+
+    var pm = try PageManager.init(allocator, vfs_impl, "db", .{ .create = true });
+    defer pm.deinit();
+
+    // A page the file was just extended with has no checksum, and reads.
+    const fresh = try pm.allocatePage();
+    var buf: [4096]u8 align(4096) = undefined;
+    try pm.readPage(fresh, &buf);
+
+    // A written page whose first bytes were then zeroed, checksum included,
+    // as damage to its first sector would leave it.
+    const page_id = try pm.allocatePage();
+    @memset(&buf, 0x5A);
+    try pm.writePage(page_id, &buf);
+    const file = try vfs_impl.open("db", .{ .write = true });
+    defer file.close();
+    const zeroes = [_]u8{0} ** 512;
+    try file.write(@as(u64, page_id) * 4096, &zeroes);
+    try std.testing.expectError(PageManagerError.ChecksumMismatch, pm.readPage(page_id, &buf));
+
+    // This release seals the pages it extends a file with, so in a file it
+    // created a page that is zeroes all through, checksum included, is
+    // damage too. A scan over every page, which meets pages a crash kept
+    // from being written, still takes it for a blank one.
+    const all_zero = [_]u8{0} ** 4096;
+    try file.write(@as(u64, page_id) * 4096, &all_zero);
+    try std.testing.expect(pm.getHeader().pagesSealed());
+    try std.testing.expectError(PageManagerError.ChecksumMismatch, pm.readPage(page_id, &buf));
+    try std.testing.expect(try pm.readPageForScan(page_id, &buf));
+    try std.testing.expect(!try pm.readPageForScan(fresh, &buf));
+}
+
+test "page_manager: lfmt a page this release extends the file with is sealed" {
+    const allocator = std.testing.allocator;
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+    const vfs_impl = memory.vfs();
+
+    var pm = try PageManager.init(allocator, vfs_impl, "db", .{ .create = true });
+    defer pm.deinit();
+    try std.testing.expect(pm.getHeader().flags & lattice.storage.page.FileFlags.SEALED_PAGES != 0);
+    try std.testing.expect(pm.getHeader().pagesSealed());
+
+    const page_id = try pm.allocatePage();
+    var raw: [4096]u8 align(4096) = undefined;
+    const file = try vfs_impl.open("db", .{});
+    defer file.close();
+    _ = try file.read(@as(u64, page_id) * 4096, &raw);
+    try std.testing.expect(std.mem.readInt(u32, raw[4..8], .little) != 0);
+
+    var buf: [4096]u8 align(4096) = undefined;
+    try pm.readPage(page_id, &buf);
+    try std.testing.expect(!try pm.readPageForScan(page_id, &buf));
+}
+
+test "page_manager: lfmt a file 0.16.0 wrote last does not count as sealed" {
+    const allocator = std.testing.allocator;
+    var memory = lattice.storage.memory_vfs.MemoryVfs.init(allocator);
+    defer memory.deinit();
+    const vfs_impl = memory.vfs();
+    const FileHeader = lattice.storage.page.FileHeader;
+    const SEALED_PAGES = lattice.storage.page.FileFlags.SEALED_PAGES;
+
+    var page_id: types.PageId = undefined;
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "db", .{ .create = true });
+        defer pm.deinit();
+        page_id = try pm.allocatePage();
+    }
+
+    // 0.16.0 copies `flags` along, bit included, when it writes the header,
+    // and zeroes what follows its own fields; it extends the file with
+    // pages of zeroes.
+    {
+        const file = try vfs_impl.open("db", .{ .write = true });
+        defer file.close();
+        const tail = [_]u8{0} ** (@sizeOf(FileHeader) - FileHeader.LEGACY_SIZE);
+        try file.write(FileHeader.LEGACY_SIZE, &tail);
+        const all_zero = [_]u8{0} ** 4096;
+        try file.write(@as(u64, page_id) * 4096, &all_zero);
+    }
+
+    var buf: [4096]u8 align(4096) = undefined;
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "db", .{ .read_only = true });
+        defer pm.deinit();
+        try std.testing.expect(pm.getHeader().flags & SEALED_PAGES != 0);
+        try std.testing.expect(!pm.getHeader().pagesSealed());
+        try pm.readPage(page_id, &buf);
+    }
+    {
+        var pm = try PageManager.init(allocator, vfs_impl, "db", .{});
+        defer pm.deinit();
+        try std.testing.expect(pm.getHeader().hasExtension());
+        try std.testing.expect(pm.getHeader().flags & SEALED_PAGES == 0);
+        try std.testing.expect(!pm.getHeader().pagesSealed());
+        try pm.readPage(page_id, &buf);
+    }
+}

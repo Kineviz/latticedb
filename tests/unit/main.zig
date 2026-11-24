@@ -17,15 +17,24 @@ const query_test = @import("query_test.zig");
 const search_test = @import("search_test.zig");
 const stream_store_test = @import("stream_store_test.zig");
 const c_api_test = @import("c_api_test.zig");
+const lfmt_c_api_test = @import("lfmt_c_api_test.zig");
+const lnl_c_api_test = @import("lnl_c_api_test.zig");
+const lnl_buffer_pool_test = @import("lnl_buffer_pool_test.zig");
+const lfmt_checkpoint_test = @import("lfmt_checkpoint_test.zig");
+const lfmt_reader_gate_test = @import("lfmt_reader_gate_test.zig");
 const concurrency_test = @import("concurrency_test.zig");
 const transaction_test = @import("transaction_test.zig");
 const quipu_repro_test = @import("quipu_longmemeval_repro.zig");
-const cli_main = @import("cli_main");
+const vector_test = @import("vector_test.zig");
+const lcf_btree_split_test = @import("lcf_btree_split_test.zig");
+const lcf_c_api_changefeed_test = @import("lcf_c_api_changefeed_test.zig");
 
 // Re-export tests from all modules
 test {
     // Core types
     _ = lattice.core.types;
+    _ = lattice.core.id_key;
+    _ = lattice.storage.id_key_upgrade;
 
     // Storage - inline tests
     _ = lattice.storage.page;
@@ -71,10 +80,17 @@ test {
     _ = search_test;
     _ = stream_store_test;
     _ = c_api_test;
+    _ = lfmt_c_api_test;
+    _ = lnl_c_api_test;
+    _ = lnl_buffer_pool_test;
+    _ = lfmt_checkpoint_test;
+    _ = lfmt_reader_gate_test;
     _ = concurrency_test;
     _ = transaction_test;
     _ = quipu_repro_test;
-    _ = cli_main;
+    _ = vector_test;
+    _ = lcf_btree_split_test;
+    _ = lcf_c_api_changefeed_test;
 }
 
 test "lattice version" {

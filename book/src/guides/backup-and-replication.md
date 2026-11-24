@@ -33,7 +33,9 @@ process first.
 lattice backup social.lattice --file=/backups/social-2026-08-25.lattice
 ```
 
-From your own code, the same thing is a method on the database:
+From Zig code, the same thing is a method on the database. The C API and the
+language bindings do not expose backup or replication; from Python, TypeScript,
+Go or Java, use the `lattice` command while nothing else has the database open.
 
 ```zig
 const stats = try db.backup("/backups/social-2026-08-25.lattice");
@@ -54,39 +56,57 @@ want to lose the last hour", because an hour is exactly how much you lose.
 ## Keeping a copy up to date
 
 `replicate` ships changes into a directory. The first pass copies the whole
-database, and every pass after that copies only what has changed since:
+database; later passes copy the write-ahead log frames written since, when the
+log still holds them (see [Generations](#generations)):
 
 ```bash
 lattice replicate social.lattice --to=/mnt/backup/social
 ```
 
-Run it on an interval and the destination trails your database by roughly that
-interval:
+Run it on a timer, from cron or a scheduler, and the destination trails your
+database by roughly that interval. A pass with nothing to ship is normal, says
+so, and exits successfully, so this does not fill your logs with things that
+look like failures.
+
+`--follow` keeps the command running and replicating on an interval:
 
 ```bash
 lattice replicate social.lattice --to=/mnt/backup/social --follow --interval=30
 ```
 
-A pass with nothing to ship is normal, says so, and exits successfully, so this
-is safe to put on a timer without filling your logs with things that look like
-failures.
+Each pass opens the database, which takes its file lock, and closes it again,
+so other processes can use the database between passes. A pass that finds the
+database open in another process is skipped until the next interval, and a
+process that tries to open the database during the moment a pass is running is
+refused and can retry. A database your application keeps open the whole time
+cannot be followed this way; call `replicateTo` from the application.
 
 ### Why later passes are cheap
 
 Every change is written to the write-ahead log before it reaches the database
 file. Replication copies frames out of that log, so a pass has to move only what
-was actually written, not the whole database again.
+was actually written, not the whole database again. That holds while the log
+still has those frames, which is the case for an application that keeps the
+database open and replicates through its own handle (below).
 
 ### Generations
 
 Every so often LatticeDB folds pending changes into the database file and starts
-the log over. By default this happens once the log reaches a thousand frames, and
-again whenever the database closes.
+the log over. By default this happens once the log reaches an eighth of the page
+cache (never less than a thousand frames, never more than 64 MB), and when a
+database that has been written to closes.
 
 When the log starts over, frame numbering restarts from zero. Frame 40 before the
 reset and frame 40 after it are completely different changes, so replication
 cannot simply keep counting. Instead it starts a **generation**: a fresh full
 snapshot, followed by the changes that came after it.
+
+A process that writes and then closes the database therefore leaves a reset log
+behind, and the next pass starts a new generation. When your writers are
+separate short-lived processes, such as `lattice exec` or a script, each pass
+after a change is a full snapshot, and a pass with nothing changed ships
+nothing. Frames are shipped incrementally only when the process doing the
+writing also does the replicating.
 
 You will see this in the destination:
 
@@ -96,6 +116,9 @@ You will see this in the destination:
 /mnt/backup/social/gen-0000000001/frames/0000000012-0000000016.frames
 /mnt/backup/social/gen-0000000002/snapshot.lattice
 ```
+
+(The `frames/` files come from passes made through `replicateTo`; passes made
+by the command against a closed database add only `gen-` snapshots.)
 
 Older generations are kept rather than cleaned up, because restoring to a moment
 inside one still needs its frames. If you want to reclaim the space, deleting a
@@ -114,8 +137,9 @@ Error: social.lattice is open in another process. Close it first, or pass
 ```
 
 That makes the command right for a database nothing else is using. For the case
-people most often want, which is replicating while an application runs, call
-`replicateTo` on the handle your application already has:
+people most often want, which is replicating while an application runs, a Zig
+application can call `replicateTo` on the handle it already has (the C API and
+the language bindings do not offer it):
 
 ```zig
 // Somewhere on a timer inside your application.
@@ -131,6 +155,37 @@ not.
 Do not reach for `--no-lock` to work around this. It exists for filesystems where
 locking does not work, and it does not make two processes safe — it only removes
 the thing that was going to tell you they were not.
+
+### After upgrading a database to format 5
+
+`lattice compact --upgrade-id-keys --apply` rewrites a database created by 0.18 or
+earlier into the format-5 layout
+([Upgrading an older file to format 5](../getting-started/cli.md#upgrading-an-older-file-to-format-5)).
+The upgraded file gets a new id, and a destination remembers the id of the
+database it belongs to. So the directory you were replicating to refuses the
+upgraded file:
+
+```text
+Error: /mnt/backup/social already holds backups of a different database. A
+database upgraded with 'compact --upgrade-id-keys' counts as a different one:
+replicate it to a new directory (the old one still restores it as it was before
+the upgrade)
+```
+
+Nothing in the old directory is touched by that refusal. What to do:
+
+1. Replicate the upgraded database to a new, empty directory, and point whatever
+   runs `replicate` on a schedule at it. The first pass there is a full snapshot.
+2. Keep the old directory for as long as you might want the database as it was
+   before the upgrade. `lattice restore` on it still works, and gives you a file
+   0.18 can open.
+
+The upgrade command tells you this before it changes anything: without `--apply` it
+prints the notice and stops.
+
+The new id is deliberate. A log or journal left beside the old file carries the old
+id, and the database will not apply either to a file with a different one. Without
+that, a leftover log could write pre-upgrade pages into the upgraded file.
 
 ## Getting a database back
 
@@ -189,8 +244,8 @@ should have the same bug rather than a different one.
 |---------------|-------------|
 | A copy before an upgrade or a risky migration | `lattice backup` |
 | A nightly snapshot | `lattice backup` from cron |
-| To lose no more than a few seconds of work | `replicateTo` on a timer in your application |
-| To mirror a database nothing else has open | `lattice replicate --follow` |
+| To lose no more than a few seconds of work | `replicateTo` on a timer in your application (Zig only) |
+| To keep restore points of a database written by separate processes | `lattice replicate` on a timer |
 | To undo a bad migration or a bad delete | `lattice restore --at=...` |
 | Many small databases kept in a bucket | `serialize` and `deserialize` |
 | A database that never touches the disk | open `:memory:` |
@@ -226,10 +281,10 @@ db.query("CREATE (n:Note {text: 'found something'})")
 s3.put_object(Bucket=bucket, Key=key, Body=db.serialize(), IfMatch=etag)
 ```
 
-The same pair exists in every binding: `Database.serialize()` returns bytes, and
-`deserialize` (a package-level function in Python and TypeScript,
-`latticedb.Deserialize` in Go, `lattice_serialize` and `lattice_deserialize` in
-C) opens a database from them.
+The same pair exists in every binding: `serialize()` on the database returns
+bytes, and `deserialize` (a package-level function in Python and TypeScript,
+`latticedb.Deserialize` in Go, `Database.deserialize` in Java,
+`lattice_serialize` and `lattice_deserialize` in C) opens a database from them.
 
 Pending writes are folded in before the bytes are handed over, so what you upload
 is a complete database that needs no log beside it. You can write those bytes to
@@ -246,10 +301,12 @@ Pass `:memory:` as the path and the database has no files behind it at all:
 
 ```python
 db = latticedb.Database(":memory:")
+db.open()
 ```
 
 ```typescript
 const db = new Database(':memory:');
+await db.open();
 ```
 
 ```go
@@ -271,11 +328,13 @@ it disappears when you close it and that nothing locks it, since there is no
 second process that could reach it.
 
 It is also cheaper than you might expect for small databases. The page cache is
-sized to the database rather than to a fixed budget, because a cache bigger than
-the data it holds has frames it can never fill. A hundred-kilobyte database costs
-around a quarter of a megabyte in memory, rather than the sixteen a file-backed
-one would reserve. If you are keeping many small databases open at once, that
-difference is most of what you pay.
+capped at 64 pages (256 KB at the default page size) whatever cache size you ask
+for, because a miss against memory is only a copy. A hundred-kilobyte database
+costs a few hundred kilobytes in memory, rather than the 100 MB cache a
+file-backed one opened through the C API or a binding reserves by default. If you
+are keeping many small databases open at once, that difference is most of what
+you pay. See [In-Memory Databases](../configuration/in-memory.md) for
+measurements.
 
 ### Loading without a second copy
 

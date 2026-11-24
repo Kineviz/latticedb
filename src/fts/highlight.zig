@@ -12,6 +12,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const tokenizer_mod = @import("tokenizer.zig");
+const query_mod = @import("query.zig");
+const fuzzy_mod = @import("fuzzy.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const TokenizerConfig = tokenizer_mod.TokenizerConfig;
 const Language = tokenizer_mod.Language;
@@ -76,9 +78,12 @@ const SnippetRegion = struct {
 
 /// Find all matches of query terms in document text.
 ///
-/// Query terms should already be normalized/stemmed if stemming is used.
-/// This function re-tokenizes the document and finds tokens whose
-/// stemmed form matches any query term.
+/// Query terms should already be normalized the way the index normalizes
+/// them (`tokenizer.normalizeTerm`). This function re-tokenizes the document
+/// and finds tokens whose normalized form matches any query term. Pass the
+/// config the index reads with (`FtsIndex.analysis`), so a highlighted word
+/// is one the search matched: the same word splitting, case and accent
+/// folding, and stemming only where the index stems.
 ///
 /// Returns matches sorted by start position.
 pub fn findMatches(
@@ -110,16 +115,11 @@ pub fn findMatches(
 
     var tokenizer = Tokenizer.init(allocator, text, doc_config);
 
-    var stem_buf: [64]u8 = undefined;
+    var term_buf: [tokenizer_mod.MAX_TERM_LEN]u8 = undefined;
 
     while (tokenizer.next()) |token| {
-        // Normalize/stem the token to match against query terms
-        const normalized = tokenizer_mod.normalizeAndStemWithLanguage(
-            token.text,
-            &stem_buf,
-            tokenizer_config.use_stemming,
-            tokenizer_config.language,
-        );
+        // Normalize the token as indexing does to match against query terms
+        const normalized = tokenizer_mod.normalizeTerm(tokenizer_config, token.text, &term_buf) orelse continue;
 
         // Check if this token matches any query term
         if (term_set.contains(normalized)) {
@@ -152,7 +152,17 @@ pub fn highlight(
     // Find all matches
     const matches = try findMatches(allocator, text, query_terms, tokenizer_config);
     defer allocator.free(matches);
+    return snippetsFor(allocator, text, matches, config);
+}
 
+/// Snippets of `text` around `matches` (sorted by start, not overlapping),
+/// with markers inserted.
+fn snippetsFor(
+    allocator: Allocator,
+    text: []const u8,
+    matches: []const Match,
+    config: HighlightConfig,
+) HighlightError!HighlightResult {
     if (matches.len == 0) {
         const snippets = allocator.alloc(Snippet, 0) catch return HighlightError.OutOfMemory;
         return HighlightResult{
@@ -163,7 +173,10 @@ pub fn highlight(
 
     // Group matches into snippet regions
     var regions: std.ArrayListUnmanaged(SnippetRegion) = .empty;
-    defer regions.deinit(allocator);
+    defer {
+        for (regions.items) |region| allocator.free(region.matches);
+        regions.deinit(allocator);
+    }
 
     var region_matches: std.ArrayListUnmanaged(Match) = .empty;
     defer region_matches.deinit(allocator);
@@ -203,6 +216,12 @@ pub fn highlight(
             }
         }
 
+        // The context is measured in bytes; widen it to whole characters so a
+        // snippet never starts or ends inside a multi-byte one. Matches are
+        // tokens, which already begin and end on character boundaries.
+        region_start = charStart(text, region_start);
+        region_end = charEnd(text, region_end);
+
         // Store region with its matches (copy the matches array)
         const region_matches_copy = allocator.dupe(Match, region_matches.items) catch
             return HighlightError.OutOfMemory;
@@ -220,16 +239,16 @@ pub fn highlight(
     // Build snippets from regions
     var snippets = allocator.alloc(Snippet, regions.items.len) catch
         return HighlightError.OutOfMemory;
+    // Only the snippets built so far have text to free.
+    var built: usize = 0;
     errdefer {
-        for (snippets) |s| {
+        for (snippets[0..built]) |s| {
             allocator.free(s.text);
         }
         allocator.free(snippets);
     }
 
     for (regions.items, 0..) |region, idx| {
-        defer allocator.free(region.matches);
-
         const snippet_text = try insertMarkers(
             allocator,
             text,
@@ -244,12 +263,36 @@ pub fn highlight(
             .doc_offset = region.start,
             .match_count = @intCast(region.matches.len),
         };
+        built += 1;
     }
 
     return HighlightResult{
         .snippets = snippets,
         .total_matches = @intCast(matches.len),
     };
+}
+
+/// Whether `byte` continues a UTF-8 character rather than starting one.
+fn isContinuationByte(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
+}
+
+/// `offset` moved back to the start of the UTF-8 character it falls inside.
+/// A character has at most three continuation bytes, so text that is not
+/// UTF-8 moves it no further than that.
+fn charStart(text: []const u8, offset: u32) u32 {
+    var o = offset;
+    var steps: u32 = 0;
+    while (o > 0 and o < text.len and steps < 3 and isContinuationByte(text[o])) : (steps += 1) o -= 1;
+    return o;
+}
+
+/// `offset` moved forward to the end of the UTF-8 character it falls inside.
+fn charEnd(text: []const u8, offset: u32) u32 {
+    var o = offset;
+    var steps: u32 = 0;
+    while (o < text.len and steps < 3 and isContinuationByte(text[o])) : (steps += 1) o += 1;
+    return o;
 }
 
 /// Insert highlight markers around matches in a text region
@@ -343,6 +386,88 @@ fn insertMarkers(
 // ============================================================================
 // Cleanup
 // ============================================================================
+
+/// The words of `text` a parsed query matched, sorted by position.
+///
+/// `query` comes from `query.parse` with the analysis the index reads with
+/// (`FtsIndex.parseQuery`), and `tokenizer_config` is that analysis, so a
+/// word is marked exactly when search would have matched it: a term, a word
+/// starting with a prefix, a word within a fuzzy word's distance, or every
+/// word of each place a phrase occurs (not the phrase's words elsewhere).
+/// Excluded words are not marked. Every branch's words are marked, also
+/// those of a branch the text does not satisfy as a whole.
+pub fn findQueryMatches(
+    allocator: Allocator,
+    text: []const u8,
+    query: query_mod.Query,
+    tokenizer_config: TokenizerConfig,
+) HighlightError![]Match {
+    const Word = struct { term: []const u8, position: u32, start: u32, end: u32 };
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var words: std.ArrayListUnmanaged(Word) = .empty;
+    var tokenizer = Tokenizer.init(arena, text, tokenizer_config);
+    while (tokenizer.next()) |token| {
+        var buf: [tokenizer_mod.MAX_TERM_LEN]u8 = undefined;
+        const term = tokenizer_mod.normalizeTerm(tokenizer_config, token.text, &buf) orelse continue;
+        words.append(arena, .{
+            .term = arena.dupe(u8, term) catch return HighlightError.OutOfMemory,
+            .position = token.position,
+            .start = token.byte_offset,
+            .end = token.byte_offset + @as(u32, @intCast(token.text.len)),
+        }) catch return HighlightError.OutOfMemory;
+    }
+    const marked = arena.alloc(bool, words.items.len) catch return HighlightError.OutOfMemory;
+    @memset(marked, false);
+
+    for (query.branches) |branch| {
+        for (branch.required) |unit| {
+            switch (unit) {
+                .term => |t| for (words.items, marked) |w, *m| {
+                    if (std.mem.eql(u8, w.term, t)) m.* = true;
+                },
+                .prefix => |p| for (words.items, marked) |w, *m| {
+                    if (std.mem.startsWith(u8, w.term, p)) m.* = true;
+                },
+                .fuzzy => |f| for (words.items, marked) |w, *m| {
+                    if (fuzzy_mod.levenshteinDistanceBounded(f.term, w.term, f.distance) != null) m.* = true;
+                },
+                .phrase => |terms| for (words.items, 0..) |w, start| {
+                    if (!std.mem.eql(u8, w.term, terms[0])) continue;
+                    if (start + terms.len > words.items.len) break;
+                    const whole = for (terms[1..], 1..) |t, k| {
+                        const next = words.items[start + k];
+                        if (next.position != w.position + k or !std.mem.eql(u8, next.term, t)) break false;
+                    } else true;
+                    if (whole) @memset(marked[start..][0..terms.len], true);
+                },
+            }
+        }
+    }
+
+    var matches: std.ArrayListUnmanaged(Match) = .empty;
+    errdefer matches.deinit(allocator);
+    for (words.items, marked) |w, m| {
+        if (m) matches.append(allocator, .{ .start = w.start, .end = w.end }) catch return HighlightError.OutOfMemory;
+    }
+    return matches.toOwnedSlice(allocator) catch return HighlightError.OutOfMemory;
+}
+
+/// Snippets of `text` with the words a parsed query matched marked; see
+/// `findQueryMatches`. Free with `freeResult`.
+pub fn highlightQuery(
+    allocator: Allocator,
+    text: []const u8,
+    query: query_mod.Query,
+    tokenizer_config: TokenizerConfig,
+    config: HighlightConfig,
+) HighlightError!HighlightResult {
+    const matches = try findQueryMatches(allocator, text, query, tokenizer_config);
+    defer allocator.free(matches);
+    return snippetsFor(allocator, text, matches, config);
+}
 
 /// Free a highlight result and all associated memory
 pub fn freeResult(allocator: Allocator, result: HighlightResult) void {
@@ -562,4 +687,67 @@ test "highlight - with stemming" {
     // "runners" stems to "runner" (not "run"), so only "running" -> "run" matches
     try std.testing.expectEqual(@as(u32, 1), result.total_matches);
     try std.testing.expect(std.mem.indexOf(u8, result.snippets[0].text, "**running**") != null);
+}
+
+test "highlight - context never splits a UTF-8 character" {
+    const allocator = std.testing.allocator;
+
+    // Each "é" is two bytes, so cutting the context by bytes lands inside one
+    // on both sides of the match.
+    const text = "ééééé database ééééé";
+    const terms = [_][]const u8{"database"};
+
+    for (1..12) |context| {
+        const result = try highlight(allocator, text, &terms, .{
+            .use_stemming = false,
+            .remove_stop_words = false,
+        }, .{
+            .context_chars = @intCast(context),
+            .ellipsis = "...",
+        });
+        defer freeResult(allocator, result);
+
+        try std.testing.expectEqual(@as(usize, 1), result.snippets.len);
+        const snippet = result.snippets[0];
+        try std.testing.expect(std.unicode.utf8ValidateSlice(snippet.text));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text[snippet.doc_offset..]));
+        try std.testing.expect(std.mem.indexOf(u8, snippet.text, "<em>database</em>") != null);
+    }
+}
+
+test "highlight - running out of memory frees what was built" {
+    const text = "data at start. " ++ "x" ** 100 ++ " data in middle. " ++ "x" ** 100 ++ " data at end.";
+    const terms = [_][]const u8{"data"};
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = highlight(failing.allocator(), text, &terms, .{
+            .use_stemming = false,
+            .remove_stop_words = false,
+        }, .{ .context_chars = 10, .merge_distance = 20 }) catch |err| {
+            try std.testing.expectEqual(HighlightError.OutOfMemory, err);
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 3), result.snippets.len);
+        freeResult(failing.allocator(), result);
+        break;
+    }
+}
+
+test "highlightQuery marks what each query form matched, and a phrase only where it occurs" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const config: TokenizerConfig = .{};
+    const query = try query_mod.parse(arena_state.allocator(), "\"quick brown\" data* OR jumpz~ -lazy", .{ .analysis = config });
+
+    const text = "The quick brown fox saw a brown quick database jump over the lazy dog";
+    const result = try highlightQuery(allocator, text, query, config, .{ .context_chars = 200, .max_snippets = 1 });
+    defer freeResult(allocator, result);
+    try std.testing.expectEqual(@as(usize, 1), result.snippets.len);
+    try std.testing.expectEqualStrings(
+        "The <em>quick</em> <em>brown</em> fox saw a brown quick <em>database</em> <em>jump</em> over the lazy dog",
+        result.snippets[0].text,
+    );
 }

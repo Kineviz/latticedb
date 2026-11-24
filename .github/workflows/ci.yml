@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
         # Windows is built and tested by zig-build-windows below, which needs
         # its own shell and artifact handling.
 
@@ -59,8 +59,8 @@ jobs:
         run: |
           case "${{ matrix.os }}-$(uname -m)" in
             ubuntu-latest-x86_64) target="x86_64-linux-gnu" ;;
-            macos-14-arm64) target="aarch64-macos" ;;
-            macos-14-x86_64) target="x86_64-macos" ;;
+            macos-15-arm64) target="aarch64-macos" ;;
+            macos-15-x86_64) target="x86_64-macos" ;;
             *)
               echo "Unsupported CI shared library target: ${{ matrix.os }}-$(uname -m)" >&2
               exit 1
@@ -103,13 +103,14 @@ jobs:
       - name: Build
         run: zig build -Dtarget=x86_64-windows-gnu
 
-      # "zig build test" starts four test binaries at once and Zig kills any of
-      # them that takes more than 60 seconds to send its first message,
-      # discarding every result it had already reported. That limit is not
-      # configurable except through this flag. The unit binary keeps the disk
-      # busy for over three minutes on its own, which is long enough to starve
-      # the other three out of their startup handshake on a four-core runner.
       - name: Run unit tests
+        # This step runs several test binaries at once, and on Windows Zig 0.16
+        # starts each with inheritable pipes and nothing to stop a sibling
+        # started at the same moment from inheriting them too. A binary that
+        # finishes then sees no end of output until that sibling exits, and the
+        # build runner gives up on it after 60 seconds of silence unless a
+        # longer test timeout is set. Linux and macOS are not affected: Zig
+        # marks the pipes close-on-exec there for exactly this reason.
         run: zig build test -Dtarget=x86_64-windows-gnu --test-timeout 10m
 
       - name: Run integration tests
@@ -149,12 +150,25 @@ jobs:
   python-test:
     name: Python Tests
     needs: [zig-build, zig-build-windows]
-    runs-on: ${{ matrix.os }}
+    # `needs` waits on every leg of a job, so without this a Zig failure on any
+    # one platform would skip the binding tests on all of them. Each leg only
+    # uses its own platform's library: when that one is missing its download
+    # fails, and the other platforms still report.
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
         python-version: ['3.9', '3.11', '3.12']
+        include:
+          # ubuntu-latest is 26.04 now, and setup-python has no 3.9 for it. The
+          # package still supports 3.9, so that leg runs on 24.04 instead. `os`
+          # stays as it was because it names the library this leg downloads,
+          # which needs nothing newer than glibc 2.28.
+          - os: ubuntu-latest
+            python-version: '3.9'
+            runner: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -195,11 +209,12 @@ jobs:
   typescript-test:
     name: TypeScript Tests
     needs: [zig-build, zig-build-windows]
+    if: ${{ !cancelled() }} # see python-test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
         node-version: ['18', '20']
 
     steps:
@@ -244,11 +259,12 @@ jobs:
   go-test:
     name: Go Repo-Local Tests
     needs: zig-build
+    if: ${{ !cancelled() }} # see python-test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -274,11 +290,12 @@ jobs:
   java-test:
     name: Java Tests
     needs: zig-build
+    if: ${{ !cancelled() }} # see python-test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
 
     steps:
       - uses: actions/checkout@v4

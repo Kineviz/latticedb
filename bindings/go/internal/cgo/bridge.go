@@ -14,23 +14,26 @@ import (
 type ErrorCode int
 
 const (
-	ErrorOK              ErrorCode = 0
-	ErrorGeneric         ErrorCode = -1
-	ErrorIO              ErrorCode = -2
-	ErrorCorruption      ErrorCode = -3
-	ErrorNotFound        ErrorCode = -4
-	ErrorAlreadyExists   ErrorCode = -5
-	ErrorInvalidArg      ErrorCode = -6
-	ErrorTxnAborted      ErrorCode = -7
-	ErrorLockTimeout     ErrorCode = -8
-	ErrorReadOnly        ErrorCode = -9
-	ErrorFull            ErrorCode = -10
-	ErrorVersionMismatch ErrorCode = -11
-	ErrorChecksum        ErrorCode = -12
-	ErrorOutOfMemory     ErrorCode = -13
-	ErrorUnsupported     ErrorCode = -14
-	ErrorValueTooLarge   ErrorCode = -15
-	ErrorDatabaseLocked  ErrorCode = -16
+	ErrorOK               ErrorCode = 0
+	ErrorGeneric          ErrorCode = -1
+	ErrorIO               ErrorCode = -2
+	ErrorCorruption       ErrorCode = -3
+	ErrorNotFound         ErrorCode = -4
+	ErrorAlreadyExists    ErrorCode = -5
+	ErrorInvalidArg       ErrorCode = -6
+	ErrorTxnAborted       ErrorCode = -7
+	ErrorLockTimeout      ErrorCode = -8
+	ErrorReadOnly         ErrorCode = -9
+	ErrorFull             ErrorCode = -10
+	ErrorVersionMismatch  ErrorCode = -11
+	ErrorChecksum         ErrorCode = -12
+	ErrorOutOfMemory      ErrorCode = -13
+	ErrorUnsupported      ErrorCode = -14
+	ErrorValueTooLarge    ErrorCode = -15
+	ErrorDatabaseLocked   ErrorCode = -16
+	ErrorHasRelationships ErrorCode = -17
+	ErrorConfigMismatch   ErrorCode = -18
+	ErrorNeedsNewerWriter ErrorCode = -19
 )
 
 type QueryErrorStage int
@@ -81,7 +84,16 @@ type OpenOptions struct {
 	// so Open returns an error rather than waiting. Turning it off is for
 	// filesystems where locking does not work; it does not make concurrent
 	// access safe.
-	Lock                 bool
+	Lock bool
+	// The lattice_open_options_v5 fields. 0 means "not set" for each.
+	SyncMode             uint8
+	FullFsync            uint8
+	VectorMetric         uint8
+	VectorM              uint16
+	VectorEfConstruction uint16
+	// A lattice_changefeed_retention and its value (events or milliseconds).
+	ChangefeedRetention      uint8
+	ChangefeedRetentionValue uint64
 }
 
 type QueryResult struct {
@@ -93,6 +105,13 @@ type QueryCacheStats struct {
 	Entries uint32
 	Hits    uint64
 	Misses  uint64
+}
+
+type CheckpointStats struct {
+	PagesFlushed  uint32
+	DurationNS    uint64
+	CheckpointLSN uint64
+	WALTruncated  bool
 }
 
 type VectorSearchResult struct {
@@ -163,21 +182,28 @@ func Open(path string, opts OpenOptions) (*DB, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	cOpts := C.lattice_open_options_v4{
-		struct_size:            C.size_t(unsafe.Sizeof(C.lattice_open_options_v4{})),
-		create:                 C.bool(opts.Create),
-		read_only:              C.bool(opts.ReadOnly),
-		cache_size_mb:          C.uint32_t(opts.CacheSizeMB),
-		page_size:              C.uint32_t(opts.PageSize),
-		enable_vector:          C.bool(opts.EnableVector),
-		vector_dimensions:      C.uint16_t(opts.VectorDimensions),
-		enable_wal:             C.bool(opts.EnableWAL),
-		enable_adjacency_cache: C.bool(opts.EnableAdjacencyCache),
-		lock:                   C.bool(opts.Lock),
+	cOpts := C.lattice_open_options_v5{
+		struct_size:                C.size_t(unsafe.Sizeof(C.lattice_open_options_v5{})),
+		create:                     C.bool(opts.Create),
+		read_only:                  C.bool(opts.ReadOnly),
+		cache_size_mb:              C.uint32_t(opts.CacheSizeMB),
+		page_size:                  C.uint32_t(opts.PageSize),
+		enable_vector:              C.bool(opts.EnableVector),
+		vector_dimensions:          C.uint16_t(opts.VectorDimensions),
+		enable_wal:                 C.bool(opts.EnableWAL),
+		enable_adjacency_cache:     C.bool(opts.EnableAdjacencyCache),
+		lock:                       C.bool(opts.Lock),
+		sync_mode:                  C.uint8_t(opts.SyncMode),
+		full_fsync:                 C.uint8_t(opts.FullFsync),
+		vector_metric:              C.uint8_t(opts.VectorMetric),
+		vector_m:                   C.uint16_t(opts.VectorM),
+		vector_ef_construction:     C.uint16_t(opts.VectorEfConstruction),
+		changefeed_retention:       C.uint8_t(opts.ChangefeedRetention),
+		changefeed_retention_value: C.uint64_t(opts.ChangefeedRetentionValue),
 	}
 
 	var db *C.lattice_database
-	if err := errorFromCode(ErrorCode(C.lattice_open_v4(cPath, &cOpts, &db))); err != nil {
+	if err := errorFromCode(ErrorCode(C.lattice_open_v5(cPath, &cOpts, &db))); err != nil {
 		return nil, err
 	}
 
@@ -201,24 +227,31 @@ func (db *DB) Serialize() ([]byte, error) {
 
 	// Copied into Go memory before the native buffer is released, so what the
 	// caller holds does not depend on memory this function is about to free.
-	out := C.GoBytes(unsafe.Pointer(cBytes), C.int(cLen))
+	out := copyCBytes(unsafe.Pointer(cBytes), uint64(cLen))
 	C.lattice_free_bytes(cBytes, cLen)
 	return out, nil
 }
 
 // Deserialize opens a database from bytes produced by Serialize.
 func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
-	cOpts := C.lattice_open_options_v4{
-		struct_size:            C.size_t(unsafe.Sizeof(C.lattice_open_options_v4{})),
-		create:                 C.bool(false),
-		read_only:              C.bool(false),
-		cache_size_mb:          C.uint32_t(opts.CacheSizeMB),
-		page_size:              C.uint32_t(opts.PageSize),
-		enable_vector:          C.bool(opts.EnableVector),
-		vector_dimensions:      C.uint16_t(opts.VectorDimensions),
-		enable_wal:             C.bool(opts.EnableWAL),
-		enable_adjacency_cache: C.bool(opts.EnableAdjacencyCache),
-		lock:                   C.bool(opts.Lock),
+	cOpts := C.lattice_open_options_v5{
+		struct_size:                C.size_t(unsafe.Sizeof(C.lattice_open_options_v5{})),
+		create:                     C.bool(false),
+		read_only:                  C.bool(false),
+		cache_size_mb:              C.uint32_t(opts.CacheSizeMB),
+		page_size:                  C.uint32_t(opts.PageSize),
+		enable_vector:              C.bool(opts.EnableVector),
+		vector_dimensions:          C.uint16_t(opts.VectorDimensions),
+		enable_wal:                 C.bool(opts.EnableWAL),
+		enable_adjacency_cache:     C.bool(opts.EnableAdjacencyCache),
+		lock:                       C.bool(opts.Lock),
+		sync_mode:                  C.uint8_t(opts.SyncMode),
+		full_fsync:                 C.uint8_t(opts.FullFsync),
+		vector_metric:              C.uint8_t(opts.VectorMetric),
+		vector_m:                   C.uint16_t(opts.VectorM),
+		vector_ef_construction:     C.uint16_t(opts.VectorEfConstruction),
+		changefeed_retention:       C.uint8_t(opts.ChangefeedRetention),
+		changefeed_retention_value: C.uint64_t(opts.ChangefeedRetentionValue),
 	}
 
 	var ptr *C.uint8_t
@@ -227,7 +260,7 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 	}
 
 	var db *C.lattice_database
-	if err := errorFromCode(ErrorCode(C.lattice_deserialize(ptr, C.size_t(len(data)), &cOpts, &db))); err != nil {
+	if err := errorFromCode(ErrorCode(C.lattice_deserialize_v5(ptr, C.size_t(len(data)), &cOpts, &db))); err != nil {
 		return nil, err
 	}
 
@@ -266,6 +299,41 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	}
 
 	return &Tx{ptr: txn, db: db}, nil
+}
+
+// Checkpoint runs lattice_checkpoint with mode, which the caller has checked.
+func (db *DB) Checkpoint(mode int) (CheckpointStats, error) {
+	if db == nil || db.ptr == nil {
+		return CheckpointStats{}, &Error{Code: ErrorInvalidArg, Message: "database is not open"}
+	}
+
+	var stats C.lattice_checkpoint_stats
+	if err := errorFromCode(ErrorCode(C.lattice_checkpoint(
+		db.ptr,
+		C.lattice_checkpoint_mode(mode),
+		&stats,
+	))); err != nil {
+		return CheckpointStats{}, err
+	}
+
+	return CheckpointStats{
+		PagesFlushed:  uint32(stats.pages_flushed),
+		DurationNS:    uint64(stats.duration_ns),
+		CheckpointLSN: uint64(stats.checkpoint_lsn),
+		WALTruncated:  bool(stats.wal_truncated),
+	}, nil
+}
+
+// SetAutoCheckpoint runs lattice_set_auto_checkpoint.
+func (db *DB) SetAutoCheckpoint(maxWALFrames, minIntervalMS uint64) error {
+	if db == nil || db.ptr == nil {
+		return &Error{Code: ErrorInvalidArg, Message: "database is not open"}
+	}
+	return errorFromCode(ErrorCode(C.lattice_set_auto_checkpoint(
+		db.ptr,
+		C.uint64_t(maxWALFrames),
+		C.uint64_t(minIntervalMS),
+	)))
 }
 
 func (db *DB) CacheClear() error {
@@ -460,11 +528,14 @@ func (tx *Tx) Commit() error {
 	if tx == nil || tx.ptr == nil {
 		return nil
 	}
-	err := errorFromCode(ErrorCode(C.lattice_commit(tx.ptr)))
-	if err == nil {
+	code := ErrorCode(C.lattice_commit(tx.ptr))
+	// TXN_ABORTED means the C side has retired the handle (or had already): it
+	// cannot be committed or rolled back again. Any other failure leaves the
+	// transaction open for the caller to roll back.
+	if code == ErrorOK || code == ErrorTxnAborted {
 		tx.ptr = nil
 	}
-	return err
+	return errorFromCode(code)
 }
 
 func (tx *Tx) Rollback() error {
@@ -498,6 +569,10 @@ func (tx *Tx) AddNodeLabel(nodeID uint64, label string) error {
 
 func (tx *Tx) DeleteNode(nodeID uint64) error {
 	return errorFromCode(ErrorCode(C.lattice_node_delete(tx.ptr, C.lattice_node_id(nodeID))))
+}
+
+func (tx *Tx) DetachDeleteNode(nodeID uint64) error {
+	return errorFromCode(ErrorCode(C.lattice_node_detach_delete(tx.ptr, C.lattice_node_id(nodeID))))
 }
 
 func (tx *Tx) NodeExists(nodeID uint64) (bool, error) {
@@ -540,6 +615,43 @@ func (tx *Tx) SetNodeVector(nodeID uint64, key string, vector []float32) error {
 		cKey,
 		vectorPtr,
 		C.uint32_t(len(vector)),
+	)))
+}
+
+// GetNodeVector returns the node's vector, or nil when it has none.
+func (tx *Tx) GetNodeVector(nodeID uint64, key string) ([]float32, error) {
+	cKey := C.CString(key)
+	defer C.free(unsafe.Pointer(cKey))
+
+	var vectorOut *C.float
+	var dimsOut C.uint32_t
+	if err := errorFromCode(ErrorCode(C.lattice_node_get_vector(
+		tx.ptr,
+		C.lattice_node_id(nodeID),
+		cKey,
+		&vectorOut,
+		&dimsOut,
+	))); err != nil {
+		return nil, err
+	}
+	if vectorOut == nil || dimsOut == 0 {
+		return nil, nil
+	}
+	defer C.lattice_free_vector(vectorOut, dimsOut)
+
+	out := make([]float32, int(dimsOut))
+	copy(out, unsafe.Slice((*float32)(unsafe.Pointer(vectorOut)), len(out)))
+	return out, nil
+}
+
+func (tx *Tx) RemoveNodeVector(nodeID uint64, key string) error {
+	cKey := C.CString(key)
+	defer C.free(unsafe.Pointer(cKey))
+
+	return errorFromCode(ErrorCode(C.lattice_node_remove_vector(
+		tx.ptr,
+		C.lattice_node_id(nodeID),
+		cKey,
 	)))
 }
 
@@ -1079,6 +1191,27 @@ func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeou
 	return records, nil
 }
 
+// ChangefeedStatus returns the changefeed's retention mode and value, the
+// oldest event held (0 when none is) and the last sequence handed out.
+func (db *DB) ChangefeedStatus() (uint8, uint64, uint64, uint64, error) {
+	var mode C.uint8_t
+	var value, oldest, last C.uint64_t
+	if err := errorFromCode(ErrorCode(C.lattice_changefeed_status(db.ptr, &mode, &value, &oldest, &last))); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return uint8(mode), uint64(value), uint64(oldest), uint64(last), nil
+}
+
+// ChangefeedTrim applies the retention policy in full and returns the number
+// of events dropped.
+func (db *DB) ChangefeedTrim() (uint64, error) {
+	var removed C.uint64_t
+	if err := errorFromCode(ErrorCode(C.lattice_changefeed_trim(db.ptr, &removed))); err != nil {
+		return 0, err
+	}
+	return uint64(removed), nil
+}
+
 func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
 	var streamPtr unsafe.Pointer
 	if len(stream) > 0 {
@@ -1477,8 +1610,22 @@ func errorMessage(code ErrorCode) string {
 }
 
 func cStringN(ptr *C.char, length int) string {
-	if ptr == nil || length == 0 {
+	if ptr == nil || length <= 0 {
 		return ""
 	}
-	return C.GoStringN(ptr, C.int(length))
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(ptr)), length))
+}
+
+// copyCBytes copies length bytes of C memory into a new Go slice.
+//
+// C.GoBytes takes its length as a C int, so a buffer of 2 GiB or more wrapped:
+// to a negative length, which panics, or past 4 GiB to a short one, which
+// silently truncated a serialized database. The length here is a full size_t.
+func copyCBytes(ptr unsafe.Pointer, length uint64) []byte {
+	if ptr == nil || length == 0 {
+		return []byte{}
+	}
+	out := make([]byte, length)
+	copy(out, unsafe.Slice((*byte)(ptr), length))
+	return out
 }

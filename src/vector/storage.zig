@@ -27,6 +27,12 @@ const PageType = page.PageType;
 const BufferPool = buffer_pool.BufferPool;
 const BufferFrame = buffer_pool.BufferFrame;
 const LatchMode = locking.LatchMode;
+/// The part of a page this code lays out, which is not the database's page
+/// size. Databases can use pages of 4096 to 65535 bytes; these pages use
+/// their first 4096 bytes whatever the page size and leave the rest unused.
+/// That is the layout files are written with, so it is a format constant:
+/// sizing the layout from the real page size would misread every page an
+/// existing large-page database already holds.
 const PAGE_SIZE: usize = 4096;
 
 /// Vector storage errors
@@ -146,7 +152,45 @@ pub const VectorStorage = struct {
     last_page: PageId,
     layout: VectorLayout,
 
+    /// Deleted records that a store can reuse, so a store does not have to
+    /// walk the page chain looking for one. Filled by one walk the first time
+    /// a store needs it, then kept up to date by `delete`.
+    free_slots: std.ArrayListUnmanaged(VectorLocation) = .empty,
+    free_slots_known: bool = false,
+
+    /// Buffers that borrowed overflow vectors are copied into, reused from
+    /// one borrow to the next. Allocated on the first overflow borrow.
+    scratch: ?*ScratchPool = null,
+
     const Self = @This();
+
+    /// The most overflow vectors borrowed at once. The graph code holds at
+    /// most a batch of 64 neighbours, or a node, a candidate and 64 selected
+    /// neighbours; a borrow past this falls back to allocating.
+    const SCRATCH_SLOTS = 160;
+
+    pub const ScratchPool = struct {
+        buffers: [SCRATCH_SLOTS]?[]f32 = @splat(null),
+        in_use: std.StaticBitSet(SCRATCH_SLOTS) = .initEmpty(),
+
+        fn acquire(pool: *ScratchPool, allocator: Allocator, dimensions: usize) ?u8 {
+            var unused = pool.in_use.complement().iterator(.{});
+            const slot = unused.next() orelse return null;
+            if (pool.buffers[slot] == null) {
+                pool.buffers[slot] = allocator.alloc(f32, dimensions) catch return null;
+            }
+            pool.in_use.set(slot);
+            return @intCast(slot);
+        }
+
+        fn release(pool: *ScratchPool, slot: u8) void {
+            pool.in_use.unset(slot);
+        }
+
+        fn deinit(pool: *ScratchPool, allocator: Allocator) void {
+            for (pool.buffers) |buffer| if (buffer) |b| allocator.free(b);
+        }
+    };
 
     fn validateDimensions(dimensions: u16) VectorStorageError!void {
         types.validateVectorDimensions(dimensions) catch return VectorStorageError.InvalidDimensions;
@@ -267,6 +311,19 @@ pub const VectorStorage = struct {
         };
     }
 
+    /// Release the in-memory free-slot list. The storage stays usable; the
+    /// list is rebuilt from the pages if it is needed again.
+    pub fn deinit(self: *Self) void {
+        self.free_slots.deinit(self.allocator);
+        self.free_slots = .empty;
+        self.free_slots_known = false;
+        if (self.scratch) |pool| {
+            pool.deinit(self.allocator);
+            self.allocator.destroy(pool);
+            self.scratch = null;
+        }
+    }
+
     /// Open existing vector storage from a known first page
     pub fn open(allocator: Allocator, bp: *BufferPool, first_page: PageId, dimensions: u16) !Self {
         try validateDimensions(dimensions);
@@ -316,9 +373,14 @@ pub const VectorStorage = struct {
             return VectorStorageError.DimensionMismatch;
         }
 
-        if (try self.findReusableLocation()) |loc| {
-            try self.writeAtLocation(loc, vector_id, vector);
-            return loc;
+        if (!self.free_slots_known) try self.collectFreeSlots();
+        while (self.free_slots.pop()) |loc| {
+            // Reuse a listed record only if it is still free.
+            const reused = self.writeAtLocation(loc, vector_id, vector, .only_if_free) catch |err| {
+                self.free_slots.appendAssumeCapacity(loc);
+                return err;
+            };
+            if (reused) return loc;
         }
 
         return switch (self.layout) {
@@ -327,29 +389,29 @@ pub const VectorStorage = struct {
         };
     }
 
-    fn findReusableLocation(self: *Self) VectorStorageError!?VectorLocation {
+    /// Walk the page chain once and list every deleted record, first in chain
+    /// order at the top so stores fill the chain from the front.
+    fn collectFreeSlots(self: *Self) VectorStorageError!void {
+        self.free_slots.clearRetainingCapacity();
         var current_page = self.first_page;
         while (current_page != NULL_PAGE) {
             const frame = self.bp.fetchPage(current_page, .shared) catch return VectorStorageError.BufferPoolError;
-            const vph = self.readVectorPageHeader(frame) catch |err| {
-                self.bp.unpinPage(frame, false);
-                return err;
-            };
+            defer self.bp.unpinPage(frame, false);
+            const vph = try self.readVectorPageHeader(frame);
 
             var slot: u16 = 0;
             while (slot < vph.vector_count) : (slot += 1) {
                 const offset = VECTOR_DATA_OFFSET + @as(usize, slot) * self.bytes_per_vector;
                 const vector_id = std.mem.readInt(u64, frame.data[offset..][0..8], .little);
                 if (vector_id == DELETED_VECTOR_ID) {
-                    self.bp.unpinPage(frame, false);
-                    return .{ .page_id = current_page, .slot_index = slot };
+                    self.free_slots.append(self.allocator, .{ .page_id = current_page, .slot_index = slot }) catch
+                        return VectorStorageError.OutOfMemory;
                 }
             }
-
             current_page = vph.next_page;
-            self.bp.unpinPage(frame, false);
         }
-        return null;
+        std.mem.reverse(VectorLocation, self.free_slots.items);
+        self.free_slots_known = true;
     }
 
     /// Replace an existing vector without allocating a new storage record.
@@ -364,7 +426,7 @@ pub const VectorStorage = struct {
         }
         const stored_id = try self.getVectorId(loc);
         if (stored_id != vector_id) return VectorStorageError.NotFound;
-        try self.writeAtLocation(loc, vector_id, vector);
+        _ = try self.writeAtLocation(loc, vector_id, vector, .any);
     }
 
     /// Mark a stored vector record reusable by a future insertion.
@@ -387,14 +449,28 @@ pub const VectorStorage = struct {
         }
         std.mem.writeInt(u64, frame.data[offset..][0..8], DELETED_VECTOR_ID, .little);
         self.bp.unpinPage(frame, true);
+
+        if (self.free_slots_known) {
+            self.free_slots.append(self.allocator, loc) catch {
+                // The record is deleted either way; the next store that
+                // needs a free record walks the chain to find it.
+                self.free_slots.clearRetainingCapacity();
+                self.free_slots_known = false;
+            };
+        }
     }
 
+    const WriteMode = enum { any, only_if_free };
+
+    /// Write a record in place. With `.only_if_free` the record must be
+    /// deleted, and false is returned without writing if it is not.
     fn writeAtLocation(
         self: *Self,
         loc: VectorLocation,
         vector_id: u64,
         vector: []const f32,
-    ) VectorStorageError!void {
+        mode: WriteMode,
+    ) VectorStorageError!bool {
         const frame = self.bp.fetchPage(loc.page_id, .exclusive) catch return VectorStorageError.BufferPoolError;
         const vph = self.readVectorPageHeader(frame) catch |err| {
             self.bp.unpinPage(frame, false);
@@ -406,6 +482,12 @@ pub const VectorStorage = struct {
         }
 
         const offset = VECTOR_DATA_OFFSET + @as(usize, loc.slot_index) * self.bytes_per_vector;
+        if (mode == .only_if_free and
+            std.mem.readInt(u64, frame.data[offset..][0..8], .little) != DELETED_VECTOR_ID)
+        {
+            self.bp.unpinPage(frame, false);
+            return false;
+        }
         switch (self.layout) {
             .inline_data => {
                 const float_offset = offset + INLINE_VECTOR_ID_SIZE;
@@ -424,6 +506,7 @@ pub const VectorStorage = struct {
         }
         std.mem.writeInt(u64, frame.data[offset..][0..8], vector_id, .little);
         self.bp.unpinPage(frame, true);
+        return true;
     }
 
     fn storeInline(self: *Self, vector_id: u64, vector: []const f32) VectorStorageError!VectorLocation {
@@ -675,17 +758,24 @@ pub const VectorStorage = struct {
         switch (self.layout) {
             .inline_data => {
                 const float_offset = offset + INLINE_VECTOR_ID_SIZE;
-
-                for (0..self.dimensions) |i| {
-                    const byte_offset = float_offset + i * @sizeOf(f32);
-                    const bits = std.mem.readInt(u32, frame.data[byte_offset..][0..4], .little);
-                    result[i] = @bitCast(bits);
-                }
+                readFloats(result, frame.data[float_offset..][0 .. result.len * @sizeOf(f32)]);
             },
             .overflow => {
                 const first_overflow = std.mem.readInt(u32, frame.data[offset + 8 ..][0..4], .little);
                 try self.readOverflowChain(first_overflow, result);
             },
+        }
+    }
+
+    /// Copy little-endian f32s out of page bytes.
+    fn readFloats(out: []f32, bytes: []const u8) void {
+        std.debug.assert(bytes.len == out.len * @sizeOf(f32));
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            @memcpy(std.mem.sliceAsBytes(out), bytes);
+        } else {
+            for (out, 0..) |*value, i| {
+                value.* = @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            }
         }
     }
 
@@ -719,12 +809,11 @@ pub const VectorStorage = struct {
                 self.bp.unpinPage(frame, false);
                 return VectorStorageError.Corruption;
             }
-            const floats_in_page = expected_floats;
-            for (0..floats_in_page) |i| {
-                const byte_offset = OVERFLOW_DATA_OFFSET + i * @sizeOf(f32);
-                const bits = std.mem.readInt(u32, frame.data[byte_offset..][0..4], .little);
-                result[vector_offset + i] = @bitCast(bits);
-            }
+            const floats_in_page: usize = expected_floats;
+            readFloats(
+                result[vector_offset..][0..floats_in_page],
+                frame.data[OVERFLOW_DATA_OFFSET..][0 .. floats_in_page * @sizeOf(f32)],
+            );
 
             vector_offset += floats_in_page;
             current_page = oph.next_page;
@@ -744,6 +833,8 @@ pub const VectorStorage = struct {
         bp: ?*BufferPool = null,
         owned_data: ?[]f32 = null,
         allocator: ?Allocator = null,
+        scratch: ?*ScratchPool = null,
+        scratch_slot: u8 = 0,
 
         pub fn release(self: BorrowedVector) void {
             if (self.frame) |frame| {
@@ -751,6 +842,9 @@ pub const VectorStorage = struct {
             }
             if (self.owned_data) |owned| {
                 self.allocator.?.free(owned);
+            }
+            if (self.scratch) |pool| {
+                pool.release(self.scratch_slot);
             }
         }
     };
@@ -784,25 +878,40 @@ pub const VectorStorage = struct {
                 };
             },
             .overflow => {
-                const owned = self.allocator.alloc(f32, self.dimensions) catch {
-                    self.bp.unpinPage(frame, false);
-                    return VectorStorageError.OutOfMemory;
+                // The payload spans pages, so it is copied out: into a reused
+                // scratch buffer, or a fresh allocation if all are taken.
+                defer self.bp.unpinPage(frame, false);
+                var borrowed = BorrowedVector{ .data = &.{} };
+                const buffer = blk: {
+                    if (self.scratchPool()) |pool| {
+                        if (pool.acquire(self.allocator, self.dimensions)) |slot| {
+                            borrowed.scratch = pool;
+                            borrowed.scratch_slot = slot;
+                            break :blk pool.buffers[slot].?;
+                        }
+                    }
+                    const owned = self.allocator.alloc(f32, self.dimensions) catch
+                        return VectorStorageError.OutOfMemory;
+                    borrowed.owned_data = owned;
+                    borrowed.allocator = self.allocator;
+                    break :blk owned;
                 };
-                errdefer self.allocator.free(owned);
+                borrowed.data = buffer;
+                errdefer borrowed.release();
 
-                self.readVectorFromHeadFrame(frame, loc.slot_index, owned) catch |err| {
-                    self.bp.unpinPage(frame, false);
-                    return err;
-                };
-                self.bp.unpinPage(frame, false);
-
-                return BorrowedVector{
-                    .data = owned,
-                    .owned_data = owned,
-                    .allocator = self.allocator,
-                };
+                try self.readVectorFromHeadFrame(frame, loc.slot_index, buffer);
+                return borrowed;
             },
         }
+    }
+
+    fn scratchPool(self: *Self) ?*ScratchPool {
+        if (self.scratch == null) {
+            const pool = self.allocator.create(ScratchPool) catch return null;
+            pool.* = .{};
+            self.scratch = pool;
+        }
+        return self.scratch;
     }
 
     /// Get vector ID at a location
@@ -1116,6 +1225,7 @@ test "vector storage updates and reuses deleted records" {
     defer bp.deinit();
 
     var storage = try VectorStorage.init(allocator, &bp, 4);
+    defer storage.deinit();
     const original = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
     const replacement = [_]f32{ 0.0, 1.0, 0.0, 0.0 };
     const reused = [_]f32{ 0.0, 0.0, 1.0, 0.0 };
@@ -1271,6 +1381,7 @@ fn testLargeVectorRoundTrip(comptime dimensions: usize) !void {
         defer bp.deinit();
 
         var storage = try VectorStorage.init(allocator, &bp, @intCast(dimensions));
+        defer storage.deinit();
         first_page = storage.first_page;
 
         var vector: [dimensions]f32 = undefined;
@@ -1360,4 +1471,101 @@ test "vector storage rejects invalid dimensions and mismatched vectors" {
     var storage = try VectorStorage.init(allocator, &bp, 4);
     const wrong = [_]f32{ 1.0, 2.0, 3.0 };
     try std.testing.expectError(VectorStorageError.DimensionMismatch, storage.store(1, &wrong));
+}
+
+test "vector storage reuses records deleted before it was opened, then appends" {
+    const allocator = std.testing.allocator;
+    const vfs = @import("../storage/vfs.zig");
+    const page_manager = @import("../storage/page_manager.zig");
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/lattice_s2_vector_free_slots_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 64 * 4096);
+    defer bp.deinit();
+
+    // 384 dimensions fit two records to a page, so 9 records span 5 pages.
+    var first = try VectorStorage.init(allocator, &bp, 384);
+    defer first.deinit();
+    var vector: [384]f32 = undefined;
+    @memset(&vector, 0.5);
+    var locs: [9]VectorLocation = undefined;
+    for (&locs, 1..) |*loc, id| loc.* = try first.store(id, &vector);
+    try first.delete(locs[1], 2);
+    try first.delete(locs[6], 7);
+
+    var reopened = try VectorStorage.open(allocator, &bp, first.first_page, 384);
+    defer reopened.deinit();
+    const a = try reopened.store(100, &vector);
+    const b = try reopened.store(101, &vector);
+    try std.testing.expectEqual(locs[1], a);
+    try std.testing.expectEqual(locs[6], b);
+
+    // No free record is left, so the next store appends after the last one.
+    const c = try reopened.store(102, &vector);
+    try std.testing.expect(!std.meta.eql(c, a) and !std.meta.eql(c, b));
+    try std.testing.expectEqual(@as(u64, 10), try reopened.count());
+
+    // A record deleted now is reused next.
+    try reopened.delete(locs[3], 4);
+    try std.testing.expectEqual(locs[3], try reopened.store(103, &vector));
+}
+
+test "borrowing overflow vectors reuses scratch buffers instead of allocating" {
+    const allocator = std.testing.allocator;
+    const vfs = @import("../storage/vfs.zig");
+    const page_manager = @import("../storage/page_manager.zig");
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/lattice_s2_vector_scratch_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 256 * 4096);
+    defer bp.deinit();
+
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
+    var storage = try VectorStorage.init(counting.allocator(), &bp, 1536);
+    defer storage.deinit();
+
+    var locs: [3]VectorLocation = undefined;
+    var vector: [1536]f32 = undefined;
+    for (&locs, 0..) |*loc, i| {
+        fillLargeVector(&vector, @floatFromInt(i + 1));
+        loc.* = try storage.store(i + 1, &vector);
+    }
+
+    // The pool and one buffer per vector held at once are allocated on the
+    // first pass; later passes allocate nothing.
+    var allocations: usize = 0;
+    for (0..50) |pass| {
+        if (pass == 1) allocations = counting.allocations;
+        const a = try storage.borrowByLocation(locs[0]);
+        const b = try storage.borrowByLocation(locs[1]);
+        const c = try storage.borrowByLocation(locs[2]);
+        a.release();
+        b.release();
+        c.release();
+    }
+    try std.testing.expectEqual(allocations, counting.allocations);
+
+    // Contents match a plain read, including past the scratch slots.
+    var held: [VectorStorage.SCRATCH_SLOTS + 2]VectorStorage.BorrowedVector = undefined;
+    for (&held, 0..) |*h, i| h.* = try storage.borrowByLocation(locs[i % 3]);
+    defer for (held) |h| h.release();
+    for (held, 0..) |h, i| {
+        const copy = try storage.getByLocation(locs[i % 3]);
+        defer storage.free(copy);
+        try std.testing.expectEqualSlices(f32, copy, h.data);
+    }
 }

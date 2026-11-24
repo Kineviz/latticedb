@@ -112,6 +112,33 @@ const LatticeOpenOptionsV4 = defineNamedType('lattice_open_options_v4', () => ko
   lock: 'bool',
 }));
 
+const LatticeOpenOptionsV5 = defineNamedType('lattice_open_options_v5', () => koffi.struct('lattice_open_options_v5', {
+  struct_size: 'uintptr_t',
+  create: 'bool',
+  read_only: 'bool',
+  cache_size_mb: 'uint32',
+  page_size: 'uint32',
+  enable_vector: 'bool',
+  vector_dimensions: 'uint16',
+  enable_wal: 'bool',
+  enable_adjacency_cache: 'bool',
+  lock: 'bool',
+  sync_mode: 'uint8',
+  full_fsync: 'uint8',
+  vector_metric: 'uint8',
+  vector_m: 'uint16',
+  vector_ef_construction: 'uint16',
+  changefeed_retention: 'uint8',
+  changefeed_retention_value: 'uint64',
+}));
+
+const LatticeCheckpointStats = defineNamedType('lattice_checkpoint_stats', () => koffi.struct('lattice_checkpoint_stats', {
+  pages_flushed: 'uint32',
+  duration_ns: 'uint64',
+  checkpoint_lsn: 'uint64',
+  wal_truncated: 'bool',
+}));
+
 // Define struct for string in value union
 const LatticeStringValue = defineNamedType('lattice_string_value', () => koffi.struct('lattice_string_value', {
   ptr: 'void*',
@@ -195,11 +222,24 @@ export interface LatticeBindings {
     options: unknown,
     db_out: unknown[]
   ) => number;
+  lattice_open_v5?: (
+    path: string,
+    options: unknown,
+    db_out: unknown[]
+  ) => number;
   lattice_serialize?: (
     db: unknown,
     bytes_out: unknown[],
     len_out: number[]
   ) => number;
+  lattice_changefeed_status?: (
+    db: unknown,
+    retention_out: Buffer,
+    retention_value_out: Buffer,
+    oldest_sequence_out: Buffer,
+    last_sequence_out: Buffer
+  ) => number;
+  lattice_changefeed_trim?: (db: unknown, removed_out: Buffer) => number;
   lattice_deserialize?: (
     bytes: Uint8Array,
     len: number,
@@ -212,8 +252,26 @@ export interface LatticeBindings {
     options: unknown,
     db_out: unknown[]
   ) => number;
+  lattice_deserialize_v5?: (
+    bytes: Uint8Array,
+    len: number,
+    options: unknown,
+    db_out: unknown[]
+  ) => number;
+  lattice_deserialize_borrowed_v5?: (
+    bytes: Uint8Array,
+    len: number,
+    options: unknown,
+    db_out: unknown[]
+  ) => number;
   lattice_free_bytes?: (bytes: unknown, len: number) => void;
   lattice_close: (db: unknown) => number;
+  lattice_checkpoint?: (db: unknown, mode: number, stats_out: Buffer | null) => number;
+  lattice_set_auto_checkpoint?: (
+    db: unknown,
+    max_wal_frames: bigint,
+    min_interval_ms: bigint
+  ) => number;
 
   // Transaction operations
   lattice_begin: (
@@ -241,6 +299,7 @@ export interface LatticeBindings {
     label: string
   ) => number;
   lattice_node_delete: (txn: unknown, node_id: bigint) => number;
+  lattice_node_detach_delete?: (txn: unknown, node_id: bigint) => number;
   lattice_node_exists: (
     txn: unknown,
     node_id: bigint,
@@ -336,7 +395,7 @@ export interface LatticeBindings {
     payload: unknown,
     sequence_out: Buffer
   ) => number;
-  lattice_stream_read: (
+  lattice_stream_read: ((
     db: unknown,
     stream: Buffer,
     stream_len: number,
@@ -344,7 +403,18 @@ export interface LatticeBindings {
     limit: number,
     timeout_ms: number,
     batch_out: unknown[]
-  ) => number;
+  ) => number) & {
+    async: (
+      db: unknown,
+      stream: Buffer,
+      stream_len: number,
+      after_sequence: bigint,
+      limit: number,
+      timeout_ms: number,
+      batch_out: unknown[],
+      callback: (err: unknown, result: number) => void
+    ) => void;
+  };
   lattice_stream_batch_count: (batch: unknown) => number;
   lattice_stream_batch_get: (
     batch: unknown,
@@ -385,6 +455,15 @@ export interface LatticeBindings {
     vector: Float32Array,
     dimensions: number
   ) => number;
+  lattice_node_get_vector?: (
+    txn: unknown,
+    node_id: bigint,
+    key: string,
+    vector_out: unknown[],
+    dimensions_out: Buffer
+  ) => number;
+  lattice_free_vector?: (vector: unknown, dimensions: number) => void;
+  lattice_node_remove_vector?: (txn: unknown, node_id: bigint, key: string) => number;
   lattice_batch_insert: (
     txn: unknown,
     nodes: unknown,
@@ -700,6 +779,8 @@ function createBindings(): LatticeBindings {
   const OpenOptionsV2Ptr = koffi.pointer(LatticeOpenOptionsV2);
   const OpenOptionsV3Ptr = koffi.pointer(LatticeOpenOptionsV3);
   const OpenOptionsV4Ptr = koffi.pointer(LatticeOpenOptionsV4);
+  const OpenOptionsV5Ptr = koffi.pointer(LatticeOpenOptionsV5);
+  const CheckpointStatsPtr = koffi.pointer(LatticeCheckpointStats);
   const ValuePtr = koffi.pointer(LatticeValue);
   const ValueConstPtr = koffi.pointer(LatticeValue);
   const ValueConstPtrPtr = koffi.pointer(ValueConstPtr);
@@ -730,6 +811,22 @@ function createBindings(): LatticeBindings {
       OpenOptionsV4Ptr, // options
       koffi.out(DatabasePtrPtr), // db_out
     ]),
+    lattice_open_v5: tryOptionalFunc(lib, 'lattice_open_v5', 'int', [
+      'str', // path
+      OpenOptionsV5Ptr, // options
+      koffi.out(DatabasePtrPtr), // db_out
+    ]),
+    lattice_changefeed_status: tryOptionalFunc(lib, 'lattice_changefeed_status', 'int', [
+      DatabasePtr,
+      koffi.out(koffi.pointer('uint8')), // retention_out
+      koffi.out(koffi.pointer('uint64')), // retention_value_out
+      koffi.out(koffi.pointer('uint64')), // oldest_sequence_out
+      koffi.out(koffi.pointer('uint64')), // last_sequence_out
+    ]),
+    lattice_changefeed_trim: tryOptionalFunc(lib, 'lattice_changefeed_trim', 'int', [
+      DatabasePtr,
+      koffi.out(koffi.pointer('uint64')), // removed_out
+    ]),
     lattice_serialize: tryOptionalFunc(lib, 'lattice_serialize', 'int', [
       DatabasePtr,
       koffi.out(koffi.pointer('void*')), // bytes_out - raw pointer for manual free
@@ -747,11 +844,33 @@ function createBindings(): LatticeBindings {
       OpenOptionsV4Ptr, // options
       koffi.out(DatabasePtrPtr), // db_out
     ]),
+    lattice_deserialize_v5: tryOptionalFunc(lib, 'lattice_deserialize_v5', 'int', [
+      'uint8_t*', // bytes
+      'size_t', // len
+      OpenOptionsV5Ptr, // options
+      koffi.out(DatabasePtrPtr), // db_out
+    ]),
+    lattice_deserialize_borrowed_v5: tryOptionalFunc(lib, 'lattice_deserialize_borrowed_v5', 'int', [
+      'uint8_t*', // bytes
+      'size_t', // len
+      OpenOptionsV5Ptr, // options
+      koffi.out(DatabasePtrPtr), // db_out
+    ]),
     lattice_free_bytes: tryOptionalFunc(lib, 'lattice_free_bytes', 'void', [
       'void*',
       'size_t',
     ]),
     lattice_close: lib.func('lattice_close', 'int', [DatabasePtr]),
+    lattice_checkpoint: tryOptionalFunc(lib, 'lattice_checkpoint', 'int', [
+      DatabasePtr,
+      'int', // mode
+      CheckpointStatsPtr, // stats_out (may be NULL)
+    ]),
+    lattice_set_auto_checkpoint: tryOptionalFunc(lib, 'lattice_set_auto_checkpoint', 'int', [
+      DatabasePtr,
+      'uint64', // max_wal_frames
+      'uint64', // min_interval_ms
+    ]),
 
     // Transaction operations
     lattice_begin: lib.func('lattice_begin', 'int', [
@@ -779,6 +898,10 @@ function createBindings(): LatticeBindings {
       'str', // label
     ]),
     lattice_node_delete: lib.func('lattice_node_delete', 'int', [
+      TxnPtr,
+      'uint64', // node_id
+    ]),
+    lattice_node_detach_delete: tryOptionalFunc(lib, 'lattice_node_detach_delete', 'int', [
       TxnPtr,
       'uint64', // node_id
     ]),
@@ -935,6 +1058,22 @@ function createBindings(): LatticeBindings {
       'str', // key
       koffi.pointer('float'), // vector
       'uint32', // dimensions
+    ]),
+    lattice_node_get_vector: tryOptionalFunc(lib, 'lattice_node_get_vector', 'int', [
+      TxnPtr,
+      'uint64', // node_id
+      'str', // key
+      koffi.out(koffi.pointer(koffi.pointer('float'))), // vector_out
+      koffi.out(koffi.pointer('uint32')), // dimensions_out
+    ]),
+    lattice_free_vector: tryOptionalFunc(lib, 'lattice_free_vector', 'void', [
+      koffi.pointer('float'), // vector
+      'uint32', // dimensions
+    ]),
+    lattice_node_remove_vector: tryOptionalFunc(lib, 'lattice_node_remove_vector', 'int', [
+      TxnPtr,
+      'uint64', // node_id
+      'str', // key
     ]),
     lattice_batch_insert: lib.func('lattice_batch_insert', 'int', [
       TxnPtr,
@@ -1128,7 +1267,7 @@ function createBindings(): LatticeBindings {
       'uint32', // index
       koffi.out(koffi.pointer('uint64')), // source_out
       koffi.out(koffi.pointer('uint64')), // target_out
-      koffi.out(koffi.pointer('str')), // edge_type_out
+      koffi.out(koffi.pointer('void*')), // edge_type_out: read edge_type_len_out bytes
       koffi.out(koffi.pointer('uint32')), // edge_type_len_out
     ]),
     lattice_edge_result_free: lib.func('lattice_edge_result_free', 'void', [

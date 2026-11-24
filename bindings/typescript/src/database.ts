@@ -10,6 +10,7 @@ import {
   VectorSearchOptions,
   FtsSearchOptions,
   StreamRecord,
+  CheckpointStats,
 } from './types';
 import {
   getFFI,
@@ -17,6 +18,12 @@ import {
   LatticeError,
   LatticeErrorCode,
   DatabaseHandle,
+  SyncMode,
+  VectorMetric,
+  ChangefeedRetention,
+  ChangefeedStatus,
+  LatticeChangesTrimmedError,
+  CheckpointMode,
 } from './ffi';
 
 /**
@@ -27,17 +34,29 @@ export interface DatabaseOptions {
   create?: boolean;
   /** Open in read-only mode */
   readOnly?: boolean;
-  /** Cache size in megabytes */
+  /**
+   * Cache size in megabytes. Unset, the LATTICE_BUFFER_POOL_MB environment
+   * variable decides if it is set, else 100; a size given here wins over it.
+   */
   cacheSizeMb?: number;
-  /** Enable WAL-backed transactions (default: true) */
+  /** Log every commit so it survives a crash (default: true). Transactions work either way. */
   enableWal?: boolean;
-  /** Enable in-memory graph adjacency cache */
+  /**
+   * Accepted for compatibility. Queries and the other methods here read edges
+   * from storage either way, so it does not change their speed or results.
+   */
   enableAdjacencyCache?: boolean;
-  /** Enable vector storage and indexing */
+  /**
+   * Create a vector index if the database has none. A database that already
+   * has one opens with it whatever this says.
+   */
   enableVectors?: boolean;
-  /** @deprecated Use enableVectors instead. Earliest removal is v0.6.0. */
+  /** @deprecated Use enableVectors instead. */
   enableVector?: boolean;
-  /** Vector dimensions (default: 128) */
+  /**
+   * Vector dimensions when enableVectors is set (default: 128). It must match
+   * the index the file records, if it has one; 0 takes the file's.
+   */
   vectorDimensions?: number;
   /**
    * Take a lock on the file so two processes cannot tread on each other
@@ -47,6 +66,40 @@ export interface DatabaseOptions {
    * make concurrent access safe.
    */
   lock?: boolean;
+  /**
+   * When a commit waits for the disk. `'full'` syncs the log on every commit,
+   * so a commit that has returned survives a power cut. `'normal'` hands the
+   * commit to the operating system and returns: it survives the process being
+   * killed, but a power cut or OS crash can lose the most recent commits.
+   * Unset uses the LATTICE_SYNC_MODE environment variable, else full.
+   */
+  syncMode?: SyncMode;
+  /**
+   * On macOS, whether syncs ask the drive to flush its cache (F_FULLFSYNC).
+   * No effect elsewhere. Unset uses LATTICE_FULL_FSYNC, else off.
+   */
+  fullFsync?: boolean;
+  /**
+   * How a new vector index measures distance: `'cosine'` (1 - cos, vectors
+   * stored at unit length), `'euclidean'` (L2 distance) or `'dot_product'`
+   * (negative dot product). Unset means the file's, or cosine.
+   */
+  vectorMetric?: VectorMetric;
+  /** HNSW connections per node for a new index, 2..32. Unset: the file's, or 16. */
+  vectorM?: number;
+  /** HNSW build candidate list size for a new index, 1..4096. Unset: the file's, or 200. */
+  vectorEfConstruction?: number;
+  /**
+   * How much of the changefeed (see {@link Database.changes}) to keep:
+   * `'all'`, `'off'`, `'last:<events>'` or `'age:<duration>'` such as
+   * `'age:7d'`. The file records its policy. Unset keeps the file's, which is
+   * `'all'` unless something set another (for a new database, the
+   * LATTICE_CHANGEFEED_RETENTION environment variable). A value set here
+   * replaces the file's policy when the database is opened for writing; a
+   * read-only open never changes it. Retention drops the oldest events at
+   * checkpoints; {@link Database.trimChangefeed} applies it at once.
+   */
+  changefeedRetention?: ChangefeedRetention;
 }
 
 /**
@@ -85,7 +138,6 @@ export class Database {
     this.options = {
       create: false,
       readOnly: false,
-      cacheSizeMb: 100,
       enableWal: true,
       enableAdjacencyCache: false,
       enableVector: false,
@@ -133,6 +185,12 @@ export class Database {
       enableVector: this.options.enableVector,
       vectorDimensions: this.options.vectorDimensions,
       lock: this.options.lock,
+      syncMode: this.options.syncMode,
+      fullFsync: this.options.fullFsync,
+      vectorMetric: this.options.vectorMetric,
+      vectorM: this.options.vectorM,
+      vectorEfConstruction: this.options.vectorEfConstruction,
+      changefeedRetention: this.options.changefeedRetention,
     });
   }
 
@@ -315,13 +373,14 @@ export class Database {
     options: { afterSequence?: bigint; limit?: number; timeoutMs?: number } = {}
   ): Promise<StreamRecord[]> {
     this.ensureOpen();
-    return this.ffi!.readStream(
-      this.dbHandle!,
-      stream,
-      options.afterSequence ?? BigInt(0),
-      options.limit ?? 100,
-      options.timeoutMs ?? 0
-    );
+    const afterSequence = options.afterSequence ?? BigInt(0);
+    const limit = options.limit ?? 100;
+    const timeoutMs = options.timeoutMs ?? 0;
+    if (timeoutMs > 0) {
+      // A wait runs off the event loop; a plain read is quicker done inline.
+      return this.ffi!.readStreamAsync(this.dbHandle!, stream, afterSequence, limit, timeoutMs);
+    }
+    return this.ffi!.readStream(this.dbHandle!, stream, afterSequence, limit, 0);
   }
 
   async getStreamOffset(stream: string, consumer: string): Promise<bigint | null> {
@@ -329,10 +388,49 @@ export class Database {
     return this.ffi!.getStreamOffset(this.dbHandle!, stream, consumer);
   }
 
+  /**
+   * Read graph changefeed records from `__lattice_changes`: up to `limit`
+   * records with a sequence greater than `afterSequence`, oldest first.
+   * `afterSequence: 0n` reads from the oldest event held.
+   *
+   * Throws {@link LatticeChangesTrimmedError} when retention or a trim has
+   * dropped the events after `afterSequence` (the reader has missed changes),
+   * and a `LatticeError` with code `Unsupported` when the policy is `'off'`.
+   */
   async changes(
     options: { afterSequence?: bigint; limit?: number; timeoutMs?: number } = {}
   ): Promise<StreamRecord[]> {
-    return this.readStream('__lattice_changes', options);
+    try {
+      return await this.readStream('__lattice_changes', options);
+    } catch (err) {
+      if (err instanceof LatticeError && err.code === LatticeErrorCode.NotFound) {
+        throw new LatticeChangesTrimmedError(
+          `the changefeed no longer holds the events after sequence ${options.afterSequence ?? 0}: ` +
+            'its retention policy or a trim dropped them'
+        );
+      }
+      if (err instanceof LatticeError && err.code === LatticeErrorCode.Unsupported) {
+        throw new LatticeError("the changefeed is off (changefeedRetention: 'off')", err.code);
+      }
+      throw err;
+    }
+  }
+
+  /** The changefeed's retention policy and the events it holds. */
+  async changefeedStatus(): Promise<ChangefeedStatus> {
+    this.ensureOpen();
+    return this.ffi!.changefeedStatus(this.dbHandle!);
+  }
+
+  /**
+   * Apply the changefeed's retention policy in full now (checkpoints apply it
+   * a bounded number of events at a time) and make that durable. Returns the
+   * number of events dropped. Throws a `LatticeError` with code `LockTimeout`
+   * while a write transaction is open.
+   */
+  async trimChangefeed(): Promise<bigint> {
+    this.ensureOpen();
+    return this.ffi!.trimChangefeed(this.dbHandle!);
   }
 
   /**
@@ -341,6 +439,8 @@ export class Database {
    * @param vector - Query vector
    * @param options - Search options
    * @returns Search results
+   * @throws LatticeError with code -14 (Unsupported) if the database was
+   *   created without a vector index
    */
   async vectorSearch(
     vector: Float32Array,
@@ -489,6 +589,58 @@ export class Database {
   }
 
   /**
+   * Fold the log (the -wal file) into the database file now.
+   *
+   * A commit is durable once it is in the log; a checkpoint writes the pages
+   * the log's commits changed into the database file and can then empty the
+   * log. `'passive'` writes the changed pages unless one is in use, in which
+   * case it writes nothing and reports 0 pages, and leaves the log in place.
+   * `'full'` writes every changed page and leaves the log in place.
+   * `'truncate'` (the default, and what automatic checkpoints do) does what
+   * `'full'` does and then empties the log; it is the only mode that bounds the
+   * log's size.
+   *
+   * @param mode - `'passive'`, `'full'` or `'truncate'`; anything else throws a
+   *   TypeError before the library is called
+   * @returns What the checkpoint did
+   * @throws LatticeError with code -9 (`ReadOnly`) on a read-only database,
+   *   -8 (`LockTimeout`) if a transaction already has records in the log, -2
+   *   (`IoError`) if writing failed (the log still holds every commit), and -14
+   *   (`Unsupported`) if the native library has no `lattice_checkpoint`
+   */
+  async checkpoint(mode: CheckpointMode = 'truncate'): Promise<CheckpointStats> {
+    this.ensureOpen();
+    return this.ffi!.checkpoint(this.dbHandle!, mode);
+  }
+
+  /**
+   * Set when commits checkpoint from now on.
+   *
+   * A commit runs a `'truncate'` checkpoint once the log holds `maxWalFrames`
+   * frames (one frame is one page, usually 4096 bytes), and no sooner than
+   * `minIntervalMs` after the last automatic one. `maxWalFrames = 0` switches
+   * automatic checkpoints off: the log grows until {@link Database.checkpoint}
+   * runs, though closing still folds it into the file. Without this call the
+   * LATTICE_AUTO_CHECKPOINT_FRAMES environment variable sets the frame count
+   * (0 for none), and without that the log may grow to an eighth of the page
+   * cache, from 1000 frames up to 64 MB. This call wins over the variable, and
+   * its count is used as given, not scaled to the cache. It has no effect on
+   * a read-only database.
+   *
+   * A larger interval means fewer checkpoints, each a longer pause for the
+   * commit that runs it, a longer log on disk and more to replay after a crash.
+   * A smaller one means shorter pauses, more often.
+   *
+   * @throws RangeError if either argument is not a non-negative safe integer;
+   *   LatticeError with code -14 (`Unsupported`) if the native library has no
+   *   `lattice_set_auto_checkpoint`
+   */
+  async setAutoCheckpoint(maxWalFrames: number, minIntervalMs = 0): Promise<void> {
+    this.ensureOpen();
+    this.ffi!.setAutoCheckpoint(this.dbHandle!, maxWalFrames, minIntervalMs);
+  }
+
+  /**
    * Clear the query cache.
    *
    * Removes all cached parsed queries, forcing re-parsing on next execution.
@@ -545,6 +697,16 @@ export class Database {
  * await s3.send(new PutObjectCommand({ Bucket, Key, Body: db.serialize(), IfMatch: etag }));
  * ```
  *
+ * The options mean what they mean to {@link Database}, apart from `create` and
+ * `readOnly`, which are ignored. Bytes that hold a vector index open with the
+ * configuration they record, and any vector option that is set must match it
+ * (code -18, `ConfigMismatch`, otherwise); `enableVectors` creates an index,
+ * configured by the vector options, in bytes that have none. `syncMode`,
+ * `fullFsync`, `vectorMetric`, `vectorM`, `vectorEfConstruction` and
+ * `changefeedRetention` (which sets the policy as an open does) need a
+ * native library with `lattice_deserialize_v5`; against an older one, setting
+ * any of them throws with code -14 (`Unsupported`).
+ *
  * The bytes are copied, so the caller may discard them as soon as this returns.
  * Changes made afterwards do not travel back to them.
  *
@@ -575,6 +737,12 @@ export function deserialize(
     enableVector: options.enableVector,
     vectorDimensions: options.vectorDimensions,
     lock: options.lock,
+    syncMode: options.syncMode,
+    fullFsync: options.fullFsync,
+    vectorMetric: options.vectorMetric,
+    vectorM: options.vectorM,
+    vectorEfConstruction: options.vectorEfConstruction,
+    changefeedRetention: options.changefeedRetention,
   }, copy);
 
   // The handle is already open, so the wrapper is attached to it rather than

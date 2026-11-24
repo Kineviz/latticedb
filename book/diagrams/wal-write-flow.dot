@@ -1,33 +1,35 @@
-// A write becomes a WAL record before it becomes a page change; commit is the
-// point at which the frame is forced to disk.
+// The log's own write path. Records are copied into an in-memory frame; a
+// full frame is written without a sync; a commit ends with sync() in the
+// default sync mode and with flush() in .normal.
 digraph wal_write_flow {
   bgcolor="transparent"
   rankdir=TB
   nodesep=0.4
-  ranksep=0.45
+  ranksep=0.4
   fontname="Helvetica,Arial,sans-serif"
   node [shape=box style="filled,rounded" fillcolor="#eef4fb" color="#4a90d9"
-        penwidth=1.2 fontname="Helvetica,Arial,sans-serif" fontsize=12
-        fontcolor="#1a1a1a" margin="0.22,0.13"]
+        penwidth=1.2 fontname="Menlo,Consolas,monospace" fontsize=11
+        fontcolor="#1a1a1a" margin="0.2,0.12"]
   edge [color="#6b7280" penwidth=1.1 arrowsize=0.7
         fontname="Helvetica,Arial,sans-serif" fontsize=10 fontcolor="#6b7280"]
 
-  app [label="Application" fillcolor="#f6f8fa" color="#c7d0da"]
-  txn [label="Transaction\nINSERT(k, v)"]
-  wal [label="WAL Manager\l  1. assign LSN\l  2. build record\l  3. append to frame buffer\l"
-       fillcolor="#dbe9f8" fontname="Menlo,Consolas,monospace" fontsize=11]
+  caller [label="Commit logs its overlay\l(TXN_BEGIN goes out with the first record)\l"
+          fillcolor="#f6f8fa" color="#c7d0da"]
+  append [label="appendRecord\l  assign the next LSN\l  copy the record into the frame buffer\l"
+          fillcolor="#dbe9f8"]
+  full   [label="Frame full: write it to the -wal file,\lrewrite the header's frame count\l(no fsync)\l"]
+  commit [label="TXN_COMMIT appended" fillcolor="#f6f8fa" color="#c7d0da"]
+  sync   [label="sync(): write the partial frame\land the header, then fsync\lsync_mode = .full (default)\l"
+          fillcolor="#eaf5ea" color="#2f7d32" penwidth=1.6]
+  flush  [label="flush(): write the partial frame\land the header, no fsync\lsync_mode = .normal\l"
+          fillcolor="#fdf0ea" color="#c2703f"]
 
-  gate [shape=diamond style="filled" fillcolor="#f6f8fa" color="#c7d0da"
-        label="what triggered\nthe flush?" fontsize=11 margin="0.05,0.05"]
+  caller -> append
+  append -> full [label="  next record\l  does not fit\l"]
+  full -> append [style=dashed color="#c7d0da"]
+  append -> commit [label="  last record"]
+  commit -> sync
+  commit -> flush
 
-  full   [label="Frame buffer full\nflush frame to disk"]
-  commit [label="Commit requested\nflush frame + fsync"
-          fillcolor="#eaf5ea" color="#2f7d32"]
-  done   [label="Safe to return\nto the application"
-          fillcolor="#eaf5ea" color="#2f7d32" penwidth=1.5]
-
-  app -> txn -> wal -> gate
-  gate -> full   [label="  buffer full"]
-  gate -> commit [label="  COMMIT" color="#2f7d32"]
-  commit -> done [color="#2f7d32"]
+  { rank=same; sync; flush }
 }

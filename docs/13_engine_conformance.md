@@ -6,8 +6,8 @@ The goal is not to freeze Zig internals. The goal is to freeze the observable da
 
 This document sits alongside, not above, the existing binding contracts:
 
-- [c_api_nested_values.md](c_api_nested_values.md) defines the C ABI nested-value contract.
-- [go_cgo_plan.md](go_cgo_plan.md) defines the current Go binding plan and public Go surface.
+- [archive/c_api_nested_values.md](archive/c_api_nested_values.md) records the C ABI nested-value contract (now built; `include/lattice.h` is authoritative).
+- [archive/go_cgo_plan.md](archive/go_cgo_plan.md) records the Go binding plan (now built; see `bindings/go/README.md`).
 
 ## Purpose
 
@@ -108,7 +108,7 @@ The logical value model is:
 - `LIST`
 - `MAP`
 
-The detailed nested-value contract lives in [c_api_nested_values.md](c_api_nested_values.md). At the engine level the important points are:
+The detailed nested-value contract lives in [archive/c_api_nested_values.md](archive/c_api_nested_values.md). At the engine level the important points are:
 
 - lists are ordered and heterogeneous
 - maps are string-keyed nested values
@@ -121,26 +121,30 @@ The detailed nested-value contract lives in [c_api_nested_values.md](c_api_neste
 
 ### Missing Versus `NULL`
 
-Missing property and stored `NULL` are distinct concepts.
+Since 0.18.1 no write path stores a `NULL` property, so a property is either
+present with a non-`NULL` value or missing.
 
-- Direct property APIs must preserve the distinction.
-- High-level bindings should expose a way to distinguish them.
 - Query property access on a missing property yields `NULL`, not an error.
-- Query results may therefore contain `NULL` for both:
-  - an explicitly stored `NULL`
-  - a missing property referenced through query evaluation
-
-That distinction is only guaranteed through the direct property APIs, not through query projection alone.
+- A database written by 0.18.0 or earlier can still hold a stored `NULL`
+  property. It reads back as written until it is removed, and direct property
+  APIs report it as present with a `NULL` value; high-level bindings should keep
+  a way to tell it from a missing property.
+- `NULL` inside a list or a map is a value and is stored as given.
 
 ### Property Mutation Semantics
 
-The direct property APIs and Cypher mutation syntax are intentionally different:
+The direct property APIs and Cypher mutation syntax follow one rule:
 
-- Direct property setters may store an explicit `NULL` value.
-- In query mutation semantics, `SET n.prop = null` behaves like property removal.
+- Writing `NULL` to a property removes it. This holds for `SET n.prop = null`,
+  for the direct property setters (`lattice_node_set_property`,
+  `lattice_edge_set_property` and every binding's setter), and for the JSON,
+  JSONL and CSV importers. Removing a property that is not there does nothing.
+- A create call given a `NULL` property, in Cypher or a binding, leaves it out.
 - `REMOVE n.prop` also removes the property.
 
-This distinction is part of the public contract and should not be normalized away by a future engine.
+Up to 0.18.0 the direct setters stored an explicit `NULL`, and this document
+called that distinction part of the public contract. 0.18.1 dropped it so that
+the API and Cypher cannot disagree about whether a property exists.
 
 ## Transaction Semantics
 
@@ -165,8 +169,9 @@ The current public contract does not freeze:
 Only one read-write transaction may be active per database handle. Beginning a
 second writer fails with the public lock-timeout/contention error instead of
 allowing overlapping overlays to overwrite each other's committed changes.
-Read-only transactions may remain active while the writer runs and retain their
-snapshot-oriented visibility guarantees.
+Read-only transactions may remain active while the writer runs. What a
+long-lived reader sees of commits made while it is open is not frozen (see
+above).
 
 The internal transaction manager uses snapshot-oriented MVCC machinery, but that should not be treated as the required public engine contract yet because the end-to-end database APIs are not fully wired to expose those stronger guarantees consistently. Implementations may provide stronger isolation than the guarantees listed above, but callers must not depend on that stronger behavior for cross-engine portability.
 
@@ -238,6 +243,8 @@ The following behaviors are part of the contract:
 - `SET target.prop = expr` updates or removes a property depending on whether `expr` evaluates to non-`NULL` or `NULL`
 - `SET target = {...}` replaces the property map on the target
 - `SET target += {...}` merges into the property map on the target
+- no property is stored as `NULL`: a `NULL` value in a `SET target += {...}` map or in `ON CREATE SET` / `ON MATCH SET` removes that property, and one in a `SET target = {...}` map or a `CREATE` pattern leaves it out
+- a `NULL` pattern property in `MERGE`, on a node or a relationship, is an error
 - `REMOVE target.prop` removes a property
 - `REMOVE target:Label` removes a label
 - mutation against a bound edge variable targets the matched stable edge instance, not all parallel edges with the same endpoints
@@ -328,11 +335,13 @@ Current export behavior establishes several logical invariants worth preserving 
 
 ### Import Compatibility Boundary
 
-Current CLI import compatibility is intentionally narrower than the logical value model.
+CLI export writes JSON format version 2, which `import` reads back with every value type intact.
 
-- The JSON import path currently accepts scalar property values only: `NULL`, `BOOL`, numeric, and `STRING`.
-- Nested `LIST`/`MAP`, `BYTES`, and `VECTOR` values are not yet part of the guaranteed JSON import contract.
-- Cross-engine compatibility should therefore target the direct property/query APIs and canonical dump/export behavior, not full-fidelity nested-value interchange through the current CLI JSON import format.
+- `null`, booleans, integers, strings, lists and maps are plain JSON. Floats always carry a decimal point or an exponent, so `2.0` reads back as a float.
+- Bytes, vector-valued properties and non-finite floats are written as single-key tagged objects (`{"$bytes": "<base64>"}`, `{"$vector": [...]}`, `{"$float": "NaN"}`), and a map whose only key starts with `$` is wrapped in `{"$map": ...}`.
+- A string is always imported as a string.
+- A file with no `"version"` field is read as version 1, what 0.16.0 and earlier wrote. There an array of numbers still reads as a `VECTOR`, and bytes, which version 1 wrote as hex strings, come back as strings. A version newer than the importer knows is refused.
+- Node vectors (the HNSW embedding, not a vector property) are exported and imported whenever the database has a vector index, which the file records. A file records the vector dimensions but not the metric or the HNSW settings. Importing vectors into a database without an index needs `--enable-vector --vector-dims=<n>`, which creates one.
 
 ## Deliberately Unspecified Areas
 
@@ -363,6 +372,10 @@ The current extracted suite already covers black-box cases drawn from these sour
   - own-write visibility
   - deleted-version invisibility
 - `conformance/go/suite_test.go`
+  - persistence across reopen and stable edge IDs
+  - a `NULL` write storing no property, and nested values
+  - mutation atomicity and parallel edges
+  - search operators and the query cache
   - read-only rejection
   - own-write visibility
   - newly started transactions observe committed state
@@ -385,7 +398,7 @@ The current extracted suite already covers black-box cases drawn from these sour
   - aborted tail inserts remaining invisible after replay
   - post-recovery edge-ID monotonicity relative to committed state
 - binding integration tests
-  - missing-versus-`NULL` distinction in direct property APIs
+  - a `NULL` write through the direct property APIs removing the property
   - query cache surface behavior
   - nested value round-trips through public APIs
 

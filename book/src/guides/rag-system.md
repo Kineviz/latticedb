@@ -14,24 +14,29 @@ A typical RAG system with LatticeDB:
 ## Step 1: Set Up the Database
 
 ```python
-from latticedb import Database, hash_embed
+from latticedb import Database
+from latticedb.embedding import hash_embed
 
 db = Database(
     "rag.db",
     create=True,
-    enable_vector=True,
+    enable_vectors=True,
     vector_dimensions=128,  # Match your embedding model's output
 )
 db.open()
+
+# Declare the full-text index once, before loading text into Chunk.text
+db.create_node_fts_index("Chunk", "text")
 ```
 
 For production, use a real embedding model via the HTTP client:
 
 ```python
-from latticedb import EmbeddingClient
+from latticedb.embedding import EmbeddingClient
 
+# The endpoint is the full URL the client POSTs to
 client = EmbeddingClient(
-    "http://localhost:11434",
+    "http://localhost:11434/api/embeddings",
     model="nomic-embed-text",
 )
 ```
@@ -42,9 +47,7 @@ Split documents into chunks and store them with graph relationships:
 
 ```python
 def ingest_document(db, title, author_name, chunks):
-    db.create_node_fts_index("Chunk", "text")
-
-with db.write() as txn:
+    with db.write() as txn:
         # Create or find the author
         doc = txn.create_node(
             labels=["Document"],
@@ -78,6 +81,19 @@ with db.write() as txn:
             prev_chunk = chunk
 
         txn.commit()
+    return doc
+
+
+doc = ingest_document(
+    db,
+    "Attention Is All You Need",
+    "Vaswani",
+    [
+        "The transformer architecture uses self-attention.",
+        "Self-attention relates every position in a sequence to every other.",
+        "Multi-head attention runs several attention functions in parallel.",
+    ],
+)
 ```
 
 ## Step 3: Add Topic Links
@@ -122,16 +138,19 @@ def retrieve_context(db, query_text, k=5):
 Get surrounding chunks for more context:
 
 ```python
+query_vec = hash_embed("How does self-attention work?", dimensions=128)
+
 results = db.query("""
-    MATCH (chunk:Chunk)-[:PART_OF]->(doc:Document)
+    MATCH (prev:Chunk)-[:NEXT]->(chunk:Chunk)-[:PART_OF]->(doc:Document)
     WHERE chunk.embedding <=> $query < 0.5
-    WITH chunk, doc
+    RETURN prev.text, chunk.text, doc.title
     ORDER BY chunk.embedding <=> $query
     LIMIT 5
-    MATCH (prev:Chunk)-[:NEXT]->(chunk)
-    RETURN prev.text, chunk.text, doc.title
 """, parameters={"query": query_vec})
 ```
+
+The path can also be written in two `MATCH` clauses that share `chunk`; a node
+variable bound in one `MATCH` stands for the same node in the next.
 
 ### Combine Vector and Full-Text Search
 
@@ -168,15 +187,18 @@ Question: How does self-attention work?"""
 
 ## Batch Loading
 
-For large datasets, use batch insert:
+For large datasets, `batch_insert_vectors` creates a node and stores its vector
+for every row in one call:
 
 ```python
 import numpy as np
 
+all_chunks = ["first chunk of text", "second chunk of text"]  # your chunk texts
+
 with db.write() as txn:
-    # Insert 10,000 chunks at once
+    # Insert every chunk at once
     vectors = np.array([hash_embed(text, 128) for text in all_chunks], dtype=np.float32)
-    node_ids = txn.batch_insert("Chunk", vectors)
+    node_ids = txn.batch_insert_vectors("Chunk", vectors)
 
     # Set properties and create edges afterward
     for node_id, text in zip(node_ids, all_chunks):
@@ -187,8 +209,9 @@ with db.write() as txn:
 
 ## Performance Tips
 
-- Use `batch_insert()` for bulk loading — significantly faster than individual creates
-- Set `ef_search` based on your recall requirements (64 gives 100% recall at 1M vectors)
-- Use `cache_size_mb` to control memory usage
+- Use `batch_insert_vectors()` for bulk loading — it saves one binding call per node; each vector is still inserted into the HNSW index individually
+- Set `ef_search` based on your recall requirements: the default, 64, measured about 98% recall@10 at 100K vectors and 93–96% at 1M; 128 brought 1M to about 98% (see [Benchmarks](../performance/benchmarks.md#ef_search))
+- End a retrieval query as above, with `ORDER BY` the same `<=>` distance as the `WHERE` and a `LIMIT`: the search then stops once it has enough rows, rather than finding every chunk under the threshold and sorting them. To return the distance, write it in the `RETURN` the same way (`chunk.embedding <=> $query AS dist`) and the measured value is reused
+- Use `cache_size_mb` to control memory usage; once the file outgrows the cache (about 100K 128-d vectors at the default 100 MB), vector inserts and searches slow down several times over, so size it to the file for large indexes
 - Declare a full-text index only over properties you actually search; each one costs write time
-- Use parameters (`$name`) to enable query plan caching
+- Use parameters (`$name`) so the query text stays the same and its parsed form is reused from the query cache

@@ -3,6 +3,8 @@
 //! Provides operators for scanning nodes:
 //! - AllNodesScan: Scans all nodes in the graph
 //! - LabelScan: Scans nodes with a specific label
+//! - PropertyIndexScan: The nodes an equality index names
+//! - NodeIdSeek: The nodes `WHERE id(n) = k` or `id(n) IN [...]` names
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -80,7 +82,8 @@ pub const AllNodesScan = struct {
         // Allocate row for reuse
         self.current_row = ctx.allocRow() catch return OperatorError.OutOfMemory;
 
-        self.node_ids = self.database.getAllNodeIdsInTxn(ctx.txn) catch return OperatorError.StorageError;
+        self.node_ids = self.database.getAllNodeIdsInTxn(ctx.txn) catch |err|
+            return ctx.storageFailure(err, "reading every node", .{});
         self.current_index = 0;
     }
 
@@ -122,6 +125,12 @@ pub const AllNodesScan = struct {
 
 /// Scans nodes with a specific label using the LabelIndex.
 /// Produces one row per node with the node ID in the output slot.
+///
+/// A query that only reads streams the ids: it reads the label index
+/// `CHUNK` ids at a time, so `MATCH (n:L) RETURN n LIMIT 1` reads one chunk
+/// rather than every :L node. A query that writes takes all the ids when it
+/// opens instead, so that nodes it creates, relabels or deletes while
+/// scanning cannot change which nodes the scan visits.
 pub const LabelScan = struct {
     /// The slot to output node IDs to
     output_slot: u8,
@@ -129,12 +138,33 @@ pub const LabelScan = struct {
     label_id: SymbolId,
     /// Database reference for txn-aware scans
     database: *Database,
-    /// Materialized node ids visible in the current txn
+    /// Materialized node ids visible in the current txn (writing queries)
     node_ids: ?[]NodeId,
-    /// Current result index
+    /// Current result index into `node_ids`
     current_index: usize,
     /// Current row being returned
     current_row: ?*Row,
+    /// Streaming state (read-only queries)
+    stream: ?Stream,
+
+    const CHUNK = 256;
+
+    /// Committed ids read from the label index a chunk at a time, merged
+    /// with the nodes the transaction's overlay gives the label.
+    const Stream = struct {
+        chunk: []NodeId,
+        chunk_len: usize = 0,
+        chunk_pos: usize = 0,
+        /// The last committed id read, where the next chunk starts.
+        last: ?NodeId = null,
+        /// The index has nothing after the current chunk.
+        exhausted: bool = false,
+        /// The next committed id the overlay does not rule out.
+        pending: ?NodeId = null,
+        /// Overlay nodes with the label, ascending.
+        overlay_ids: []NodeId,
+        overlay_pos: usize = 0,
+    };
 
     const Self = @This();
 
@@ -148,6 +178,7 @@ pub const LabelScan = struct {
             .node_ids = null,
             .current_index = 0,
             .current_row = null,
+            .stream = null,
         };
         return self;
     }
@@ -167,46 +198,122 @@ pub const LabelScan = struct {
         .deinit = deinit,
     };
 
+    /// The label scan `op` is, if it is one. Its rows carry nothing but
+    /// the node, one row per node, so an operator reading them can treat
+    /// the scan as the set "nodes with this label".
+    pub fn of(op: Operator) ?*Self {
+        if (op.vtable != &vtable) return null;
+        return @ptrCast(@alignCast(op.ptr));
+    }
+
     fn open(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        // Opened again without a close (the inner side of a join): start over.
+        self.release();
+
         // Allocate row for reuse
         self.current_row = ctx.allocRow() catch return OperatorError.OutOfMemory;
-
-        self.node_ids = self.database.getNodesByLabelIdInTxn(ctx.txn, self.label_id) catch return OperatorError.StorageError;
         self.current_index = 0;
-    }
 
-    fn next(ptr: *anyopaque, _: *ExecutionContext) OperatorError!?*Row {
-        const self: *Self = @ptrCast(@alignCast(ptr));
-
-        const node_ids = self.node_ids orelse return OperatorError.NotInitialized;
-        const row = self.current_row orelse return OperatorError.NotInitialized;
-
-        if (self.current_index < node_ids.len) {
-            const node_id = node_ids[self.current_index];
-            self.current_index += 1;
-            // Set the node reference in the output slot
-            row.clear();
-            row.setSlot(self.output_slot, .{ .node_ref = node_id });
-
-            return row;
+        if (!ctx.stable_reads) {
+            self.node_ids = self.database.getNodesByLabelIdInTxn(ctx.txn, self.label_id) catch |err|
+                return ctx.storageFailure(err, "reading the label index", .{});
+            return;
         }
 
-        return null;
+        const allocator = self.database.allocator;
+        const chunk = allocator.alloc(NodeId, CHUNK) catch return OperatorError.OutOfMemory;
+        errdefer allocator.free(chunk);
+        const overlay_ids = self.database.overlayNodesWithLabel(ctx.txn, self.label_id) catch |err|
+            return ctx.storageFailure(err, "reading the transaction's labelled nodes", .{});
+        self.stream = .{ .chunk = chunk, .overlay_ids = overlay_ids };
     }
 
-    fn close(ptr: *anyopaque, _: *ExecutionContext) void {
+    /// The next committed id with the label that the overlay does not
+    /// contradict, or null when the index has no more.
+    fn nextCommitted(self: *Self, stream: *Stream, ctx: *ExecutionContext) OperatorError!?NodeId {
+        while (true) {
+            if (stream.chunk_pos == stream.chunk_len) {
+                if (stream.exhausted) return null;
+                const n = self.database.label_index.readNodesByLabel(self.label_id, stream.last, stream.chunk) catch |err|
+                    return ctx.storageFailure(err, "reading the label index", .{});
+                stream.chunk_len = n;
+                stream.chunk_pos = 0;
+                if (n < stream.chunk.len) stream.exhausted = true;
+                if (n == 0) return null;
+                stream.last = stream.chunk[n - 1];
+            }
+            const id = stream.chunk[stream.chunk_pos];
+            stream.chunk_pos += 1;
+            // An overlay that holds the node decides; a node it gives the
+            // label is in `overlay_ids` as well, and the merge emits it once.
+            if (self.database.overlayNodeHasLabel(ctx.txn, id, self.label_id)) |has| {
+                if (!has) continue;
+            }
+            return id;
+        }
+    }
+
+    fn nextStreamed(self: *Self, stream: *Stream, ctx: *ExecutionContext) OperatorError!?NodeId {
+        if (stream.pending == null) stream.pending = try self.nextCommitted(stream, ctx);
+        const committed = stream.pending;
+        const from_overlay: ?NodeId = if (stream.overlay_pos < stream.overlay_ids.len)
+            stream.overlay_ids[stream.overlay_pos]
+        else
+            null;
+
+        if (from_overlay) |o| {
+            if (committed == null or o <= committed.?) {
+                stream.overlay_pos += 1;
+                if (committed != null and committed.? == o) stream.pending = null;
+                return o;
+            }
+        }
+        stream.pending = null;
+        return committed;
+    }
+
+    fn next(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!?*Row {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        const row = self.current_row orelse return OperatorError.NotInitialized;
+
+        const node_id: NodeId = if (self.stream) |*stream|
+            (try self.nextStreamed(stream, ctx)) orelse return null
+        else blk: {
+            const node_ids = self.node_ids orelse return OperatorError.NotInitialized;
+            if (self.current_index >= node_ids.len) return null;
+            self.current_index += 1;
+            break :blk node_ids[self.current_index - 1];
+        };
+
+        // Set the node reference in the output slot
+        row.clear();
+        row.setSlot(self.output_slot, .{ .node_ref = node_id });
+        return row;
+    }
+
+    fn release(self: *Self) void {
         if (self.node_ids) |node_ids| {
             self.database.allocator.free(node_ids);
             self.node_ids = null;
         }
+        if (self.stream) |stream| {
+            self.database.allocator.free(stream.chunk);
+            self.database.allocator.free(stream.overlay_ids);
+            self.stream = null;
+        }
+    }
+
+    fn close(ptr: *anyopaque, _: *ExecutionContext) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.release();
     }
 
     fn deinit(ptr: *anyopaque, allocator: Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
+        self.release();
         allocator.destroy(self);
     }
 };
@@ -217,6 +324,56 @@ pub const LabelScan = struct {
 
 /// Scans an explicit label/property equality index. The value expression is
 /// evaluated once at open time, allowing both literals and query parameters.
+/// The nodes with `label` whose indexed `property` equals `value`, as
+/// Cypher compares: 1 and 1.0 are equal.
+///
+/// The index keys a value by a digest of its type and bits, so an integer
+/// and the float of the same number land under different keys. The other
+/// form is looked up as well and the two lists merged. The result is owned
+/// by `database.allocator`.
+pub fn findNodesByIndexedValue(
+    database: *Database,
+    ctx: *const ExecutionContext,
+    label: []const u8,
+    property: []const u8,
+    value: types.PropertyValue,
+) OperatorError![]NodeId {
+    const first = database.findNodesByLabelProperty(ctx.txn, label, property, value, std.math.maxInt(usize)) catch |err|
+        return ctx.storageFailure(err, "reading the property index on {s}.{s}", .{ label, property });
+    const other: types.PropertyValue = switch (value) {
+        .int_val => |i| blk: {
+            const f: f64 = @floatFromInt(i);
+            // Only when the float is exactly this integer.
+            if (f >= 0x1p63 or @as(i64, @intFromFloat(f)) != i) return first;
+            break :blk .{ .float_val = f };
+        },
+        .float_val => |f| blk: {
+            if (!std.math.isFinite(f) or @trunc(f) != f or f < -0x1p63 or f >= 0x1p63) return first;
+            break :blk .{ .int_val = @intFromFloat(f) };
+        },
+        else => return first,
+    };
+    defer database.allocator.free(first);
+    const second = database.findNodesByLabelProperty(ctx.txn, label, property, other, std.math.maxInt(usize)) catch |err|
+        return ctx.storageFailure(err, "reading the property index on {s}.{s}", .{ label, property });
+    defer database.allocator.free(second);
+
+    const merged = database.allocator.alloc(NodeId, first.len + second.len) catch return OperatorError.OutOfMemory;
+    @memcpy(merged[0..first.len], first);
+    @memcpy(merged[first.len..], second);
+    std.mem.sort(NodeId, merged, {}, std.sort.asc(NodeId));
+    var kept: usize = 0;
+    for (merged) |id| {
+        if (kept > 0 and merged[kept - 1] == id) continue;
+        merged[kept] = id;
+        kept += 1;
+    }
+    if (kept == merged.len) return merged;
+    // The caller frees the slice it gets, so it must be the allocation.
+    defer database.allocator.free(merged);
+    return database.allocator.dupe(NodeId, merged[0..kept]) catch OperatorError.OutOfMemory;
+}
+
 pub const PropertyIndexScan = struct {
     output_slot: u8,
     label: []const u8,
@@ -269,15 +426,13 @@ pub const PropertyIndexScan = struct {
         const temporary_allocator = ctx.row_arena.allocator();
         var evaluator = expression.ExpressionEvaluator.init(temporary_allocator);
         const empty_row = Row.init();
-        const evaluated = evaluator.evaluate(self.value_expression, &empty_row, ctx) catch return OperatorError.EvaluationError;
-        const value = evaluated.toPropertyValue(temporary_allocator);
-        self.node_ids = self.database.findNodesByLabelProperty(
-            ctx.txn,
-            self.label,
-            self.property,
-            value,
-            std.math.maxInt(usize),
-        ) catch return OperatorError.StorageError;
+        const evaluated = evaluator.evaluate(self.value_expression, &empty_row, ctx) catch |err| return switch (err) {
+            error.OutOfMemory => OperatorError.OutOfMemory,
+            error.StorageError => OperatorError.StorageError,
+            else => OperatorError.EvaluationError,
+        };
+        const value = evaluated.toPropertyValue(temporary_allocator) catch return OperatorError.OutOfMemory;
+        self.node_ids = try findNodesByIndexedValue(self.database, ctx, self.label, self.property, value);
         self.current_index = 0;
     }
 
@@ -308,6 +463,134 @@ pub const PropertyIndexScan = struct {
 };
 
 // ============================================================================
+// NodeIdSeek Operator
+// ============================================================================
+
+/// The nodes `WHERE id(n) = k` or `WHERE id(n) IN [...]` names, read
+/// straight from the node tree rather than by scanning every node.
+///
+/// The value is evaluated once when the scan opens, so it may be a literal,
+/// a parameter or a list of them. Every number that is a whole non-negative
+/// value names an id (`id(n) = 3.0` holds for node 3, as Cypher compares);
+/// anything else names none. The ids are visited ascending, once each, and
+/// only those that exist as the transaction sees them. The WHERE keeps the
+/// condition and checks each row, and the pattern's labels are checked by
+/// filters above, so the seek only has to offer every node that could match.
+pub const NodeIdSeek = struct {
+    output_slot: u8,
+    value_expression: *const ast.Expression,
+    /// `IN`: the value is a list of ids rather than one.
+    list: bool,
+    database: *Database,
+    allocator: Allocator,
+    node_ids: std.ArrayList(NodeId) = .empty,
+    current_index: usize = 0,
+    current_row: ?*Row = null,
+
+    const Self = @This();
+
+    pub fn init(
+        allocator: Allocator,
+        output_slot: u8,
+        value_expression: *const ast.Expression,
+        list: bool,
+        database: *Database,
+    ) !*Self {
+        const self = try allocator.create(Self);
+        self.* = .{
+            .output_slot = output_slot,
+            .value_expression = value_expression,
+            .list = list,
+            .database = database,
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    pub fn operator(self: *Self) Operator {
+        return .{ .vtable = &vtable, .ptr = self };
+    }
+
+    const vtable = Operator.VTable{
+        .open = open,
+        .next = next,
+        .close = close,
+        .deinit = deinit,
+    };
+
+    /// The node id a value names, if any.
+    fn idOf(value: expression.EvalResult) ?NodeId {
+        return switch (value) {
+            .int_val => |i| if (i >= 0) @intCast(i) else null,
+            .float_val => |f| if (std.math.isFinite(f) and f >= 0 and f < 0x1p64 and @trunc(f) == f)
+                @intFromFloat(f)
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn open(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.current_row = ctx.allocRow() catch return OperatorError.OutOfMemory;
+        self.node_ids.clearRetainingCapacity();
+        self.current_index = 0;
+
+        var evaluator = expression.ExpressionEvaluator.init(ctx.row_arena.allocator());
+        const empty_row = Row.init();
+        const value = evaluator.evaluate(self.value_expression, &empty_row, ctx) catch |err| return switch (err) {
+            error.OutOfMemory => OperatorError.OutOfMemory,
+            error.StorageError => OperatorError.StorageError,
+            else => OperatorError.EvaluationError,
+        };
+        if (self.list) {
+            switch (value) {
+                .list_val => |items| for (items) |item| {
+                    if (idOf(item)) |id| self.node_ids.append(self.allocator, id) catch return OperatorError.OutOfMemory;
+                },
+                else => {},
+            }
+        } else if (idOf(value)) |id| {
+            self.node_ids.append(self.allocator, id) catch return OperatorError.OutOfMemory;
+        }
+
+        std.mem.sort(NodeId, self.node_ids.items, {}, std.sort.asc(NodeId));
+        var kept: usize = 0;
+        for (self.node_ids.items) |id| {
+            if (kept > 0 and self.node_ids.items[kept - 1] == id) continue;
+            const visible = self.database.nodeVisibleInTxn(ctx.txn, id) catch |err|
+                return ctx.storageFailure(err, "reading node {d}", .{id});
+            if (!visible) continue;
+            self.node_ids.items[kept] = id;
+            kept += 1;
+        }
+        self.node_ids.shrinkRetainingCapacity(kept);
+    }
+
+    fn next(ptr: *anyopaque, _: *ExecutionContext) OperatorError!?*Row {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const row = self.current_row orelse return OperatorError.NotInitialized;
+        if (self.current_index >= self.node_ids.items.len) return null;
+        const node_id = self.node_ids.items[self.current_index];
+        self.current_index += 1;
+        row.clear();
+        row.setSlot(self.output_slot, .{ .node_ref = node_id });
+        return row;
+    }
+
+    fn close(ptr: *anyopaque, _: *ExecutionContext) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.node_ids.clearRetainingCapacity();
+    }
+
+    fn deinit(ptr: *anyopaque, allocator: Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.node_ids.deinit(self.allocator);
+        allocator.destroy(self);
+    }
+};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -327,6 +610,18 @@ test "LabelScan basic structure" {
     try std.testing.expect(@TypeOf(vtable.next) != void);
     try std.testing.expect(@TypeOf(vtable.close) != void);
     try std.testing.expect(@TypeOf(vtable.deinit) != void);
+}
+
+test "NodeIdSeek takes whole non-negative numbers as ids" {
+    try std.testing.expectEqual(@as(?NodeId, 3), NodeIdSeek.idOf(.{ .int_val = 3 }));
+    try std.testing.expectEqual(@as(?NodeId, 3), NodeIdSeek.idOf(.{ .float_val = 3.0 }));
+    try std.testing.expectEqual(@as(?NodeId, 0), NodeIdSeek.idOf(.{ .float_val = -0.0 }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .float_val = 3.5 }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .int_val = -1 }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .float_val = std.math.nan(f64) }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .float_val = 0x1p64 }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .string_val = "3" }));
+    try std.testing.expectEqual(@as(?NodeId, null), NodeIdSeek.idOf(.{ .null_val = {} }));
 }
 
 test "PropertyIndexScan basic structure" {

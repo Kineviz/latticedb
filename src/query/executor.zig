@@ -27,6 +27,9 @@ const Transaction = txn_mod.Transaction;
 const database_mod = lattice.storage.database;
 const Database = database_mod.Database;
 
+const regex = @import("regex.zig");
+const ast = @import("ast.zig");
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -60,11 +63,94 @@ pub const OperatorError = error{
     PropertyNotFound,
     /// Operation not supported
     Unsupported,
+    /// DELETE of a node that still has relationships (use DETACH DELETE)
+    NodeHasRelationships,
 };
+
+/// What went wrong in a failed execution, in words, written where the
+/// failure is found.
+///
+/// An error value says only which kind of thing failed: every evaluation
+/// failure used to reach the user as "EvaluationError: query failed", the
+/// same for a division by zero as for an unknown function. The code that
+/// finds a failure knows the operator, the function and the values, so it
+/// records them here, and the database reports this text through the same
+/// path that carries parse errors.
+///
+/// Nothing is formatted until something fails. The first failure recorded
+/// wins: errors propagate outwards, and the innermost one is the cause.
+pub const Diagnostic = struct {
+    pub const Kind = enum {
+        /// Something about the query or its data: a type error, an overflow.
+        query,
+        /// Reading or writing the database failed.
+        storage,
+        out_of_memory,
+    };
+
+    buf: [MESSAGE_CAPACITY]u8 = undefined,
+    len: usize = 0,
+    recorded: bool = false,
+    kind: Kind = .query,
+    /// A short name for the failure, such as "DivisionByZero".
+    code: []const u8 = "",
+    /// Where in the query text, when the failing expression is known.
+    location: ?ast.SourceLocation = null,
+
+    pub const MESSAGE_CAPACITY = 384;
+
+    pub fn record(
+        self: *Diagnostic,
+        kind: Kind,
+        code: []const u8,
+        location: ?ast.SourceLocation,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
+        @branchHint(.cold);
+        if (self.recorded) return;
+        self.recorded = true;
+        self.kind = kind;
+        self.code = code;
+        self.location = location;
+        var writer: std.Io.Writer = .fixed(&self.buf);
+        writer.print(fmt, args) catch {
+            // Keep what fitted and say it was cut.
+            const ellipsis = "...";
+            self.len = self.buf.len;
+            @memcpy(self.buf[self.buf.len - ellipsis.len ..], ellipsis);
+            return;
+        };
+        self.len = writer.end;
+    }
+
+    pub fn message(self: *const Diagnostic) ?[]const u8 {
+        if (!self.recorded or self.len == 0) return null;
+        return self.buf[0..self.len];
+    }
+};
+
+/// The kind of failure an error value stands for, for errors recorded
+/// without a more specific kind.
+pub fn diagnosticKind(err: anyerror) Diagnostic.Kind {
+    return switch (err) {
+        error.StorageError => .storage,
+        error.OutOfMemory => .out_of_memory,
+        else => .query,
+    };
+}
 
 // ============================================================================
 // Slot Value
 // ============================================================================
+
+/// A path: its nodes in order and the relationships between them, one fewer
+/// than the nodes. A named path (`p = (a)-->(b)`) and the walk of a
+/// variable-length relationship are held as one.
+pub const Path = struct {
+    nodes: []const NodeId,
+    edges: []const EdgeId,
+};
 
 /// A value stored in a row slot
 pub const SlotValue = union(enum) {
@@ -76,12 +162,23 @@ pub const SlotValue = union(enum) {
     edge_ref: EdgeId,
     /// Scalar property value
     property: PropertyValue,
+    /// A path, in memory that lasts as long as the query.
+    path: *const Path,
+    /// A list or map with nodes, relationships or paths in it, which a
+    /// property value cannot hold, in memory that lasts as long as the query.
+    value: *const @import("expression.zig").EvalResult,
 
     const Self = @This();
 
     /// Check if this slot is empty
     pub fn isEmpty(self: Self) bool {
         return self == .empty;
+    }
+
+    /// Whether the slot holds null, as a variable that OPTIONAL MATCH did
+    /// not bind does.
+    pub fn isNull(self: Self) bool {
+        return self == .property and self.property == .null_val;
     }
 
     /// Get as node ID if this is a node reference
@@ -124,6 +221,11 @@ pub const Row = struct {
     scores: [MAX_SLOTS]f32,
     /// Bitmask indicating which slots are populated
     populated: u16,
+    /// Slots whose distance a vector search set, and whose score a full-text
+    /// search set, for this row's entity. A slot given a new value loses
+    /// both, so a number never outlives the entity it was measured for.
+    measured: u16 = 0,
+    scored: u16 = 0,
 
     const Self = @This();
 
@@ -141,7 +243,10 @@ pub const Row = struct {
     pub fn setSlot(self: *Self, slot: u8, value: SlotValue) void {
         std.debug.assert(slot < MAX_SLOTS);
         self.slots[slot] = value;
-        self.populated |= (@as(u16, 1) << @intCast(slot));
+        const bit = @as(u16, 1) << @intCast(slot);
+        self.populated |= bit;
+        self.measured &= ~bit;
+        self.scored &= ~bit;
     }
 
     /// Get a slot value, returns null if slot is not populated
@@ -163,6 +268,33 @@ pub const Row = struct {
     pub fn setDistance(self: *Self, slot: u8, distance: f32) void {
         std.debug.assert(slot < MAX_SLOTS);
         self.distances[slot] = distance;
+        self.measured |= @as(u16, 1) << @intCast(slot);
+    }
+
+    /// The distance a vector search measured for the entity in `slot`, or
+    /// null when no search did.
+    pub fn searchDistance(self: *const Self, slot: u8) ?f32 {
+        std.debug.assert(slot < MAX_SLOTS);
+        if (self.measured & (@as(u16, 1) << @intCast(slot)) == 0) return null;
+        return self.distances[slot];
+    }
+
+    /// The score a full-text search gave the entity in `slot`, or null when
+    /// no search did.
+    pub fn searchScore(self: *const Self, slot: u8) ?f32 {
+        std.debug.assert(slot < MAX_SLOTS);
+        if (self.scored & (@as(u16, 1) << @intCast(slot)) == 0) return null;
+        return self.scores[slot];
+    }
+
+    /// Carry `slot`'s search distance and score over from `other`, where
+    /// the slot holds the same entity in both.
+    pub fn copySearchMarks(self: *Self, other: *const Self, slot: u8) void {
+        const bit = @as(u16, 1) << @intCast(slot);
+        self.distances[slot] = other.distances[slot];
+        self.scores[slot] = other.scores[slot];
+        self.measured = (self.measured & ~bit) | (other.measured & bit);
+        self.scored = (self.scored & ~bit) | (other.scored & bit);
     }
 
     /// Get the distance for a slot
@@ -175,6 +307,7 @@ pub const Row = struct {
     pub fn setScore(self: *Self, slot: u8, score: f32) void {
         std.debug.assert(slot < MAX_SLOTS);
         self.scores[slot] = score;
+        self.scored |= @as(u16, 1) << @intCast(slot);
     }
 
     /// Get the score for a slot
@@ -199,6 +332,8 @@ pub const Row = struct {
                 self.populated |= (@as(u16, 1) << @intCast(i));
             }
         }
+        self.measured = (self.measured & ~other.populated) | other.measured;
+        self.scored = (self.scored & ~other.populated) | other.scored;
     }
 
     /// Clear all slots
@@ -207,6 +342,8 @@ pub const Row = struct {
         self.distances = [_]f32{0.0} ** MAX_SLOTS;
         self.scores = [_]f32{0.0} ** MAX_SLOTS;
         self.populated = 0;
+        self.measured = 0;
+        self.scored = 0;
     }
 };
 
@@ -315,6 +452,31 @@ pub const FtsFilterCache = struct {
 
 /// Runtime context for query execution.
 /// Provides access to storage, parameters, and memory management.
+/// What a planned vector search compared its entities with.
+pub const VectorQuery = struct {
+    property: []const u8,
+    param_name: ?[]const u8 = null,
+    literal: ?[]const f32 = null,
+};
+
+/// The vector search, if any, behind each slot. Only the slots in `mask`
+/// hold one and the rest of `items` is undefined, so a query without a
+/// vector search pays nothing to set this up.
+pub const VectorQueries = struct {
+    mask: u16 = 0,
+    items: [MAX_SLOTS]VectorQuery = undefined,
+
+    pub fn get(self: *const VectorQueries, slot: u8) ?VectorQuery {
+        if (self.mask & (@as(u16, 1) << @intCast(slot)) == 0) return null;
+        return self.items[slot];
+    }
+
+    pub fn set(self: *VectorQueries, slot: u8, query: VectorQuery) void {
+        self.items[slot] = query;
+        self.mask |= @as(u16, 1) << @intCast(slot);
+    }
+};
+
 pub const ExecutionContext = struct {
     /// Allocator for query lifetime allocations
     allocator: Allocator,
@@ -327,6 +489,10 @@ pub const ExecutionContext = struct {
 
     /// Variable name to slot mapping
     variables: std.StringHashMap(u8),
+
+    /// The plans of the pattern subqueries in the query's expressions, set
+    /// while the query runs when it has any.
+    subqueries: ?*@import("operators/subquery.zig").SubqueryHost = null,
 
     /// Node store for property lookups (optional)
     node_store: ?*NodeStore,
@@ -346,7 +512,110 @@ pub const ExecutionContext = struct {
     /// record what it looked up. Null until the first search needs it.
     fts_cache: ?*FtsFilterCache = null,
 
+    /// Patterns `=~` has compiled during this execution. A pointer for the
+    /// same reason as `fts_cache`; null when it could not be allocated, and
+    /// then each match compiles its pattern.
+    regex_cache: ?*regex.Cache = null,
+
+    /// Whether nothing writes to the stores while this query runs, so a
+    /// node record read once can be read again from memory. False unless
+    /// the caller knows the query only reads.
+    stable_reads: bool = false,
+
+    /// The vector search, if any, that put each slot's entity in the row:
+    /// which property it searched and with what query. `x.prop <=> query`
+    /// written the same way returns the distance that search measured
+    /// rather than computing it again.
+    /// The planner's, borrowed for the execution; null when no planner
+    /// set it.
+    vector_queries: ?*const VectorQueries = null,
+
+    /// Where a failure is described for the caller, or null when nobody
+    /// will read it. A pointer, so code holding a `*const ExecutionContext`
+    /// can still write to it.
+    diagnostic: ?*Diagnostic = null,
+
     const Self = @This();
+
+    /// Record why the query failed and return `err`, for
+    /// `return ctx.fail(error.X, location, "...", .{...})`. The message is
+    /// formatted only here, on the way out.
+    pub fn fail(
+        self: *const Self,
+        err: anytype,
+        location: ?ast.SourceLocation,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) @TypeOf(err) {
+        @branchHint(.cold);
+        if (self.diagnostic) |d| d.record(diagnosticKind(err), @errorName(err), location, fmt, args);
+        return err;
+    }
+
+    /// Whether a failure has already been described, so an outer layer
+    /// does not replace the cause with its own, vaguer, account.
+    pub fn failureRecorded(self: *const Self) bool {
+        const d = self.diagnostic orelse return true;
+        return d.recorded;
+    }
+
+    /// A failed database call as an operator error, recorded with what was
+    /// being done, so that a failure of the storage underneath cannot be
+    /// mistaken for a fault in the query, or the other way round.
+    ///
+    /// Some database errors are the caller's doing: a value too large to
+    /// store, a write in a read-only transaction. Those are reported as
+    /// query errors under their own names; the rest are storage errors.
+    pub fn storageFailure(
+        self: *const Self,
+        err: anyerror,
+        comptime what: []const u8,
+        args: anytype,
+    ) OperatorError {
+        @branchHint(.cold);
+        if (err == error.OutOfMemory) {
+            if (self.diagnostic) |d| d.record(.out_of_memory, "OutOfMemory", null, "Out of memory while " ++ what, args);
+            return OperatorError.OutOfMemory;
+        }
+        if (isCallerError(err)) {
+            if (self.diagnostic) |d| d.record(.query, @errorName(err), null, "Cannot complete " ++ what ++ ": {s}", args ++ .{callerErrorText(err)});
+            return OperatorError.InvalidState;
+        }
+        if (self.diagnostic) |d| d.record(.storage, "StorageError", null, "Storage error while " ++ what ++ ": {s}", args ++ .{@errorName(err)});
+        return OperatorError.StorageError;
+    }
+
+    fn isCallerError(err: anyerror) bool {
+        return switch (err) {
+            error.ValueTooLarge,
+            error.TransactionReadOnly,
+            error.ReadOnly,
+            error.PermissionDenied,
+            error.TransactionNotActive,
+            error.TransactionConflict,
+            error.InvalidArgument,
+            error.MissingIndex,
+            error.NotFound,
+            error.NodeHasRelationships,
+            => true,
+            else => false,
+        };
+    }
+
+    fn callerErrorText(err: anyerror) []const u8 {
+        return switch (err) {
+            error.ValueTooLarge => "the value is too large to store",
+            error.TransactionReadOnly => "the transaction is read-only",
+            error.ReadOnly, error.PermissionDenied => "the database is open read-only",
+            error.TransactionNotActive => "the transaction is no longer active",
+            error.TransactionConflict => "another transaction conflicts with this one",
+            error.InvalidArgument => "an argument is not valid",
+            error.MissingIndex => "the index does not exist",
+            error.NotFound => "a node or relationship it needs does not exist, or was deleted earlier in the query",
+            error.NodeHasRelationships => "the node still has relationships; delete them first, or use DETACH DELETE",
+            else => @errorName(err),
+        };
+    }
 
     /// Create a new execution context
     /// Somewhere to remember full-text searches for the length of a query.
@@ -356,6 +625,12 @@ pub const ExecutionContext = struct {
     fn newFtsCache(allocator: Allocator) ?*FtsFilterCache {
         const cache = allocator.create(FtsFilterCache) catch return null;
         cache.* = FtsFilterCache.init(allocator);
+        return cache;
+    }
+
+    fn newRegexCache(allocator: Allocator) ?*regex.Cache {
+        const cache = allocator.create(regex.Cache) catch return null;
+        cache.* = regex.Cache.init(allocator);
         return cache;
     }
 
@@ -370,6 +645,8 @@ pub const ExecutionContext = struct {
             .database = null,
             .txn = null,
             .fts_cache = newFtsCache(allocator),
+            .regex_cache = newRegexCache(allocator),
+            .diagnostic = null,
         };
     }
 
@@ -385,6 +662,7 @@ pub const ExecutionContext = struct {
             .database = null,
             .txn = null,
             .fts_cache = newFtsCache(allocator),
+            .regex_cache = newRegexCache(allocator),
         };
     }
 
@@ -394,6 +672,11 @@ pub const ExecutionContext = struct {
             cache.deinit();
             self.allocator.destroy(cache);
             self.fts_cache = null;
+        }
+        if (self.regex_cache) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
+            self.regex_cache = null;
         }
         self.row_arena.deinit();
         self.parameters.deinit();

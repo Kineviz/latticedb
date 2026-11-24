@@ -41,7 +41,36 @@ pub fn appendSlotValueKey(buf: *std.ArrayList(u8), allocator: Allocator, value: 
             try buf.append(allocator, 3);
             try appendPropertyValueKey(buf, allocator, pv);
         },
+        .path => |p| {
+            try buf.append(allocator, 4);
+            try appendPathKey(buf, allocator, p.*);
+        },
+        .value => |v| {
+            try buf.append(allocator, 5);
+            try appendEvalResultKey(buf, allocator, v.*);
+        },
     }
+}
+
+/// A float keys as the integer it equals when it is a whole number an i64
+/// can hold, so 1.0 groups with 1 as `1 = 1.0` says it should, while
+/// 9007199254740992.0 still differs from 9007199254740993. -0.0 is 0 and
+/// every NaN is one NaN, so they group as one value each.
+fn appendFloatKey(buf: *std.ArrayList(u8), allocator: Allocator, f: f64) !void {
+    if (@trunc(f) == f and f >= -0x1p63 and f < 0x1p63) {
+        try buf.append(allocator, 2);
+        try appendU64(buf, allocator, @bitCast(@as(i64, @intFromFloat(f))));
+        return;
+    }
+    try buf.append(allocator, 3);
+    const canonical = if (std.math.isNan(f)) std.math.nan(f64) else f;
+    try appendU64(buf, allocator, @bitCast(canonical));
+}
+
+fn appendPathKey(buf: *std.ArrayList(u8), allocator: Allocator, path: executor.Path) !void {
+    try appendLen(buf, allocator, path.nodes.len);
+    for (path.nodes) |id| try appendU64(buf, allocator, id);
+    for (path.edges) |id| try appendU64(buf, allocator, id);
 }
 
 pub fn appendPropertyValueKey(buf: *std.ArrayList(u8), allocator: Allocator, value: PropertyValue) !void {
@@ -55,10 +84,7 @@ pub fn appendPropertyValueKey(buf: *std.ArrayList(u8), allocator: Allocator, val
             try buf.append(allocator, 2);
             try appendU64(buf, allocator, @bitCast(i));
         },
-        .float_val => |f| {
-            try buf.append(allocator, 3);
-            try appendU64(buf, allocator, @bitCast(f));
-        },
+        .float_val => |f| try appendFloatKey(buf, allocator, f),
         .string_val => |s| {
             try buf.append(allocator, 4);
             try appendBytes(buf, allocator, s);
@@ -101,10 +127,7 @@ pub fn appendEvalResultKey(buf: *std.ArrayList(u8), allocator: Allocator, value:
             try buf.append(allocator, 2);
             try appendU64(buf, allocator, @bitCast(i));
         },
-        .float_val => |f| {
-            try buf.append(allocator, 3);
-            try appendU64(buf, allocator, @bitCast(f));
-        },
+        .float_val => |f| try appendFloatKey(buf, allocator, f),
         .string_val => |s| {
             try buf.append(allocator, 4);
             try appendBytes(buf, allocator, s);
@@ -140,6 +163,10 @@ pub fn appendEvalResultKey(buf: *std.ArrayList(u8), allocator: Allocator, value:
                 try appendBytes(buf, allocator, entry.key);
                 try appendEvalResultKey(buf, allocator, entry.value);
             }
+        },
+        .path_val => |p| {
+            try buf.append(allocator, 11);
+            try appendPathKey(buf, allocator, p.*);
         },
     }
 }

@@ -901,3 +901,243 @@ test "lexer: += tokenized as single operator" {
     try std.testing.expectEqual(TokenType.plus_equal, t2.token_type);
     try std.testing.expectEqualStrings("+=", t2.text);
 }
+
+// ============================================================================
+// Expression Semantics Tests
+// ============================================================================
+
+const ExpressionEvaluator = lattice.query.expression.ExpressionEvaluator;
+const EvalResult = lattice.query.expression.EvalResult;
+
+/// Evaluate a Cypher expression made of literals only.
+///
+/// The expression is parsed as the condition of a WHERE clause, the smallest
+/// query that carries an arbitrary expression, and evaluated against an empty
+/// row. Everything lives in `arena`, which the caller frees.
+fn evalCypher(arena: std.mem.Allocator, expr_source: []const u8) !EvalResult {
+    const source = try std.fmt.allocPrint(arena, "MATCH (n) WHERE {s} RETURN n", .{expr_source});
+    var parser = Parser.init(arena, source);
+    const parsed = parser.parse();
+    const query = parsed.query orelse return error.ParseFailed;
+    const condition = query.clauses[1].where.condition;
+
+    var evaluator = ExpressionEvaluator.init(arena);
+    var row = Row.init();
+    var ctx = ExecutionContext.init(arena);
+    return evaluator.evaluate(condition, &row, &ctx);
+}
+
+fn expectCypherNull(expr_source: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try evalCypher(arena.allocator(), expr_source);
+    if (!result.isNull()) {
+        std.debug.print("expected `{s}` to be null, got {any}\n", .{ expr_source, result });
+        return error.TestExpectedNull;
+    }
+}
+
+fn expectCypherBool(expr_source: []const u8, expected: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try evalCypher(arena.allocator(), expr_source);
+    if (result != .bool_val or result.bool_val != expected) {
+        std.debug.print("expected `{s}` to be {}, got {any}\n", .{ expr_source, expected, result });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "expression: comparison with a null operand is null" {
+    try expectCypherNull("null = null");
+    try expectCypherNull("null <> null");
+    try expectCypherNull("null = 1");
+    try expectCypherNull("1 = null");
+    try expectCypherNull("null <> 1");
+    try expectCypherNull("'a' <> null");
+    try expectCypherNull("null < 1");
+    try expectCypherNull("null <= 1");
+    try expectCypherNull("1 > null");
+    try expectCypherNull("1 >= null");
+}
+
+test "expression: NOT null is null" {
+    try expectCypherNull("NOT null");
+    try expectCypherNull("NOT (null > 3)");
+    try expectCypherBool("NOT false", true);
+    try expectCypherBool("NOT true", false);
+}
+
+test "expression: AND, OR and XOR follow three-valued logic" {
+    try expectCypherBool("false AND null", false);
+    try expectCypherBool("null AND false", false);
+    try expectCypherNull("true AND null");
+    try expectCypherNull("null AND true");
+    try expectCypherNull("null AND null");
+    try expectCypherBool("true AND true", true);
+
+    try expectCypherBool("true OR null", true);
+    try expectCypherBool("null OR true", true);
+    try expectCypherNull("false OR null");
+    try expectCypherNull("null OR false");
+    try expectCypherNull("null OR null");
+    try expectCypherBool("false OR false", false);
+
+    try expectCypherNull("true XOR null");
+    try expectCypherNull("null XOR false");
+    try expectCypherBool("true XOR false", true);
+    try expectCypherBool("true XOR true", false);
+}
+
+test "expression: IS NULL and IS NOT NULL stay two-valued" {
+    try expectCypherBool("null IS NULL", true);
+    try expectCypherBool("null IS NOT NULL", false);
+    try expectCypherBool("(null = 1) IS NULL", true);
+    try expectCypherBool("1 IS NULL", false);
+    try expectCypherBool("1 IS NOT NULL", true);
+}
+
+test "expression: IN with nulls follows three-valued logic" {
+    try expectCypherBool("1 IN [1, null]", true);
+    try expectCypherNull("2 IN [1, null]");
+    try expectCypherNull("null IN [1, 2]");
+    try expectCypherNull("1 IN null");
+    try expectCypherBool("3 IN [1, 2]", false);
+    try expectCypherBool("null IN []", false);
+}
+
+test "expression: string operators and arithmetic propagate null" {
+    try expectCypherNull("null STARTS WITH 'a'");
+    try expectCypherNull("'abc' STARTS WITH null");
+    try expectCypherNull("null ENDS WITH 'c'");
+    try expectCypherNull("'abc' CONTAINS null");
+    try expectCypherNull("null + 1");
+    try expectCypherNull("1 - null");
+    try expectCypherNull("null * 2");
+    try expectCypherNull("null / 2");
+    try expectCypherNull("2 % null");
+    try expectCypherNull("-null");
+}
+
+fn expectCypherInt(expr_source: []const u8, expected: i64) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try evalCypher(arena.allocator(), expr_source);
+    if (result != .int_val or result.int_val != expected) {
+        std.debug.print("expected `{s}` to be {d}, got {any}\n", .{ expr_source, expected, result });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectCypherFloat(expr_source: []const u8, expected: f64) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try evalCypher(arena.allocator(), expr_source);
+    if (result != .float_val or @abs(result.float_val - expected) > 1e-9) {
+        std.debug.print("expected `{s}` to be {d}, got {any}\n", .{ expr_source, expected, result });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectCypherError(expr_source: []const u8, expected: anyerror) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    if (evalCypher(arena.allocator(), expr_source)) |result| {
+        std.debug.print("expected `{s}` to fail with {s}, got {any}\n", .{ expr_source, @errorName(expected), result });
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(expected, err);
+    }
+}
+
+test "expression: % takes the sign of the dividend" {
+    try expectCypherInt("-7 % 2", -1);
+    try expectCypherInt("7 % -2", 1);
+    try expectCypherInt("-7 % -2", -1);
+    try expectCypherInt("7 % 2", 1);
+    try expectCypherInt("-6 % 3", 0);
+    try expectCypherFloat("7.5 % 2", 1.5);
+    try expectCypherFloat("-7.5 % 2", -1.5);
+    try expectCypherFloat("7 % 2.5", 2.0);
+    try expectCypherFloat("-7 % 2.5", -2.0);
+}
+
+test "expression: the smallest integer % -1 is 0" {
+    try expectCypherInt("(-9223372036854775807 - 1) % -1", 0);
+}
+
+test "expression: division or remainder by zero is an error" {
+    try expectCypherError("7 % 0", error.DivisionByZero);
+    try expectCypherError("7 / 0", error.DivisionByZero);
+    try expectCypherError("7.5 % 0", error.DivisionByZero);
+    try expectCypherError("7 % 0.0", error.DivisionByZero);
+}
+
+test "parser: count(*) parses as an argument-less count" {
+    var parser = Parser.init(std.testing.allocator, "MATCH (n) RETURN count(*), COUNT(*) AS c");
+    defer parser.deinit();
+
+    const result = parser.parse();
+    try std.testing.expect(result.query != null);
+    try std.testing.expectEqual(@as(usize, 0), result.errors.len);
+
+    const ret = result.query.?.clauses[1].return_;
+    for (ret.items) |item| {
+        const call = item.expression.function_call;
+        try std.testing.expect(call.star);
+        try std.testing.expect(!call.distinct);
+        try std.testing.expectEqual(@as(usize, 0), call.arguments.len);
+    }
+}
+
+test "parser: * is not an argument to anything but count" {
+    const sources = [_][]const u8{
+        "MATCH (n) RETURN sum(*)",
+        "MATCH (n) RETURN count(DISTINCT *)",
+        "MATCH (n) RETURN count(*, n)",
+    };
+    for (sources) |source| {
+        var parser = Parser.init(std.testing.allocator, source);
+        defer parser.deinit();
+        const result = parser.parse();
+        try std.testing.expect(result.query == null);
+    }
+}
+
+test "expression: integer overflow is an error" {
+    try expectCypherError("9223372036854775807 + 1", error.IntegerOverflow);
+    try expectCypherError("(-9223372036854775807 - 1) - 1", error.IntegerOverflow);
+    try expectCypherError("4611686018427387904 * 2", error.IntegerOverflow);
+    try expectCypherError("-(-9223372036854775807 - 1)", error.IntegerOverflow);
+    try expectCypherError("abs(-9223372036854775807 - 1)", error.IntegerOverflow);
+    try expectCypherError("(-9223372036854775807 - 1) / -1", error.IntegerOverflow);
+}
+
+test "expression: integer arithmetic at the edge of the range still works" {
+    try expectCypherInt("9223372036854775806 + 1", 9223372036854775807);
+    try expectCypherInt("-9223372036854775807 - 1", -9223372036854775807 - 1);
+    try expectCypherInt("4611686018427387903 * 2", 9223372036854775806);
+    try expectCypherInt("-(-9223372036854775807)", 9223372036854775807);
+    try expectCypherInt("abs(-9223372036854775807)", 9223372036854775807);
+    try expectCypherInt("(-9223372036854775807 - 1) / 1", -9223372036854775807 - 1);
+    try expectCypherInt("-7 / 2", -3);
+}
+
+// ============================================================================
+// Float-to-integer conversion
+// ============================================================================
+
+test "expression: floats outside the i64 range do not convert to integers" {
+    const expression = lattice.query.expression;
+
+    try std.testing.expectEqual(@as(?i64, 2), expression.floatToInt(2.9));
+    try std.testing.expectEqual(@as(?i64, -2), expression.floatToInt(-2.9));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), expression.floatToInt(-9223372036854775808.0));
+    try std.testing.expectEqual(@as(?i64, null), expression.floatToInt(9223372036854775808.0));
+    try std.testing.expectEqual(@as(?i64, null), expression.floatToInt(1e300));
+    try std.testing.expectEqual(@as(?i64, null), expression.floatToInt(-1e300));
+    try std.testing.expectEqual(@as(?i64, null), expression.floatToInt(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(?i64, null), expression.floatToInt(std.math.inf(f64)));
+
+    const huge: expression.EvalResult = .{ .float_val = 1e300 };
+    try std.testing.expectEqual(@as(?i64, null), huge.toInt());
+}

@@ -13,6 +13,28 @@ MATCH (n:Person) WHERE n.name = "Alice" RETURN n
 MATCH (n:Person) WHERE n.name <> "Alice" RETURN n
 ```
 
+An integer and a float compare by their exact values: `n.age = 30.0` matches an
+age stored as `30`, and an integer above 2^53 is not rounded to the nearest float
+before it is compared (`9007199254740993 > 9007199254740992.0` is true).
+
+NaN is not above, below or equal to anything, itself included: every `<`, `<=`,
+`>`, `>=` and `=` with a NaN operand is false, and `<>` is true.
+
+```cypher
+WITH toFloat('NaN') AS x RETURN x > 1, x < 1, x = x, x <> x
+```
+
+```
+┌───────┬───────┬───────┬────────┐
+│ x > 1 │ x < 1 │ x = x │ x <> x │
+├───────┼───────┼───────┼────────┤
+│ false │ false │ false │ true   │
+└───────┴───────┴───────┴────────┘
+```
+
+`ORDER BY` still has to place NaN, and puts it after every other number (see
+[RETURN](./return.md)); a property index keeps it in the same place.
+
 ## Boolean Logic
 
 Combine conditions with `AND`, `OR`, `NOT`, and `XOR`:
@@ -31,6 +53,12 @@ WHERE NOT n.field = "Systems"
 RETURN n.name
 ```
 
+A predicate can be true, false or null: a comparison with a missing property is
+null, and `NOT`, `AND` and `OR` follow three-valued logic. `WHERE` keeps a row only
+when the predicate is true, so `WHERE n.email <> "bob@x.org"` skips people with no
+email, and so does `WHERE NOT n.email = "bob@x.org"`. See
+[Functions](./functions.md#null) for the full rules.
+
 ## Null Checks
 
 ```cypher
@@ -46,6 +74,25 @@ MATCH (n:Person) WHERE n.name STARTS WITH "A" RETURN n
 MATCH (n:Person) WHERE n.name ENDS WITH "ce" RETURN n
 ```
 
+## Regular Expressions
+
+`=~` matches a string against a regular expression. The whole string has to match,
+so `"A.*"` finds names starting with "A" and `"li"` matches only the string "li":
+
+```cypher
+MATCH (n:Person) WHERE n.name =~ "A.*" RETURN n.name
+MATCH (n:Person) WHERE n.name =~ "(?i)a.*" RETURN n.name
+```
+
+The supported syntax is a subset of Java's: character classes, `\d`, `\w`, `\s`
+and their negations, groups, alternation, `*`, `+`, `?` and `{n,m}` (lazy forms are
+accepted), the anchors `^`, `$`, `\A`, `\z`, `\b` and `\B`, and the flags `(?i)`
+and `(?s)` at the start of the pattern. Matching follows UTF-8 characters, and its
+time grows with the length of the text times the size of the pattern, whatever the
+pattern, so a pattern taken from a parameter cannot make a query run away.
+Backreferences, lookaround and possessive quantifiers fail the query rather than
+being misread. A null on either side gives null.
+
 ## Property Existence
 
 Test whether a property exists by checking for null:
@@ -59,7 +106,7 @@ MATCH (n:Person) WHERE n.email IS NOT NULL RETURN n
 Properties in the MATCH pattern act as equality filters:
 
 ```cypher
--- These are equivalent:
+// These are equivalent:
 MATCH (n:Person {name: "Alice"}) RETURN n
 MATCH (n:Person) WHERE n.name = "Alice" RETURN n
 ```

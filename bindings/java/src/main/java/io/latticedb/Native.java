@@ -19,14 +19,20 @@ final class Native {
     static native long open(String path, boolean create, boolean readOnly,
                             int cacheSizeMB, int pageSize, boolean enableVector,
                             int vectorDimensions, boolean enableWal,
-                            boolean enableAdjacencyCache, boolean lock);
+                            boolean enableAdjacencyCache, boolean lock,
+                            int syncMode, int fullFsync, int vectorMetric,
+                            int vectorM, int vectorEfConstruction,
+                            int changefeedRetention, long changefeedRetentionValue);
 
     static native byte[] serialize(long db);
 
     static native long deserialize(byte[] bytes, int cacheSizeMB, int pageSize,
                                    boolean enableVector, int vectorDimensions,
                                    boolean enableWal, boolean enableAdjacencyCache,
-                                   boolean lock);
+                                   boolean lock, int syncMode, int fullFsync,
+                                   int vectorMetric, int vectorM,
+                                   int vectorEfConstruction, int changefeedRetention,
+                                   long changefeedRetentionValue);
 
     static native void close(long db);
 
@@ -44,6 +50,8 @@ final class Native {
     static native void nodeRemoveLabel(long txn, long nodeId, String label);
 
     static native void nodeDelete(long txn, long nodeId);
+
+    static native void nodeDetachDelete(long txn, long nodeId);
 
     static native void nodeSetProperty(long txn, long nodeId, String key, Object value);
 
@@ -67,6 +75,10 @@ final class Native {
                                                   String property, Object value, int limit);
 
     static native void nodeSetVector(long txn, long nodeId, String key, float[] vector);
+
+    static native float[] nodeGetVector(long txn, long nodeId, String key);
+
+    static native void nodeRemoveVector(long txn, long nodeId, String key);
 
     static native long[] batchInsert(long txn, String label, float[][] vectors);
 
@@ -152,6 +164,11 @@ final class Native {
 
     static native void streamTrim(long txn, String stream, long throughSequence);
 
+    /** {retention mode, its value, oldest sequence held (0 for none), last sequence}. */
+    static native long[] changefeedStatus(long db);
+
+    static native long changefeedTrim(long db);
+
     /* Query engine */
     static native long queryPrepare(long db, String cypher);
 
@@ -180,6 +197,12 @@ final class Native {
 
     /** Returns Object[3]: Integer entries, Long hits, Long misses. */
     static native Object[] cacheStats(long db);
+
+    /* Checkpoints */
+    /** Returns long[4]: pagesFlushed, durationNs, checkpointLsn, walTruncated (0 or 1). */
+    static native long[] checkpoint(long db, int mode);
+
+    static native void setAutoCheckpoint(long db, long maxWalFrames, long minIntervalMs);
 
     /* Embedding helpers */
     static native float[] hashEmbed(String text, int dimensions);

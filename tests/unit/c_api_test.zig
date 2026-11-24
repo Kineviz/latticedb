@@ -24,6 +24,7 @@ const lattice_query = c_api.lattice_query;
 const lattice_result = c_api.lattice_result;
 const lattice_vector_result = c_api.lattice_vector_result;
 const lattice_fts_result = c_api.lattice_fts_result;
+const lattice_edge_result = c_api.lattice_edge_result;
 const lattice_stream_batch = c_api.lattice_stream_batch;
 const lattice_error = c_api.lattice_error;
 const lattice_list = c_api.lattice_list;
@@ -315,7 +316,7 @@ test "c_api: LongMemEval-shaped first write succeeds with larger page size" {
     try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
 }
 
-test "c_api: open v2 can disable WAL and rejects write transactions" {
+test "c_api: open v2 can disable WAL and still has transactions" {
     const path = "/tmp/lattice_capi_open_v2_no_wal_test.db";
     @import("compat").fs.cwd().deleteFile(path) catch {};
     @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
@@ -339,25 +340,30 @@ test "c_api: open v2 can disable WAL and rejects write transactions" {
         @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
     }
 
+    // Without a log a write transaction works as it does with one; it is
+    // only not logged.
     var write_txn: ?*lattice_txn = null;
-    try std.testing.expectEqual(
-        lattice_error.err_unsupported,
-        c_api.lattice_begin(db, .read_write, &write_txn),
-    );
-    try std.testing.expect(write_txn == null);
-
-    var read_txn: ?*lattice_txn = null;
-    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &read_txn));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &write_txn));
     var payload = lattice_value{
         .value_type = .string,
         .data = .{ .string_val = .{ .ptr = "payload".ptr, .len = "payload".len } },
     };
     try std.testing.expectEqual(
-        lattice_error.err_unsupported,
+        lattice_error.ok,
+        c_api.lattice_stream_publish(write_txn, "events".ptr, "events".len, null, 0, &payload),
+    );
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(write_txn));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.cwd().access(path ++ "-wal", .{}));
+
+    // A read transaction refuses stream writes because it reads.
+    var read_txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &read_txn));
+    try std.testing.expectEqual(
+        lattice_error.err_read_only,
         c_api.lattice_stream_publish(read_txn, "events".ptr, "events".len, null, 0, &payload),
     );
     try std.testing.expectEqual(
-        lattice_error.err_unsupported,
+        lattice_error.err_read_only,
         c_api.lattice_stream_set_offset(
             read_txn,
             "events".ptr,
@@ -368,7 +374,7 @@ test "c_api: open v2 can disable WAL and rejects write transactions" {
         ),
     );
     try std.testing.expectEqual(
-        lattice_error.err_unsupported,
+        lattice_error.err_read_only,
         c_api.lattice_stream_trim(read_txn, "events".ptr, "events".len, 1),
     );
     try std.testing.expectEqual(lattice_error.ok, c_api.lattice_rollback(read_txn));
@@ -1128,6 +1134,50 @@ test "c_api: node properties set and get" {
     try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_node_get_property(txn, node_id, "nonexistent", &no_prop));
 
     _ = c_api.lattice_commit(txn);
+}
+
+test "c_api: setting a property to null removes it, as Cypher's SET n.x = null does" {
+    // Up to 0.18.0 both calls stored the null as a property.
+    const path = "/tmp/lattice_capi_null_property_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var a: lattice_node_id = 0;
+    var b: lattice_node_id = 0;
+    var edge: lattice_edge_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &a));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &b));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_create(txn, a, b, "R", &edge));
+    var one = lattice_value{ .value_type = .int, .data = .{ .int_val = 1 } };
+    var null_value = lattice_value{ .value_type = .null, .data = .{ .int_val = 0 } };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_property(txn, a, "x", &one));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_set_property(txn, edge, "x", &one));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    // A present key is removed; an absent one is not an error.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_property(txn, a, "x", &null_value));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_property(txn, a, "absent", &null_value));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_set_property(txn, edge, "x", &null_value));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_set_property(txn, edge, "absent", &null_value));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    // A node or edge that does not exist is still not found.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_node_set_property(txn, 999_999, "x", &null_value));
+    try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_edge_set_property(txn, 999_999, "x", &null_value));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_rollback(txn));
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &txn));
+    defer _ = c_api.lattice_rollback(txn);
+    var out: lattice_value = undefined;
+    for ([_][*:0]const u8{ "x", "absent" }) |key| {
+        try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_node_get_property(txn, a, key, &out));
+        try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_edge_get_property(txn, edge, key, &out));
+    }
 }
 
 test "c_api: delete node" {
@@ -2671,7 +2721,7 @@ test "c_api: semantic query error diagnostics include code and location" {
     var query: ?*lattice_query = null;
     try std.testing.expectEqual(
         lattice_error.ok,
-        c_api.lattice_query_prepare(db, "MATCH (a)-[r:REL*1..2]->(b) RETURN r", &query),
+        c_api.lattice_query_prepare(db, "MATCH (a)-[:REL*3..1]->(b) RETURN b", &query),
     );
 
     var result: ?*lattice_result = null;
@@ -2692,6 +2742,71 @@ test "c_api: semantic query error diagnostics include code and location" {
 
     c_api.lattice_query_free(query);
     _ = c_api.lattice_commit(txn);
+}
+
+/// Run `cypher` in a transaction of its own; the error code, and the
+/// diagnostic code when it failed, written into `code_buf`.
+fn lqsExecute(db: ?*lattice_database, cypher: [*:0]const u8, code_buf: []u8) !struct { err: lattice_error, code: []const u8 } {
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var query: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, cypher, &query));
+    defer c_api.lattice_query_free(query);
+    var result: ?*lattice_result = null;
+    const err = c_api.lattice_query_execute(query, txn, &result);
+    var len: usize = 0;
+    if (err == .ok) {
+        c_api.lattice_result_free(result);
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+    } else {
+        const code_ptr = c_api.lattice_query_last_error_code(query);
+        try std.testing.expect(code_ptr != null);
+        const code = std.mem.sliceTo(code_ptr, 0);
+        @memcpy(code_buf[0..code.len], code);
+        len = code.len;
+        _ = c_api.lattice_rollback(txn);
+    }
+    return .{ .err = err, .code = code_buf[0..len] };
+}
+
+test "lqs c_api: a query refused by the delete or endpoint rule returns the direct call's code" {
+    const path = "/tmp/lattice_capi_lqs_rule_codes_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = false,
+        .vector_dimensions = 0,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer {
+        _ = c_api.lattice_close(db);
+        @import("compat").fs.cwd().deleteFile(path) catch {};
+        @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    }
+
+    var buf: [64]u8 = undefined;
+    const created = try lqsExecute(db, "CREATE (:D {i: 1})-[:R]->(:D {i: 2}), (:D {i: 3})", &buf);
+    try std.testing.expectEqual(lattice_error.ok, created.err);
+
+    // lattice_node_delete returns err_has_relationships for this node.
+    const refused = try lqsExecute(db, "MATCH (a:D {i: 1}) DELETE a", &buf);
+    try std.testing.expectEqual(lattice_error.err_has_relationships, refused.err);
+    try std.testing.expectEqualStrings("NodeHasRelationships", refused.code);
+
+    // lattice_edge_create returns err_not_found for an end that is gone.
+    const missing = try lqsExecute(db, "MATCH (a:D {i: 3}), (b:D {i: 2}) DELETE a CREATE (b)-[:R]->(a)", &buf);
+    try std.testing.expectEqual(lattice_error.err_not_found, missing.err);
+    try std.testing.expectEqualStrings("NotFound", missing.code);
+
+    // Any other execution failure keeps the generic code.
+    const other = try lqsExecute(db, "RETURN 1 / 0", &buf);
+    try std.testing.expectEqual(lattice_error.err, other.err);
 }
 
 test "c_api: txn-scoped graph reads and queries hide uncommitted changes" {
@@ -3249,4 +3364,790 @@ test "c_api: result set iteration and cleanup" {
     }
 
     _ = c_api.lattice_commit(txn);
+}
+
+// ============================================================================
+// Concurrency: database-level calls against writers and close
+// ============================================================================
+
+const ConcurrentAccessState = struct {
+    db: ?*lattice_database,
+    writer_done: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+    reads: std.atomic.Value(u32) = .init(0),
+
+    fn fail(self: *ConcurrentAccessState) void {
+        _ = self.failures.fetchAdd(1, .monotonic);
+    }
+};
+
+fn concurrentVectorWriter(state: *ConcurrentAccessState, iterations: usize) void {
+    defer state.writer_done.store(true, .release);
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var txn: ?*lattice_txn = null;
+        if (c_api.lattice_begin(state.db, .read_write, &txn) != .ok) return state.fail();
+        var node: lattice_node_id = 0;
+        if (c_api.lattice_node_create(txn, "Doc", &node) != .ok) return state.fail();
+        const vector = [_]f32{
+            @floatFromInt(i % 7),
+            1.0,
+            @floatFromInt(i % 3),
+            @as(f32, @floatFromInt(i % 11)) / 11.0,
+        };
+        if (c_api.lattice_node_set_vector(txn, node, "embedding", &vector, vector.len) != .ok) return state.fail();
+        var payload = lattice_value{ .value_type = .int, .data = .{ .int_val = @intCast(i) } };
+        if (c_api.lattice_stream_publish(txn, "events".ptr, "events".len, null, 0, &payload) != .ok) return state.fail();
+        if (c_api.lattice_commit(txn) != .ok) return state.fail();
+    }
+}
+
+fn concurrentDatabaseReader(state: *ConcurrentAccessState) void {
+    const query = [_]f32{ 1.0, 1.0, 1.0, 0.5 };
+    while (!state.writer_done.load(.acquire)) {
+        var vector_result: ?*lattice_vector_result = null;
+        if (c_api.lattice_vector_search(state.db, &query, query.len, 5, 0, &vector_result) != .ok) return state.fail();
+        c_api.lattice_vector_result_free(vector_result);
+
+        var ids: ?[*]lattice_node_id = null;
+        var count: usize = 0;
+        if (c_api.lattice_get_nodes_by_label(state.db, "Doc", 3, &ids, &count) != .ok) return state.fail();
+        c_api.lattice_free_node_ids(ids, count);
+
+        var batch: ?*lattice_stream_batch = null;
+        if (c_api.lattice_stream_read(state.db, "events".ptr, "events".len, 0, 16, 0, &batch) != .ok) return state.fail();
+        c_api.lattice_stream_batch_free(batch);
+
+        var last: u64 = 0;
+        if (c_api.lattice_stream_get_last_sequence(state.db, "events".ptr, "events".len, &last) != .ok) return state.fail();
+        var exists = false;
+        var offset: u64 = 0;
+        if (c_api.lattice_stream_get_offset(state.db, "events".ptr, "events".len, "reader".ptr, "reader".len, &exists, &offset) != .ok) return state.fail();
+
+        var entries: u32 = 0;
+        if (c_api.lattice_query_cache_stats(state.db, &entries, null, null) != .ok) return state.fail();
+        if (c_api.lattice_query_cache_clear(state.db) != .ok) return state.fail();
+
+        _ = state.reads.fetchAdd(1, .monotonic);
+    }
+}
+
+test "c_api: database-level reads are safe against a concurrent writer" {
+    const path = "/tmp/lattice_capi_concurrent_db_reads_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 16,
+        .page_size = 4096,
+        .enable_vector = true,
+        .vector_dimensions = 4,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer {
+        _ = c_api.lattice_close(db);
+        @import("compat").fs.cwd().deleteFile(path) catch {};
+        @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    }
+
+    const writer_commits = 60;
+    var state = ConcurrentAccessState{ .db = db };
+    var readers: [2]std.Thread = undefined;
+    for (&readers) |*reader| {
+        reader.* = try std.Thread.spawn(.{}, concurrentDatabaseReader, .{&state});
+    }
+    const writer = try std.Thread.spawn(.{}, concurrentVectorWriter, .{ &state, writer_commits });
+    writer.join();
+    for (readers) |reader| reader.join();
+
+    try std.testing.expectEqual(@as(u32, 0), state.failures.load(.monotonic));
+    try std.testing.expect(state.reads.load(.monotonic) > 0);
+
+    var ids: ?[*]lattice_node_id = null;
+    var count: usize = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_get_nodes_by_label(db, "Doc", 3, &ids, &count));
+    defer c_api.lattice_free_node_ids(ids, count);
+    try std.testing.expectEqual(@as(usize, writer_commits), count);
+}
+
+const BlockedStreamReader = struct {
+    db: ?*lattice_database,
+    started: std.atomic.Value(bool) = .init(false),
+    rc: lattice_error = .ok,
+    elapsed_ms: i64 = 0,
+
+    fn run(self: *BlockedStreamReader) void {
+        self.started.store(true, .release);
+        const start = @import("compat").milliTimestamp();
+        var batch: ?*lattice_stream_batch = null;
+        self.rc = c_api.lattice_stream_read(self.db, "events".ptr, "events".len, 0, 10, 5000, &batch);
+        self.elapsed_ms = @import("compat").milliTimestamp() - start;
+        c_api.lattice_stream_batch_free(batch);
+    }
+};
+
+test "c_api: close wakes a stream reader blocked on the database" {
+    const path = "/tmp/lattice_capi_close_wakes_stream_reader_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer {
+        @import("compat").fs.cwd().deleteFile(path) catch {};
+        @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    }
+
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = false,
+        .vector_dimensions = 0,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+
+    var reader = BlockedStreamReader{ .db = db };
+    const thread = try std.Thread.spawn(.{}, BlockedStreamReader.run, .{&reader});
+    while (!reader.started.load(.acquire)) std.atomic.spinLoopHint();
+    // Let the reader reach its wait. Closing must neither free the database
+    // under it nor be refused because of it: the reader is woken and leaves.
+    @import("compat").sleep(200 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_close(db));
+    thread.join();
+
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, reader.rc);
+    try std.testing.expect(reader.elapsed_ms < 4000);
+}
+
+// ============================================================================
+// Transaction handles after the transaction ends
+// ============================================================================
+
+fn openScratchDb(comptime path: [:0]const u8) !?*lattice_database {
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = false,
+        .vector_dimensions = 0,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    return db;
+}
+
+fn removeScratchDb(comptime path: [:0]const u8) void {
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+}
+
+test "c_api: a finished transaction handle never reaches a later transaction" {
+    const path = "/tmp/lattice_capi_stale_txn_no_alias_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+
+    var first: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &first));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(first));
+
+    // Begin and finish many more, keeping the last one open. However the
+    // allocator reuses memory, the first handle must stay dead.
+    var live: ?*lattice_txn = null;
+    for (0..500) |i| {
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &live));
+        if (i == 499) break;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_rollback(live));
+    }
+    try std.testing.expect(live != first);
+
+    var node: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.err_txn_aborted, c_api.lattice_node_create(first, "Stale", &node));
+    try std.testing.expectEqual(lattice_error.err_txn_aborted, c_api.lattice_commit(first));
+    try std.testing.expectEqual(lattice_error.err_txn_aborted, c_api.lattice_rollback(first));
+
+    var query: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "RETURN 1", &query));
+    var result: ?*lattice_result = null;
+    try std.testing.expectEqual(lattice_error.err_txn_aborted, c_api.lattice_query_execute(query, first, &result));
+    c_api.lattice_query_free(query);
+
+    // The live transaction is untouched by all of that.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(live, "Live", &node));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(live));
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_close(db));
+    // Still recognised as an ended transaction after the database is gone,
+    // while an arbitrary pointer is not a transaction at all.
+    try std.testing.expectEqual(lattice_error.err_txn_aborted, c_api.lattice_commit(first));
+    var not_a_handle: u64 = 0;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_commit(@ptrCast(&not_a_handle)));
+}
+
+const TxnUser = struct {
+    txn: ?*lattice_txn,
+    stop: std.atomic.Value(bool) = .init(false),
+    ok_calls: std.atomic.Value(u32) = .init(0),
+    unexpected: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *TxnUser) void {
+        var saw_end = false;
+        while (!self.stop.load(.acquire)) {
+            var exists = false;
+            switch (c_api.lattice_node_exists(self.txn, 1, &exists)) {
+                .ok => {
+                    if (saw_end) _ = self.unexpected.fetchAdd(1, .monotonic);
+                    _ = self.ok_calls.fetchAdd(1, .monotonic);
+                },
+                .err_txn_aborted => saw_end = true,
+                else => _ = self.unexpected.fetchAdd(1, .monotonic),
+            }
+        }
+    }
+};
+
+test "c_api: ending a transaction while another thread uses it is safe" {
+    const path = "/tmp/lattice_capi_txn_end_while_used_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+
+    for (0..20) |_| {
+        var txn: ?*lattice_txn = null;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &txn));
+
+        var users = [_]TxnUser{ .{ .txn = txn }, .{ .txn = txn } };
+        var threads: [users.len]std.Thread = undefined;
+        for (&users, &threads) |*user, *thread| thread.* = try std.Thread.spawn(.{}, TxnUser.run, .{user});
+        while (users[0].ok_calls.load(.monotonic) == 0 or users[1].ok_calls.load(.monotonic) == 0) {
+            std.atomic.spinLoopHint();
+        }
+
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_rollback(txn));
+        for (&users) |*user| user.stop.store(true, .release);
+        for (threads) |thread| thread.join();
+        for (users) |user| try std.testing.expectEqual(@as(u32, 0), user.unexpected.load(.monotonic));
+    }
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_close(db));
+}
+
+test "c_api: a freed handle never reaches a later handle of the same kind" {
+    // An allocator that reuses memory puts the second handle where the first
+    // one was. Freeing or using the first again must not touch the second.
+    const path = "/tmp/lattice_capi_stale_handle_no_alias_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var node: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "Person", &node));
+    var other: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "Thing", &other));
+    var edge: lattice_edge_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_create(txn, node, other, "OWNS", &edge));
+
+    var first_query: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "MATCH (n:Person) RETURN n", &first_query));
+    var first_result: ?*lattice_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_execute(first_query, txn, &first_result));
+    c_api.lattice_result_free(first_result);
+    c_api.lattice_query_free(first_query);
+
+    var query: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "MATCH (n:Person) RETURN n", &query));
+    var result: ?*lattice_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_execute(query, txn, &result));
+    try std.testing.expect(query != first_query);
+    try std.testing.expect(result != first_result);
+
+    // Stale handles: rejected, and freeing them again does nothing.
+    try std.testing.expect(!c_api.lattice_result_next(first_result));
+    try std.testing.expectEqual(@as(u32, 0), c_api.lattice_result_column_count(first_result));
+    var stale_result: ?*lattice_result = null;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_query_execute(first_query, txn, &stale_result));
+    c_api.lattice_result_free(first_result);
+    c_api.lattice_query_free(first_query);
+
+    var edges_first: ?*lattice_edge_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_get_outgoing(txn, node, &edges_first));
+    c_api.lattice_edge_result_free(edges_first);
+    var edges: ?*lattice_edge_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_get_outgoing(txn, node, &edges));
+    c_api.lattice_edge_result_free(edges_first);
+    try std.testing.expectEqual(@as(u32, 1), c_api.lattice_edge_result_count(edges));
+    c_api.lattice_edge_result_free(edges);
+
+    // The live handles still work.
+    try std.testing.expectEqual(@as(u32, 1), c_api.lattice_result_column_count(result));
+    try std.testing.expect(c_api.lattice_result_next(result));
+    try std.testing.expect(!c_api.lattice_result_next(result));
+    c_api.lattice_result_free(result);
+    c_api.lattice_query_free(query);
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    // A closed database handle stays closed when another is opened.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_close(db));
+    const second_path = "/tmp/lattice_capi_stale_handle_no_alias_second_test.db";
+    const second = try openScratchDb(second_path);
+    defer removeScratchDb(second_path);
+    try std.testing.expect(second != db);
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_close(db));
+    var second_txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_begin(db, .read_only, &second_txn));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(second, .read_only, &second_txn));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_rollback(second_txn));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_close(second));
+}
+
+test "c_api: edge result types are NUL-terminated" {
+    const path = "/tmp/lattice_capi_edge_type_nul_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var a: lattice_node_id = 0;
+    var b: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &a));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &b));
+    // Lengths that land on and off an allocation boundary.
+    const types = [_][:0]const u8{ "KNOWS", "KNOWS", "EIGHTCHR", "SIXTEEN_CHARS_AB", "KNOWS" };
+    for (types) |edge_type| {
+        var edge: lattice_edge_id = 0;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_create(txn, a, b, edge_type.ptr, &edge));
+    }
+
+    var edges: ?*lattice_edge_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_get_outgoing(txn, a, &edges));
+    defer c_api.lattice_edge_result_free(edges);
+    const count = c_api.lattice_edge_result_count(edges);
+    try std.testing.expectEqual(@as(u32, types.len), count);
+
+    var seen = [_]usize{0} ** types.len;
+    for (0..count) |i| {
+        var source: lattice_node_id = 0;
+        var target: lattice_node_id = 0;
+        var type_ptr: [*c]const u8 = null;
+        var type_len: c_uint = 0;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_edge_result_get(edges, @intCast(i), &source, &target, &type_ptr, &type_len));
+        try std.testing.expectEqual(@as(u8, 0), type_ptr[type_len]);
+        try std.testing.expectEqual(@as(usize, type_len), std.mem.len(type_ptr));
+        for (types, 0..) |edge_type, t| {
+            if (std.mem.eql(u8, edge_type, type_ptr[0..type_len])) seen[t] += 1;
+        }
+    }
+    // KNOWS matches its three entries each time; the others once.
+    try std.testing.expectEqual([_]usize{ 3, 3, 1, 1, 3 }, seen);
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+}
+
+test "c_api: embedding client keeps its own copy of the config strings" {
+    // Port 9 (discard) is not listening, so a request with the real endpoint
+    // fails to connect (IO). Had the client kept the caller's buffer, it would
+    // read the overwritten bytes and fail to parse a URI (INVALID_ARG).
+    const endpoint = try std.testing.allocator.dupeZ(u8, "http://127.0.0.1:9/api/embeddings");
+    const model = try std.testing.allocator.dupeZ(u8, "nomic-embed-text");
+    const config = c_api.lattice_embedding_config{
+        .endpoint = endpoint.ptr,
+        .model = model.ptr,
+        .api_format = .ollama,
+        .api_key = null,
+        .timeout_ms = 2000,
+    };
+    var client: ?*c_api.lattice_embedding_client = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_embedding_client_create(&config, &client));
+    defer c_api.lattice_embedding_client_free(client);
+
+    @memset(endpoint, ' ');
+    @memset(model, ' ');
+    std.testing.allocator.free(endpoint);
+    std.testing.allocator.free(model);
+
+    var vector: ?[*]f32 = null;
+    var dims: u32 = 0;
+    const text = "hello";
+    try std.testing.expectEqual(lattice_error.err_io, c_api.lattice_embedding_client_embed(client, text, text.len, &vector, &dims));
+}
+
+test "c_api: enum values a C caller made up are rejected, not trusted" {
+    // C can pass any int where the header names an enum. Call the exports
+    // the way C does, with plain ints.
+    const error_message: *const fn (c_int) callconv(.c) [*c]const u8 = @ptrCast(&c_api.lattice_error_message);
+    try std.testing.expectEqualStrings("Unknown error", std.mem.span(error_message(-999)));
+    try std.testing.expectEqualStrings("Not found", std.mem.span(error_message(-4)));
+
+    const path = "/tmp/lattice_capi_unknown_enum_test.db";
+    const db = try openScratchDb(path);
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    const begin: *const fn (?*lattice_database, c_int, ?*?*lattice_txn) callconv(.c) lattice_error = @ptrCast(&c_api.lattice_begin);
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, begin(db, 7, &txn));
+    try std.testing.expect(txn == null);
+    try std.testing.expectEqual(lattice_error.ok, begin(db, 1, &txn));
+
+    var node: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &node));
+    var bogus: lattice_value = undefined;
+    @memset(std.mem.asBytes(&bogus), 0);
+    @as(*c_int, @ptrCast(&bogus.value_type)).* = 99;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_node_set_property(txn, node, "k", &bogus));
+    c_api.lattice_value_free(&bogus); // nothing to free; must not crash
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    var config = c_api.lattice_embedding_config{
+        .endpoint = "http://127.0.0.1:9/api/embeddings",
+        .model = "m",
+        .api_format = .ollama,
+        .api_key = null,
+        .timeout_ms = 0,
+    };
+    @as(*c_int, @ptrCast(&config.api_format)).* = 5;
+    var client: ?*c_api.lattice_embedding_client = null;
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_embedding_client_create(&config, &client));
+    try std.testing.expect(client == null);
+}
+
+test "c_api: batch insert treats an empty label as no label" {
+    const path = "/tmp/lattice_capi_batch_empty_label_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = true,
+        .vector_dimensions = 2,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    const vec = [_]f32{ 1, 0 };
+    const specs = [_]c_api.lattice_node_with_vector{
+        .{ .label = "", .vector = &vec, .dimensions = 2 },
+        .{ .label = "Doc", .vector = &vec, .dimensions = 2 },
+    };
+    var ids: [2]lattice_node_id = undefined;
+    var created: u32 = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_batch_insert(txn, &specs, 2, &ids, &created));
+    try std.testing.expectEqual(@as(u32, 2), created);
+
+    const expected = [_][]const u8{ "", "Doc" };
+    for (ids, expected) |id, want| {
+        var labels: [*c]u8 = null;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_get_labels(txn, id, &labels));
+        defer c_api.lattice_free_string(labels);
+        try std.testing.expectEqualStrings(want, std.mem.span(labels));
+    }
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    // No node carries a label named "".
+    var empty_ids: ?[*]lattice_node_id = null;
+    var empty_count: usize = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_get_nodes_by_label(db, "", 0, &empty_ids, &empty_count));
+    defer c_api.lattice_free_node_ids(empty_ids, empty_count);
+    try std.testing.expectEqual(@as(usize, 0), empty_count);
+}
+
+test "c_api: set_vector rejects a key other than embedding" {
+    const path = "/tmp/lattice_capi_set_vector_key_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = true,
+        .vector_dimensions = 2,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var node: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &node));
+    const first = [_]f32{ 1, 0 };
+    const second = [_]f32{ 0, 1 };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_vector(txn, node, "embedding", &first, 2));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_vector(txn, node, "", &first, 2));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_vector(txn, node, null, &first, 2));
+    // Used to succeed and overwrite the one vector the node has.
+    try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_set_vector(txn, node, "title_vec", &second, 2));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    var results: ?*lattice_vector_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_vector_search(db, &first, 2, 1, 0, &results));
+    defer c_api.lattice_vector_result_free(results);
+    var found: lattice_node_id = 0;
+    var distance: f32 = 1;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_vector_result_get(results, 0, &found, &distance));
+    try std.testing.expectEqual(node, found);
+    try std.testing.expect(distance < 1e-3);
+}
+
+fn expectNoVector(txn: ?*lattice_txn, node: lattice_node_id) !void {
+    var vector: ?[*]f32 = null;
+    var dims: u32 = 99;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_get_vector(txn, node, "embedding", &vector, &dims));
+    try std.testing.expect(vector == null);
+    try std.testing.expectEqual(@as(u32, 0), dims);
+}
+
+fn expectVector(txn: ?*lattice_txn, node: lattice_node_id, expected: []const f32) !void {
+    var vector: ?[*]f32 = null;
+    var dims: u32 = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_get_vector(txn, node, null, &vector, &dims));
+    defer c_api.lattice_free_vector(vector, dims);
+    try std.testing.expectEqual(@as(u32, @intCast(expected.len)), dims);
+    for (expected, vector.?[0..dims]) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+}
+
+fn vectorSearchCount(db: ?*lattice_database, query: []const f32) !u32 {
+    var results: ?*lattice_vector_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_vector_search(db, query.ptr, @intCast(query.len), 10, 0, &results));
+    defer c_api.lattice_vector_result_free(results);
+    return c_api.lattice_vector_result_count(results);
+}
+
+test "c_api: get_vector and remove_vector" {
+    const path = "/tmp/lvc_capi_vector_crud_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = true,
+        .vector_dimensions = 2,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer removeScratchDb(path);
+    defer _ = c_api.lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var node: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &node));
+    try expectNoVector(txn, node);
+    // An uncommitted vector reads back as written...
+    const vector = [_]f32{ 3, 4 };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_vector(txn, node, "embedding", &vector, 2));
+    try expectVector(txn, node, &vector);
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    // ...and a committed one normalised, under the default cosine metric.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &txn));
+    try expectVector(txn, node, &.{ 0.6, 0.8 });
+    var missing: ?[*]f32 = null;
+    var missing_dims: u32 = 0;
+    try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_node_get_vector(txn, node + 100, "", &missing, &missing_dims));
+    try std.testing.expect(missing == null);
+    try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_get_vector(txn, node, "title_vec", &missing, &missing_dims));
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, c_api.lattice_node_get_vector(txn, node, null, null, &missing_dims));
+    try std.testing.expectEqual(lattice_error.err_read_only, c_api.lattice_node_remove_vector(txn, node, "embedding"));
+    _ = c_api.lattice_rollback(txn);
+    try std.testing.expectEqual(@as(u32, 1), try vectorSearchCount(db, &vector));
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_remove_vector(txn, node, "title_vec"));
+    try std.testing.expectEqual(lattice_error.err_not_found, c_api.lattice_node_remove_vector(txn, node + 100, null));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_remove_vector(txn, node, "embedding"));
+    try expectNoVector(txn, node);
+    // Removing it again changes nothing.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_remove_vector(txn, node, ""));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+    try std.testing.expectEqual(@as(u32, 0), try vectorSearchCount(db, &vector));
+
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &txn));
+    try expectNoVector(txn, node);
+    var exists = false;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_exists(txn, node, &exists));
+    try std.testing.expect(exists);
+    _ = c_api.lattice_rollback(txn);
+}
+
+test "c_api: vector calls on a database without a vector index return UNSUPPORTED, not IO" {
+    const path = "/tmp/lattice_capi_no_vector_index_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer removeScratchDb(path);
+    var options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = false,
+        .vector_dimensions = 2,
+    };
+    const vector = [_]f32{ 1, 0 };
+    var node: lattice_node_id = 0;
+    {
+        var db: ?*lattice_database = null;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+        defer _ = c_api.lattice_close(db);
+
+        var txn: ?*lattice_txn = null;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "N", &node));
+        // These returned LATTICE_ERROR_IO, which reads like a disk fault.
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_set_vector(txn, node, "embedding", &vector, 2));
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_set_vector(txn, node, null, &vector, 2));
+        // Whatever the length: the missing index is the answer, not the size.
+        const long = [_]f32{ 1, 0, 0 };
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_node_set_vector(txn, node, "", &long, 3));
+
+        // Refused before it creates a node.
+        const specs = [_]c_api.lattice_node_with_vector{
+            .{ .label = "N", .vector = &vector, .dimensions = 2 },
+            .{ .label = "N", .vector = &vector, .dimensions = 2 },
+        };
+        var ids = [_]lattice_node_id{ 0, 0 };
+        var created: u32 = 99;
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_batch_insert(txn, &specs, specs.len, &ids, &created));
+        try std.testing.expectEqual(@as(u32, 0), created);
+        var exists = true;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_exists(txn, node + 1, &exists));
+        try std.testing.expect(!exists);
+
+        // Reading finds no vector and removing has nothing to remove, as before.
+        try expectNoVector(txn, node);
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_remove_vector(txn, node, "embedding"));
+
+        var results: ?*lattice_vector_result = null;
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_vector_search_txn(txn, &vector, 2, 1, 0, &results));
+        try std.testing.expect(results == null);
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+        try std.testing.expectEqual(lattice_error.err_unsupported, c_api.lattice_vector_search(db, &vector, 2, 1, 0, &results));
+        try std.testing.expect(results == null);
+    }
+
+    // Opening it with vectors on adds the index, and the same call succeeds.
+    options.create = false;
+    options.enable_vector = true;
+    var db: ?*lattice_database = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer _ = c_api.lattice_close(db);
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_set_vector(txn, node, "embedding", &vector, 2));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+    try std.testing.expectEqual(@as(u32, 1), try vectorSearchCount(db, &vector));
+}
+
+fn cacheEntries(db: ?*lattice_database) !u32 {
+    var entries: u32 = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_cache_stats(db, &entries, null, null));
+    return entries;
+}
+
+fn runCount(db: ?*lattice_database, query: ?*lattice_query) !usize {
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &txn));
+    defer _ = c_api.lattice_rollback(txn);
+    var result: ?*lattice_result = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_execute(query, txn, &result));
+    defer c_api.lattice_result_free(result);
+    var rows: usize = 0;
+    while (c_api.lattice_result_next(result)) rows += 1;
+    return rows;
+}
+
+test "c_api: a prepared query is parsed once and outlives cache clears and eviction" {
+    const path = "/tmp/lattice_capi_prepared_once_test.db";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{
+        .create = true,
+        .read_only = false,
+        .cache_size_mb = 4,
+        .page_size = 4096,
+        .enable_vector = false,
+        .vector_dimensions = 0,
+    };
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_open(path, &options, &db));
+    defer {
+        _ = c_api.lattice_close(db);
+        @import("compat").fs.cwd().deleteFile(path) catch {};
+    }
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_write, &txn));
+    var node_id: lattice_node_id = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "Person", &node_id));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_node_create(txn, "Person", &node_id));
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_commit(txn));
+
+    var read: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "MATCH (n:Person) RETURN n", &read));
+    defer c_api.lattice_query_free(read);
+    var write: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "CREATE (n:Person) RETURN n", &write));
+    defer c_api.lattice_query_free(write);
+    try std.testing.expect(!c_api.lattice_query_writes(read));
+    try std.testing.expect(c_api.lattice_query_writes(write));
+
+    // Prepare parsed and cached it; executing it twice looks nothing up.
+    var hits: u64 = 0;
+    var misses: u64 = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_cache_stats(db, null, &hits, &misses));
+    try std.testing.expectEqual(@as(u64, 2), misses);
+    try std.testing.expectEqual(@as(usize, 2), try runCount(db, read));
+    try std.testing.expectEqual(@as(usize, 2), try runCount(db, read));
+    var hits_after: u64 = 0;
+    var misses_after: u64 = 0;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_cache_stats(db, null, &hits_after, &misses_after));
+    try std.testing.expectEqual(hits, hits_after);
+    try std.testing.expectEqual(misses, misses_after);
+
+    // A clear keeps what open queries hold, and frees it once they close.
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_cache_clear(db));
+    try std.testing.expectEqual(@as(u32, 2), try cacheEntries(db));
+    try std.testing.expectEqual(@as(usize, 2), try runCount(db, read));
+
+    // Many other queries evict everything else; the prepared one still runs.
+    var buf: [64]u8 = undefined;
+    for (0..300) |i| {
+        const cypher = try std.fmt.bufPrintZ(&buf, "UNWIND [{d}] AS x RETURN x", .{i});
+        var other: ?*lattice_query = null;
+        try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, cypher.ptr, &other));
+        try std.testing.expectEqual(@as(usize, 1), try runCount(db, other));
+        c_api.lattice_query_free(other);
+    }
+    try std.testing.expectEqual(@as(usize, 2), try runCount(db, read));
+
+    // A query that does not parse still prepares, reads as not writing, and
+    // reports its error with a location when it runs.
+    var broken: ?*lattice_query = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_query_prepare(db, "MATCH (n RETURN n", &broken));
+    defer c_api.lattice_query_free(broken);
+    try std.testing.expect(!c_api.lattice_query_writes(broken));
+    var ro: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, c_api.lattice_begin(db, .read_only, &ro));
+    defer _ = c_api.lattice_rollback(ro);
+    var result: ?*lattice_result = null;
+    try std.testing.expect(c_api.lattice_query_execute(broken, ro, &result) != .ok);
+    try std.testing.expectEqual(lattice_query_error_stage.parse, c_api.lattice_query_last_error_stage(broken));
+    try std.testing.expect(c_api.lattice_query_last_error_has_location(broken));
 }

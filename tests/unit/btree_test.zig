@@ -851,3 +851,580 @@ test "btree: delete after split maintains valid tree structure" {
     // Verify sorted iteration of remaining entries
     try helpers.assertBTreeSortedIteration(&tree, 250);
 }
+
+// ============================================================================
+// Contract: internal splits divide by bytes, so long keys cannot overflow a page
+// ============================================================================
+
+fn paddedKey(buf: []u8, prefix: u8, index: usize, len: usize) []const u8 {
+    @memset(buf[0..len], 'x');
+    buf[0] = prefix;
+    _ = std.fmt.bufPrint(buf[1..9], "{d:08}", .{index}) catch unreachable;
+    return buf[0..len];
+}
+
+fn rootKeyCount(tree: *BTree) !?u16 {
+    const frame = try tree.bp.fetchPage(tree.root_page, .shared);
+    defer tree.bp.unpinPage(frame, false);
+    const header: *const lattice.storage.page.PageHeader = @ptrCast(@alignCast(frame.data.ptr));
+    if (header.page_type != .btree_internal) return null;
+    return btree.InternalNode.getNumKeys(frame.data);
+}
+
+test "btree: internal split with long separators divides by bytes" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "internal_split_long_keys");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    // A root internal node with twenty short separators.
+    var key_buf: [1100]u8 = undefined;
+    var value_buf: [300]u8 = undefined;
+    @memset(&value_buf, 'v');
+    var short_count: usize = 0;
+    while ((try rootKeyCount(&tree)) orelse 0 < 20) : (short_count += 1) {
+        try tree.insert(paddedKey(&key_buf, 'b', short_count, 9), &value_buf);
+    }
+    try std.testing.expectEqual(@as(u16, 2), (try helpers.getTreeStats(&tree)).height);
+
+    // Maximum-length keys sorting before all of them. Every second one splits
+    // the leftmost leaf and adds a long separator to the root. Three fit next
+    // to the short ones; the fourth splits the root, and a split by key count
+    // would put all four long keys plus a dozen short ones on one page.
+    const long_len = btree.maxKeySize(db.pm.getPageSize());
+    var long_count: usize = 0;
+    while (long_count < 12) : (long_count += 1) {
+        try tree.insert(paddedKey(&key_buf, 'a', long_count, long_len), "v");
+    }
+
+    try helpers.validateBTreeInvariants(&tree);
+    try std.testing.expectEqual(short_count + long_count, try helpers.countBTreeEntries(&tree));
+    for (0..short_count) |i| {
+        try std.testing.expect(try tree.contains(paddedKey(&key_buf, 'b', i, 9)));
+    }
+    for (0..long_count) |i| {
+        try std.testing.expect(try tree.contains(paddedKey(&key_buf, 'a', i, long_len)));
+    }
+}
+
+test "btree: keys longer than the maximum key size are rejected cleanly" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "max_key_size");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    const max = btree.maxKeySize(db.pm.getPageSize());
+    try std.testing.expectEqual(@as(usize, 1012), max);
+
+    var key_buf: [4096]u8 = undefined;
+    @memset(&key_buf, 'k');
+    try std.testing.expect(tree.canFitLeafEntry(key_buf[0..max], 10));
+    try std.testing.expect(!tree.canFitLeafEntry(key_buf[0 .. max + 1], 10));
+    try tree.insert(key_buf[0..max], "ok");
+    try std.testing.expectError(BTreeError.PageFull, tree.insert(key_buf[0 .. max + 1], "no"));
+    try std.testing.expectError(BTreeError.PageFull, tree.insert(key_buf[0..3000], "no"));
+    try std.testing.expectEqual(@as(usize, 1), try helpers.countBTreeEntries(&tree));
+    try helpers.validateBTreeInvariants(&tree);
+}
+
+/// Model-checked random workload with keys and values of every size the tree
+/// accepts, over 4 KB pages. Every separator length, overflow value and
+/// split/merge shape is exercised; the tree must agree with a hash map and
+/// keep its structural invariants throughout.
+fn randomLongKeyWorkload(allocator: std.mem.Allocator, seed: u64, ops: usize) !void {
+    var db = try helpers.TempDb.initWithPoolSize(allocator, "random_long_keys", 2 * 1024 * 1024);
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    var model = std.StringHashMap([]u8).init(allocator);
+    defer {
+        var it = model.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        model.deinit();
+    }
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const max_key = btree.maxKeySize(db.pm.getPageSize());
+    var key_buf: [4096]u8 = undefined;
+    var value_buf: [9000]u8 = undefined;
+
+    for (0..ops) |op_index| {
+        // Mostly short keys, with a heavy tail up to the maximum.
+        const key_len = switch (random.uintLessThan(u8, 10)) {
+            0...4 => 1 + random.uintLessThan(usize, 24),
+            5...7 => 1 + random.uintLessThan(usize, 300),
+            else => 1 + random.uintLessThan(usize, max_key),
+        };
+        // A small alphabet makes repeats (duplicates, deletes of live keys) common.
+        for (key_buf[0..key_len]) |*b| b.* = 'a' + random.uintLessThan(u8, 3);
+        const key = key_buf[0..key_len];
+
+        const action = random.uintLessThan(u8, 10);
+        if (action < 6) {
+            const value_len = switch (random.uintLessThan(u8, 10)) {
+                0...6 => random.uintLessThan(usize, 40),
+                7, 8 => random.uintLessThan(usize, 2500),
+                else => random.uintLessThan(usize, value_buf.len),
+            };
+            random.bytes(value_buf[0..value_len]);
+            const value = value_buf[0..value_len];
+            if (tree.insert(key, value)) |_| {
+                try std.testing.expect(!model.contains(key));
+                try model.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+            } else |err| {
+                try std.testing.expectEqual(BTreeError.DuplicateKey, err);
+                try std.testing.expect(model.contains(key));
+            }
+        } else if (action < 9) {
+            if (tree.delete(key)) |_| {
+                const removed = model.fetchRemove(key) orelse return error.TestUnexpectedResult;
+                allocator.free(removed.key);
+                allocator.free(removed.value);
+            } else |err| {
+                try std.testing.expectEqual(BTreeError.KeyNotFound, err);
+                try std.testing.expect(!model.contains(key));
+            }
+        } else {
+            const got = try tree.get(key);
+            defer if (got) |v| tree.freeValue(v);
+            if (model.get(key)) |expected| {
+                try std.testing.expectEqualSlices(u8, expected, got.?);
+            } else {
+                try std.testing.expect(got == null);
+            }
+        }
+
+        if (op_index % 250 == 0) try helpers.validateBTreeInvariants(&tree);
+    }
+
+    try helpers.validateBTreeInvariants(&tree);
+    try std.testing.expectEqual(model.count(), try helpers.countBTreeEntries(&tree));
+    var it = model.iterator();
+    while (it.next()) |e| {
+        const got = (try tree.get(e.key_ptr.*)).?;
+        defer tree.freeValue(got);
+        try std.testing.expectEqualSlices(u8, e.value_ptr.*, got);
+    }
+    try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+}
+
+test "btree: random workload with keys up to the maximum size matches a model" {
+    for ([_]u64{ 1, 2, 3, 0xfeed }) |seed| {
+        try randomLongKeyWorkload(std.testing.allocator, seed, 3000);
+    }
+}
+
+// ============================================================================
+// Contract: a failed insert leaves the tree exactly as it was
+// ============================================================================
+
+fn expectLongKeyTreeHolds(tree: *BTree, count: usize) !void {
+    var key_buf: [256]u8 = undefined;
+    try helpers.validateBTreeInvariants(tree);
+    try std.testing.expectEqual(count, try helpers.countBTreeEntries(tree));
+    for (0..count) |i| {
+        try std.testing.expect(try tree.contains(longSplitKey(&key_buf, i)));
+    }
+}
+
+test "btree: an insert failing at any allocation during a split leaves the tree unchanged" {
+    const allocator = std.testing.allocator;
+    const split_index = try firstInsertThatRaisesHeightToThree(allocator);
+
+    // Fail the first, second, ... allocation of the insert that splits a
+    // leaf, its parent and the root, until the insert gets through.
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        var db = try helpers.TempDb.initWithPoolSize(allocator, "split_oom_atomic", 1024 * 1024);
+        defer db.deinit();
+
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{});
+        var tree = try BTree.init(failing_state.allocator(), db.bp);
+        var key_buf: [256]u8 = undefined;
+        for (0..split_index) |i| try tree.insert(longSplitKey(&key_buf, i), "value");
+
+        failing_state.fail_index = failing_state.alloc_index + fail_offset;
+        const result = tree.insert(longSplitKey(&key_buf, split_index), "value");
+        try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+
+        if (!failing_state.has_induced_failure) {
+            try result;
+            try expectLongKeyTreeHolds(&tree, split_index + 1);
+            break;
+        }
+
+        try std.testing.expectError(BTreeError.OutOfMemory, result);
+        try expectLongKeyTreeHolds(&tree, split_index);
+
+        failing_state.fail_index = std.math.maxInt(usize);
+        try tree.insert(longSplitKey(&key_buf, split_index), "value");
+        try expectLongKeyTreeHolds(&tree, split_index + 1);
+    }
+    try std.testing.expect(fail_offset >= 3);
+}
+
+test "btree: an insert running out of buffer frames during a split leaves the tree unchanged" {
+    const allocator = std.testing.allocator;
+    const split_index = try firstInsertThatRaisesHeightToThree(allocator);
+    const frame_count = 16;
+
+    // Hold more and more of a small pool pinned so the split runs out of
+    // frames at every step it fetches one.
+    var saw_failure = false;
+    var held_count: usize = 0;
+    while (held_count < frame_count) : (held_count += 1) {
+        var db = try helpers.TempDb.initWithPoolSize(allocator, "split_frames_atomic", frame_count * 4096);
+        defer db.deinit();
+
+        var tree = try db.createBTree();
+        var key_buf: [256]u8 = undefined;
+        for (0..split_index) |i| try tree.insert(longSplitKey(&key_buf, i), "value");
+
+        // The pool grows rather than write a dirty page out on its own, and
+        // building the tree left it grown and dirty. Flush, so that it is back
+        // to its own frames and every one is clean: from here a frame is only
+        // to be had by evicting one, and the pinned ones cannot be evicted.
+        _ = try db.bp.flushAll();
+
+        // Pin pages that are not part of the tree.
+        var held: [frame_count]*lattice.storage.buffer_pool.BufferFrame = undefined;
+        var pinned: usize = 0;
+        defer for (held[0..pinned]) |frame| db.bp.unpinPage(frame, false);
+        while (pinned < held_count) : (pinned += 1) {
+            const page_id = try db.pm.allocatePage();
+            held[pinned] = try db.bp.fetchPage(page_id, .shared);
+        }
+
+        const result = tree.insert(longSplitKey(&key_buf, split_index), "value");
+        if (result) |_| {
+            for (held[0..pinned]) |frame| db.bp.unpinPage(frame, false);
+            pinned = 0;
+            try expectLongKeyTreeHolds(&tree, split_index + 1);
+            continue;
+        } else |err| {
+            try std.testing.expectEqual(BTreeError.BufferPoolFull, err);
+            saw_failure = true;
+        }
+
+        for (held[0..pinned]) |frame| db.bp.unpinPage(frame, false);
+        pinned = 0;
+        try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+        try expectLongKeyTreeHolds(&tree, split_index);
+        try tree.insert(longSplitKey(&key_buf, split_index), "value");
+        try expectLongKeyTreeHolds(&tree, split_index + 1);
+    }
+    try std.testing.expect(saw_failure);
+}
+
+// ============================================================================
+// Contract: deleting an overflow value never leaves the entry pointing at freed pages
+// ============================================================================
+
+test "btree: delete removes an overflow entry even when freeing its chain fails" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "overflow_delete_chain_failure");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    // A fresh tree's root is the only page, so a three-page overflow value
+    // lands on the next three pages.
+    const first_chain_page = db.pm.pageCount();
+    const big = try allocator.alloc(u8, 3 * 4000);
+    defer allocator.free(big);
+    @memset(big, 'o');
+    try tree.insert("big", big);
+    try tree.insert("small", "s");
+    try std.testing.expectEqual(first_chain_page + 3, db.pm.pageCount());
+
+    const PageHeader = lattice.storage.page.PageHeader;
+    for (0..3) |i| {
+        const frame = try db.bp.fetchPage(first_chain_page + @as(u32, @intCast(i)), .shared);
+        defer db.bp.unpinPage(frame, false);
+        const header: *const PageHeader = @ptrCast(@alignCast(frame.data.ptr));
+        try std.testing.expectEqual(lattice.storage.page.PageType.overflow, header.page_type);
+    }
+
+    // Damage the middle page so freeing the chain fails after the first page.
+    {
+        const frame = try db.bp.fetchPage(first_chain_page + 1, .exclusive);
+        const header: *PageHeader = @ptrCast(@alignCast(frame.data.ptr));
+        header.page_type = .btree_leaf;
+        db.bp.unpinPage(frame, true);
+    }
+
+    try tree.delete("big");
+    try std.testing.expect(!(try tree.contains("big")));
+    try std.testing.expect((try tree.get("big")) == null);
+    try std.testing.expectError(BTreeError.KeyNotFound, tree.delete("big"));
+
+    // The key can be written again, and the first chain page, which was
+    // freed, is reused without disturbing anything else.
+    try tree.insert("big", "again");
+    const got = (try tree.get("big")).?;
+    defer tree.freeValue(got);
+    try std.testing.expectEqualStrings("again", got);
+    try std.testing.expect(try tree.contains("small"));
+    try helpers.validateBTreeInvariants(&tree);
+    try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+}
+
+// ============================================================================
+// Contract: deletes next to a fresh split do not merge it back
+// ============================================================================
+
+test "btree: delete and reinsert beside a fresh split frees and allocates no pages" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "no_merge_thrash");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    var key_buf: [16]u8 = undefined;
+    var value: [100]u8 = undefined;
+    @memset(&value, 'v');
+    var count: usize = 0;
+    while ((try rootKeyCount(&tree)) == null) : (count += 1) {
+        try tree.insert(try std.fmt.bufPrint(&key_buf, "key{d:05}", .{count}), &value);
+    }
+    const pages = db.pm.pageCount();
+
+    // The last key sits in the new right leaf. Deleting it leaves the two
+    // leaves together just under a page; merging them would free a page
+    // that the reinsert immediately splits off again.
+    const last = try std.fmt.bufPrint(&key_buf, "key{d:05}", .{count - 1});
+    for (0..50) |_| {
+        try tree.delete(last);
+        try std.testing.expectEqual(lattice.core.types.NULL_PAGE, db.pm.getHeader().freelist_page);
+        try tree.insert(last, &value);
+    }
+    try std.testing.expectEqual(pages, db.pm.pageCount());
+    try std.testing.expectEqual(count, try helpers.countBTreeEntries(&tree));
+    try helpers.validateBTreeInvariants(&tree);
+}
+
+// ============================================================================
+// Contract: getBorrowed lends the stored value and releases its pin
+// ============================================================================
+
+test "btree: getBorrowed returns inline and overflow values and releases the leaf" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "get_borrowed");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    const big = try allocator.alloc(u8, 20_000);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try tree.insert("inline", "small value");
+    try tree.insert("overflow", big);
+
+    {
+        var value = (try tree.getBorrowed("inline")).?;
+        defer value.release();
+        try std.testing.expectEqualStrings("small value", value.bytes);
+        try std.testing.expectEqual(@as(usize, 1), db.bp.getStats().pinned_frames);
+    }
+    {
+        var value = (try tree.getBorrowed("overflow")).?;
+        defer value.release();
+        try std.testing.expectEqualSlices(u8, big, value.bytes);
+        try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+    }
+    try std.testing.expect((try tree.getBorrowed("missing")) == null);
+    try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+
+    // Released leaves can be written again.
+    try tree.delete("inline");
+    try tree.insert("inline", "changed");
+    var value = (try tree.getBorrowed("inline")).?;
+    defer value.release();
+    try std.testing.expectEqualStrings("changed", value.bytes);
+}
+
+// ============================================================================
+// Contract: replace and put change a value in one step, all or nothing
+// ============================================================================
+
+test "btree: replace and put report missing and present keys" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "replace_missing");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    try std.testing.expectError(BTreeError.KeyNotFound, tree.replace("missing", "v"));
+    try std.testing.expect(!(try tree.contains("missing")));
+
+    try tree.put("k", "first");
+    try tree.put("k", "second, longer");
+    const got = (try tree.get("k")).?;
+    defer tree.freeValue(got);
+    try std.testing.expectEqualStrings("second, longer", got);
+    try std.testing.expectEqual(@as(usize, 1), try helpers.countBTreeEntries(&tree));
+    try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+}
+
+test "btree: replace moves values between every size class and reuses overflow pages" {
+    const allocator = std.testing.allocator;
+    var db = try helpers.TempDb.init(allocator, "replace_sizes");
+    defer db.deinit();
+    var tree = try db.createBTree();
+
+    const big = try allocator.alloc(u8, 20_000);
+    defer allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var key_buf: [16]u8 = undefined;
+    for (0..40) |i| try tree.insert(try std.fmt.bufPrint(&key_buf, "key{d:03}", .{i}), "small");
+
+    const sizes = [_]usize{ 5, 5, 1, 0, 900, 1500, 20_000, 20_000, 9_000, 3, 12_345, 20_000 };
+    var pages_after_first_round: u32 = 0;
+    for (0..3) |round| {
+        for (sizes) |len| {
+            for (0..40) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "key{d:03}", .{i});
+                big[0] = @truncate(i + len);
+                try tree.replace(key, big[0..len]);
+            }
+            for (0..40) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "key{d:03}", .{i});
+                big[0] = @truncate(i + len);
+                const got = (try tree.get(key)).?;
+                defer tree.freeValue(got);
+                try std.testing.expectEqualSlices(u8, big[0..len], got);
+            }
+            try helpers.validateBTreeInvariants(&tree);
+        }
+        // Old overflow chains go back to the freelist, so later rounds reuse
+        // them instead of growing the file.
+        if (round == 0) pages_after_first_round = db.pm.pageCount();
+    }
+    try std.testing.expectEqual(pages_after_first_round, db.pm.pageCount());
+    try std.testing.expectEqual(@as(usize, 40), try helpers.countBTreeEntries(&tree));
+    try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+}
+
+test "btree: a replace failing at any allocation leaves the old value" {
+    const allocator = std.testing.allocator;
+    const split_index = try firstInsertThatRaisesHeightToThree(allocator);
+    var key_buf: [256]u8 = undefined;
+    const big = try allocator.alloc(u8, 2000);
+    defer allocator.free(big);
+    @memset(big, 'B');
+
+    // A value that no longer fits the leaf, so the replace splits it.
+    var fail_offset: usize = 0;
+    while (true) : (fail_offset += 1) {
+        var db = try helpers.TempDb.initWithPoolSize(allocator, "replace_oom_atomic", 1024 * 1024);
+        defer db.deinit();
+
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{});
+        var tree = try BTree.init(failing_state.allocator(), db.bp);
+        for (0..split_index) |i| try tree.insert(longSplitKey(&key_buf, i), "value");
+        const pages = db.pm.pageCount();
+        const target = longSplitKey(&key_buf, split_index / 2);
+
+        failing_state.fail_index = failing_state.alloc_index + fail_offset;
+        const result = tree.replace(target, big);
+        try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+        failing_state.fail_index = std.math.maxInt(usize);
+
+        if (!failing_state.has_induced_failure) {
+            try result;
+            try std.testing.expect(db.pm.pageCount() > pages);
+            const got = (try tree.get(target)).?;
+            defer tree.freeValue(got);
+            try std.testing.expectEqualSlices(u8, big, got);
+            try expectLongKeyTreeHolds(&tree, split_index);
+            break;
+        }
+
+        try std.testing.expectError(BTreeError.OutOfMemory, result);
+        try expectLongKeyTreeHolds(&tree, split_index);
+        const got = (try tree.get(target)).?;
+        defer tree.freeValue(got);
+        try std.testing.expectEqualStrings("value", got);
+    }
+    try std.testing.expect(fail_offset >= 2);
+}
+
+test "btree: random workload of inserts, replaces, puts and deletes matches a model" {
+    const allocator = std.testing.allocator;
+    for ([_]u64{ 11, 12, 0xbeef }) |seed| {
+        var db = try helpers.TempDb.initWithPoolSize(allocator, "random_replace", 2 * 1024 * 1024);
+        defer db.deinit();
+        var tree = try db.createBTree();
+
+        var model = std.StringHashMap([]u8).init(allocator);
+        defer {
+            var it = model.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            model.deinit();
+        }
+
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        var key_buf: [64]u8 = undefined;
+        var value_buf: [9000]u8 = undefined;
+
+        for (0..3000) |op_index| {
+            const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{random.uintLessThan(u32, 400)});
+            const value_len = switch (random.uintLessThan(u8, 10)) {
+                0...5 => random.uintLessThan(usize, 40),
+                6...8 => random.uintLessThan(usize, 2500),
+                else => random.uintLessThan(usize, value_buf.len),
+            };
+            random.bytes(value_buf[0..value_len]);
+            const value = value_buf[0..value_len];
+
+            switch (random.uintLessThan(u8, 4)) {
+                0 => if (tree.replace(key, value)) |_| {
+                    const slot = model.getPtr(key) orelse return error.TestUnexpectedResult;
+                    allocator.free(slot.*);
+                    slot.* = try allocator.dupe(u8, value);
+                } else |err| {
+                    try std.testing.expectEqual(BTreeError.KeyNotFound, err);
+                    try std.testing.expect(!model.contains(key));
+                },
+                1 => {
+                    try tree.put(key, value);
+                    if (model.getPtr(key)) |slot| {
+                        allocator.free(slot.*);
+                        slot.* = try allocator.dupe(u8, value);
+                    } else {
+                        try model.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+                    }
+                },
+                2 => if (tree.insert(key, value)) |_| {
+                    try model.put(try allocator.dupe(u8, key), try allocator.dupe(u8, value));
+                } else |err| {
+                    try std.testing.expectEqual(BTreeError.DuplicateKey, err);
+                    try std.testing.expect(model.contains(key));
+                },
+                else => if (tree.delete(key)) |_| {
+                    const removed = model.fetchRemove(key) orelse return error.TestUnexpectedResult;
+                    allocator.free(removed.key);
+                    allocator.free(removed.value);
+                } else |err| {
+                    try std.testing.expectEqual(BTreeError.KeyNotFound, err);
+                    try std.testing.expect(!model.contains(key));
+                },
+            }
+            if (op_index % 250 == 0) try helpers.validateBTreeInvariants(&tree);
+        }
+
+        try helpers.validateBTreeInvariants(&tree);
+        try std.testing.expectEqual(model.count(), try helpers.countBTreeEntries(&tree));
+        var it = model.iterator();
+        while (it.next()) |e| {
+            const got = (try tree.get(e.key_ptr.*)).?;
+            defer tree.freeValue(got);
+            try std.testing.expectEqualSlices(u8, e.value_ptr.*, got);
+        }
+        try std.testing.expectEqual(@as(usize, 0), db.bp.getStats().pinned_frames);
+    }
+}

@@ -56,6 +56,25 @@ class TestLibraryDiscovery:
 
         assert bindings._find_library() == lib_path
 
+    def test_find_library_uses_lattice_prefix_bin_on_windows(self, monkeypatch, tmp_path) -> None:
+        """An installed Windows DLL is in prefix/bin, not prefix/lib."""
+        monkeypatch.setattr(bindings.sys, "platform", "win32")
+        package_root = tmp_path / "site-packages" / "latticedb"
+        package_root.mkdir(parents=True)
+        monkeypatch.setattr(bindings, "__file__", str(package_root / "_bindings.py"))
+
+        prefix_root = tmp_path / "prefix"
+        (prefix_root / "lib").mkdir(parents=True)
+        (prefix_root / "lib" / "lattice.lib").write_bytes(b"")
+        (prefix_root / "bin").mkdir()
+        dll = prefix_root / "bin" / "lattice.dll"
+        dll.write_bytes(b"")
+
+        monkeypatch.delenv("LATTICE_LIB_PATH", raising=False)
+        monkeypatch.setenv("LATTICE_PREFIX", str(prefix_root))
+
+        assert bindings._find_library() == dll
+
     def test_find_library_uses_pkg_config_libdir(self, monkeypatch, tmp_path) -> None:
         """pkg-config libdir should be used when no repo-local build is present."""
         lib_dir = tmp_path / "pkg-lib"
@@ -109,11 +128,13 @@ class TestNode:
         assert node.get_property("missing", "default") == "default"
 
     def test_set_vector(self) -> None:
-        """Test setting a vector."""
+        """Node.set_vector and Node.get_vector are local only, and deprecated."""
         node = Node(id=1)
         vector = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-        node.set_vector("embedding", vector)
-        result = node.get_vector("embedding")
+        with pytest.deprecated_call(match=r"Node\.set_vector\(\.\.\.\) stores nothing"):
+            node.set_vector("embedding", vector)
+        with pytest.deprecated_call(match=r"Node\.get_vector\(\.\.\.\) does not read the stored vector"):
+            result = node.get_vector("embedding")
         assert result is not None
         np.testing.assert_array_equal(result, vector)
 
@@ -298,7 +319,7 @@ class TestHashEmbed:
         import latticedb
 
         with pytest.deprecated_call(
-            match=r"latticedb\.hash_embed is deprecated; use latticedb\.embedding\.hash_embed\. Earliest removal is v0\.6\.0\."
+            match=r"latticedb\.hash_embed is deprecated; use latticedb\.embedding\.hash_embed\."
         ):
             vec = latticedb.hash_embed("hello world", dimensions=32)
 
@@ -614,7 +635,7 @@ class TestEmbeddingClientUnit:
         fake_native = self._install_fake_embedding_native(monkeypatch)
 
         with pytest.deprecated_call(
-            match=r"latticedb\.EmbeddingClient is deprecated; use latticedb\.embedding\.EmbeddingClient\. Earliest removal is v0\.6\.0\."
+            match=r"latticedb\.EmbeddingClient is deprecated; use latticedb\.embedding\.EmbeddingClient\."
         ):
             client = latticedb.EmbeddingClient(endpoint="http://localhost:11434/api/embeddings")
 

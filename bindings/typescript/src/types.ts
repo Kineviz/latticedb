@@ -99,6 +99,20 @@ export interface StreamRecord {
 }
 
 /**
+ * What a checkpoint did (see `Database.checkpoint`).
+ */
+export interface CheckpointStats {
+  /** Pages written into the database file */
+  pagesFlushed: number;
+  /** How long the checkpoint took, in nanoseconds */
+  durationNs: bigint;
+  /** The log position the database file now holds */
+  checkpointLsn: bigint;
+  /** Whether the log (the -wal file) was emptied */
+  walTruncated: boolean;
+}
+
+/**
  * Result of a vector similarity search.
  */
 export interface VectorSearchResult {
@@ -116,15 +130,27 @@ export interface VectorSearchResult {
 export interface CreateNodeOptions {
   /** Node labels */
   labels?: string[];
-  /** Node properties */
+  /** Node properties. A key whose value is null is left out, as in Cypher's CREATE. */
   properties?: Record<string, PropertyValue>;
+}
+
+/**
+ * Options for deleting a node.
+ */
+export interface DeleteNodeOptions {
+  /**
+   * Also delete every relationship the node has, as Cypher's DETACH DELETE
+   * does (default: false). Without it, deleting a node that has relationships
+   * throws a LatticeError with code -17 (HasRelationships).
+   */
+  detach?: boolean;
 }
 
 /**
  * Options for creating an edge.
  */
 export interface CreateEdgeOptions {
-  /** Edge properties */
+  /** Edge properties. A key whose value is null is left out. */
   properties?: Record<string, PropertyValue>;
 }
 
@@ -158,7 +184,11 @@ export enum EmbeddingApiFormat {
  * Configuration for an HTTP embedding client.
  */
 export interface EmbeddingConfig {
-  /** HTTP endpoint URL */
+  /**
+   * Full URL each request is POSTed to; nothing is appended to it. For
+   * Ollama, "http://localhost:11434/api/embeddings"; for OpenAI,
+   * "https://api.openai.com/v1/embeddings".
+   */
   endpoint: string;
   /** Model name (default: "nomic-embed-text") */
   model?: string;

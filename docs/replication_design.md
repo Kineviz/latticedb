@@ -1,5 +1,13 @@
 # Continuous Backup and Replication Design
 
+> **Status (0.16.0): phases 1–5 are built for local directories; phase 6 (object storage) is
+> not.** The text below is the original design and describes the state before it was built:
+> automatic checkpointing now exists (by default once the WAL reaches an eighth of the page cache,
+> 1000 frames to 64 MB), and the destination
+> layout differs from the one sketched here (`manifest.json`, `gen-N/snapshot.lattice`,
+> `gen-N/frames/A-B.frames`). `lattice restore s3://...` is not supported. For how it works today,
+> see the book's [Backup and Replication](../book/src/guides/backup-and-replication.md) guide.
+
 LatticeDB has no continuous backup story. Today the only correct backup is to
 close the database and copy the file, or to take a logical export with
 `lattice export`. Neither gives point-in-time recovery, and neither is

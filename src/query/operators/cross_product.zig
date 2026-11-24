@@ -59,11 +59,20 @@ pub const CrossProduct = struct {
     fn open(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Open and materialize inner side
+        // Opened again for each row of a CALL { ... }: start afresh.
+        self.inner_rows.clearRetainingCapacity();
+        self.outer_row = null;
+        self.inner_idx = 0;
+
+        // Open and materialize inner side. If that fails, close it here: the
+        // caller never closes an operator whose open failed.
         try self.inner.open(ctx);
-        while (true) {
-            const row = try self.inner.next(ctx) orelse break;
-            self.inner_rows.append(self.allocator, row.clone()) catch return OperatorError.OutOfMemory;
+        {
+            errdefer self.inner.close(ctx);
+            while (true) {
+                const row = try self.inner.next(ctx) orelse break;
+                self.inner_rows.append(self.allocator, row.clone()) catch return OperatorError.OutOfMemory;
+            }
         }
         self.inner.close(ctx);
 
@@ -102,6 +111,9 @@ pub const CrossProduct = struct {
             while (slot < executor.MAX_SLOTS) : (slot += 1) {
                 if (inner_row.hasSlot(slot)) {
                     output.setSlot(slot, inner_row.slots[slot]);
+                    // The score or distance a search gave the inner row's
+                    // entity goes with it.
+                    output.copySearchMarks(inner_row, slot);
                 }
             }
 

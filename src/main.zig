@@ -8,13 +8,17 @@ const std = @import("std");
 // Core modules
 pub const core = struct {
     pub const types = @import("core/types.zig");
+    pub const id_key = @import("core/id_key.zig");
 };
 
 // Storage modules
 pub const storage = struct {
     pub const vfs = @import("storage/vfs.zig");
     pub const memory_vfs = @import("storage/memory_vfs.zig");
+    pub const fault_vfs = @import("storage/fault_vfs.zig");
+    pub const overlay_vfs = @import("storage/overlay_vfs.zig");
     pub const page = @import("storage/page.zig");
+    pub const journal = @import("storage/journal.zig");
     pub const page_manager = @import("storage/page_manager.zig");
     pub const buffer_pool = @import("storage/buffer_pool.zig");
     pub const btree = @import("storage/btree.zig");
@@ -25,12 +29,15 @@ pub const storage = struct {
     pub const checkpoint = @import("storage/checkpoint.zig");
     pub const recovery = @import("storage/recovery.zig");
     pub const database = @import("storage/database.zig");
+    pub const overlay_lookup = @import("storage/overlay_lookup.zig");
+    pub const id_key_upgrade = @import("storage/id_key_upgrade.zig");
 };
 
 // Durable streams
 pub const stream = struct {
     pub const payload = @import("stream/payload.zig");
     pub const store = @import("stream/store.zig");
+    pub const changefeed = @import("stream/changefeed.zig");
 };
 
 // Vector search
@@ -56,6 +63,8 @@ pub const fts = struct {
     pub const prefix = @import("fts/prefix.zig");
     pub const stopwords = @import("fts/stopwords.zig");
     pub const highlight = @import("fts/highlight.zig");
+    pub const legacy = @import("fts/legacy.zig");
+    pub const query = @import("fts/query.zig");
 };
 
 // Query system
@@ -66,6 +75,7 @@ pub const query = struct {
     pub const semantic = @import("query/semantic.zig");
     pub const executor = @import("query/executor.zig");
     pub const expression = @import("query/expression.zig");
+    pub const regex = @import("query/regex.zig");
     pub const planner = @import("query/planner.zig");
     pub const cache = @import("query/cache.zig");
 
@@ -126,6 +136,9 @@ comptime {
     _ = &c_api.lattice_node_get_labels;
     _ = &c_api.lattice_free_string;
     _ = &c_api.lattice_node_set_vector;
+    _ = &c_api.lattice_node_get_vector;
+    _ = &c_api.lattice_node_remove_vector;
+    _ = &c_api.lattice_free_vector;
     _ = &c_api.lattice_edge_create;
     _ = &c_api.lattice_edge_delete;
     _ = &c_api.lattice_edge_set_property;
@@ -167,6 +180,8 @@ comptime {
     _ = &c_api.lattice_stream_batch_free;
     _ = &c_api.lattice_stream_get_offset;
     _ = &c_api.lattice_stream_get_last_sequence;
+    _ = &c_api.lattice_changefeed_status;
+    _ = &c_api.lattice_changefeed_trim;
     _ = &c_api.lattice_stream_set_offset;
     _ = &c_api.lattice_stream_trim;
 }
@@ -292,12 +307,16 @@ pub const CacheEntry = query.cache.CacheEntry;
 pub const CacheStats = query.cache.CacheStats;
 
 // Version information (keep in sync with build.zig)
-pub const VERSION = "0.15.0";
+pub const VERSION = "0.18.1";
 pub const VERSION_MAJOR = 0;
-pub const VERSION_MINOR = 15;
-pub const VERSION_PATCH = 0;
+pub const VERSION_MINOR = 18;
+pub const VERSION_PATCH = 1;
 
 test {
     // Run tests from all modules
     std.testing.refAllDecls(@This());
+    // Nothing in the library reaches these VFS modules' tests through the
+    // modules it uses.
+    _ = storage.fault_vfs;
+    _ = storage.overlay_vfs;
 }

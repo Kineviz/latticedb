@@ -19,7 +19,12 @@ const NodeId = types.NodeId;
 const scorer = @import("../../fts/scorer.zig");
 const ScoredDoc = scorer.ScoredDoc;
 
+const ast = @import("../ast.zig");
+const ExpressionEvaluator = @import("../expression.zig").ExpressionEvaluator;
+const limit_ops = @import("limit.zig");
+
 const fts_catalog = @import("../../fts/catalog.zig");
+const fts_query = @import("../../fts/query.zig");
 const FtsEntityKind = fts_catalog.FtsEntityKind;
 
 const database_mod = @import("../../storage/database.zig");
@@ -91,6 +96,10 @@ pub const FtsIndexSeek = struct {
     /// Which candidate `open` chose, for tests and explain output.
     chosen: usize,
     limit: u32,
+    /// The RETURN's LIMIT and SKIP, when the rows this gives reach them one
+    /// for one and in this order (best score first); see the planner's
+    /// `boundSeek`. The search then keeps only that many.
+    bound: Bound = .{},
     database: *Database,
     results: ?[]ScoredDoc,
     current_index: usize,
@@ -98,6 +107,11 @@ pub const FtsIndexSeek = struct {
     allocator: Allocator,
 
     const Self = @This();
+
+    pub const Bound = struct {
+        limit: ?*const ast.Expression = null,
+        skip: ?*const ast.Expression = null,
+    };
 
     pub fn init(
         allocator: Allocator,
@@ -187,11 +201,21 @@ pub const FtsIndexSeek = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.current_row = ctx.allocRow() catch return OperatorError.OutOfMemory;
         self.chosen = self.chooseCandidate(ctx);
+        var limit = self.limit;
+        if (self.bound.limit) |limit_expr| {
+            var evaluator = ExpressionEvaluator.init(ctx.row_arena.allocator());
+            const wanted = try limit_ops.evaluateCountExpression(&evaluator, limit_expr, ctx);
+            const skip = if (self.bound.skip) |skip_expr|
+                try limit_ops.evaluateCountExpression(&evaluator, skip_expr, ctx)
+            else
+                0;
+            limit = @intCast(@min(wanted +| skip, limit));
+        }
         self.results = try runSearches(
             self.database,
             ctx,
             self.candidates[self.chosen],
-            self.limit,
+            limit,
             self.allocator,
         );
         self.current_index = 0;
@@ -214,7 +238,14 @@ pub const FtsIndexSeek = struct {
             .{ .edge_ref = hit.doc_id }
         else
             .{ .node_ref = hit.doc_id });
-        row.setScore(self.output_slot, hit.score);
+        // With several candidates, which search ran is the planner's choice
+        // at run time, so its score would mean different things from one
+        // execution to the next: score() is null then.
+        if (self.candidates.len == 1) {
+            row.setScore(self.output_slot, hit.score);
+        } else {
+            row.scores[self.output_slot] = hit.score;
+        }
         return row;
     }
 
@@ -237,6 +268,24 @@ pub const FtsIndexSeek = struct {
     }
 };
 
+/// A failed index search as an operator error. A query the index refuses
+/// says why, in the words the per-row check uses; anything else is a
+/// storage failure.
+fn searchFailure(ctx: *ExecutionContext, err: anyerror, query_text: []const u8, search: Search) OperatorError {
+    if (err == error.InvalidArgument) {
+        const refusal = fts_query.refusalOf(ctx.allocator, query_text);
+        if (refusal != .neither) {
+            if (ctx.diagnostic) |d| switch (refusal) {
+                .only_excludes => d.record(.query, "InvalidArgument", null, "Full-text query '{s}' only excludes; it needs a word to match (write NOT x @@ 'word' to exclude)", .{query_text}),
+                .phrase => d.record(.query, "InvalidArgument", null, "Full-text query '{s}' has a phrase, and the index on {s}.{s} stores no word positions to match one (indexes built before 0.17.0 have none); drop the index and declare it again", .{ query_text, search.scope, search.property }),
+                .neither => unreachable,
+            };
+            return OperatorError.InvalidState;
+        }
+    }
+    return ctx.storageFailure(err, "searching the full-text index on {s}.{s}", .{ search.scope, search.property });
+}
+
 /// Run every search and union the results, taking each document's best score.
 ///
 /// Shared by the seek and the filtering operator so the two cannot disagree
@@ -255,8 +304,10 @@ fn runSearches(
         const query_text = if (search.literal_query) |lit|
             lit
         else if (search.param_name) |pname| blk: {
-            const param_value = ctx.getParameter(pname) orelse return OperatorError.UnboundVariable;
-            break :blk extractTextFromParam(param_value) orelse return OperatorError.TypeError;
+            const param_value = ctx.getParameter(pname) orelse
+                return ctx.fail(OperatorError.UnboundVariable, null, "Parameter ${s} was not given a value", .{pname});
+            break :blk extractTextFromParam(param_value) orelse
+                return ctx.fail(OperatorError.TypeError, null, "Parameter ${s} must be a string for @@, but it is a {s}", .{ pname, @tagName(param_value) });
         } else {
             return OperatorError.UnboundVariable;
         };
@@ -268,7 +319,7 @@ fn runSearches(
             search.property,
             query_text,
             limit,
-        ) catch return OperatorError.StorageError;
+        ) catch |err| return searchFailure(ctx, err, query_text, search);
         defer database.freeFtsSearchResults(hits);
 
         for (hits) |hit| {
@@ -287,8 +338,10 @@ fn runSearches(
         len += 1;
     }
     std.mem.sort(ScoredDoc, merged[0..len], {}, ScoredDoc.lessThan);
-    if (len > limit) len = limit;
-    return merged[0..len];
+    if (len <= limit) return merged;
+    // Callers free what this returns, so it has to be the whole allocation.
+    defer allocator.free(merged);
+    return allocator.dupe(ScoredDoc, merged[0..limit]) catch return OperatorError.OutOfMemory;
 }
 
 pub const FtsSearchWithInput = struct {

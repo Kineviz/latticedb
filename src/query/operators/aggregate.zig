@@ -18,6 +18,7 @@ const ExpressionEvaluator = expression.ExpressionEvaluator;
 const EvalResult = expression.EvalResult;
 const EvalError = expression.EvalError;
 const key_encoding = @import("key_encoding.zig");
+const orderValues = @import("limit.zig").orderValues;
 
 const ast = @import("../ast.zig");
 
@@ -63,7 +64,11 @@ pub const GroupKey = struct {
 const Accumulator = struct {
     func: AggregateFunc,
     count: u64 = 0,
-    sum: f64 = 0,
+    /// Integer values summed exactly; sum() fails if this leaves i64.
+    int_sum: i128 = 0,
+    /// Float values summed. Any float makes sum() a float.
+    float_sum: f64 = 0,
+    saw_float: bool = false,
     min_val: ?EvalResult = null,
     max_val: ?EvalResult = null,
     collected: std.ArrayList(EvalResult),
@@ -91,7 +96,13 @@ const Accumulator = struct {
         self.seen_values.deinit();
     }
 
-    fn accumulate(self: *Accumulator, value: EvalResult) !void {
+    const Error = error{ OutOfMemory, TypeError };
+
+    /// Add one value. Every aggregate but count(*) ignores null, as Cypher
+    /// does: avg of [10, null, 30] is 20 and collect leaves nulls out.
+    fn accumulate(self: *Accumulator, value: EvalResult) Error!void {
+        if (self.func != .count_star and value.isNull()) return;
+
         // If DISTINCT, check for duplicate values
         if (self.distinct and !value.isNull()) {
             var key_buf: std.ArrayList(u8) = .empty;
@@ -120,19 +131,16 @@ const Accumulator = struct {
                     self.count += 1;
                 }
             },
-            .sum => {
+            .sum, .avg => {
                 switch (value) {
-                    .int_val => |i| self.sum += @floatFromInt(i),
-                    .float_val => |f| self.sum += f,
-                    else => {},
-                }
-                self.count += 1;
-            },
-            .avg => {
-                switch (value) {
-                    .int_val => |i| self.sum += @floatFromInt(i),
-                    .float_val => |f| self.sum += f,
-                    else => {},
+                    // An i128 holds the sum of 2^64 i64 values, far more
+                    // rows than a query can produce.
+                    .int_val => |i| self.int_sum += i,
+                    .float_val => |f| {
+                        self.float_sum += f;
+                        self.saw_float = true;
+                    },
+                    else => return error.TypeError,
                 }
                 self.count += 1;
             },
@@ -164,13 +172,19 @@ const Accumulator = struct {
         }
     }
 
-    fn result(self: *const Accumulator) EvalResult {
+    /// The aggregate's value. sum() of integers is an integer, and fails
+    /// when it does not fit in one.
+    fn result(self: *const Accumulator) error{IntegerOverflow}!EvalResult {
         return switch (self.func) {
             .count_star, .count => .{ .int_val = @intCast(self.count) },
-            .sum => .{ .float_val = self.sum },
+            .sum => if (self.saw_float)
+                .{ .float_val = self.float_sum + @as(f64, @floatFromInt(self.int_sum)) }
+            else
+                .{ .int_val = std.math.cast(i64, self.int_sum) orelse return error.IntegerOverflow },
             .avg => blk: {
                 if (self.count == 0) break :blk .{ .null_val = {} };
-                break :blk .{ .float_val = self.sum / @as(f64, @floatFromInt(self.count)) };
+                const total = self.float_sum + @as(f64, @floatFromInt(self.int_sum));
+                break :blk .{ .float_val = total / @as(f64, @floatFromInt(self.count)) };
             },
             .min => self.min_val orelse .{ .null_val = {} },
             .max => self.max_val orelse .{ .null_val = {} },
@@ -179,29 +193,14 @@ const Accumulator = struct {
     }
 };
 
-/// Compare two EvalResults for ordering
+/// The order min and max choose by: the one ORDER BY sorts by.
+///
+/// Values of different types have a fixed order there, and integers and
+/// floats compare by value exactly. Comparing them here as equal made the
+/// answer over mixed types whichever value came first, and going through
+/// f64 confused integers that differ only beyond 2^53.
 fn compareValues(a: EvalResult, b: EvalResult) std.math.Order {
-    return switch (a) {
-        .int_val => |ai| switch (b) {
-            .int_val => |bi| std.math.order(ai, bi),
-            .float_val => |bf| std.math.order(@as(f64, @floatFromInt(ai)), bf),
-            else => .eq,
-        },
-        .float_val => |af| switch (b) {
-            .float_val => |bf| std.math.order(af, bf),
-            .int_val => |bi| std.math.order(af, @as(f64, @floatFromInt(bi))),
-            else => .eq,
-        },
-        .string_val => |as| switch (b) {
-            .string_val => |bs| std.mem.order(u8, as, bs),
-            else => .eq,
-        },
-        .bytes_val => |ab| switch (b) {
-            .bytes_val => |bb| std.mem.order(u8, ab, bb),
-            else => .eq,
-        },
-        else => .eq,
-    };
+    return orderValues(a, b);
 }
 
 // ============================================================================
@@ -307,8 +306,14 @@ pub const Aggregate = struct {
     fn open(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Open input
+        // A plan run once per row of another (CALL { ... }) opens this
+        // again; each run groups its own rows.
+        if (self.consumed) self.resetGroups();
+
+        // Open input. If draining it fails, close it here: the caller never
+        // closes an operator whose open failed.
         try self.input.open(ctx);
+        errdefer self.input.close(ctx);
 
         // Consume all input rows and accumulate
         while (true) {
@@ -342,9 +347,7 @@ pub const Aggregate = struct {
                 else
                     EvalResult{ .null_val = {} }; // COUNT(*)
 
-                self.global_group.?.accumulators[i].accumulate(value) catch {
-                    return OperatorError.OutOfMemory;
-                };
+                self.global_group.?.accumulators[i].accumulate(value) catch |err| return accumulateFailure(ctx, item, err, value);
             }
         } else {
             // Grouped aggregation - compute group key
@@ -390,9 +393,7 @@ pub const Aggregate = struct {
                 else
                     EvalResult{ .null_val = {} };
 
-                gop.value_ptr.accumulators[i].accumulate(value) catch {
-                    return OperatorError.OutOfMemory;
-                };
+                gop.value_ptr.accumulators[i].accumulate(value) catch |err| return accumulateFailure(ctx, item, err, value);
             }
         }
     }
@@ -410,8 +411,9 @@ pub const Aggregate = struct {
 
                 // Output aggregate results
                 for (self.agg_items, 0..) |item, i| {
-                    const result = group.accumulators[i].result();
-                    output_row.setSlot(item.output_slot, resultToSlotValue(result, self.allocator));
+                    const result = group.accumulators[i].result() catch
+                        return ctx.fail(OperatorError.EvaluationError, if (item.expr) |e| e.getLocation() else null, "Integer overflow: {s}() of these integers does not fit in a 64-bit integer", .{@tagName(item.func)});
+                    output_row.setSlot(item.output_slot, resultToSlotValue(result, self.allocator) catch return OperatorError.OutOfMemory);
                 }
 
                 // Clear global group so we don't return it again
@@ -433,13 +435,14 @@ pub const Aggregate = struct {
 
                 // Output group key values
                 for (self.group_keys, 0..) |gk, i| {
-                    output_row.setSlot(gk.output_slot, resultToSlotValue(entry.value_ptr.key_values[i], self.allocator));
+                    output_row.setSlot(gk.output_slot, resultToSlotValue(entry.value_ptr.key_values[i], self.allocator) catch return OperatorError.OutOfMemory);
                 }
 
                 // Output aggregate results
                 for (self.agg_items, 0..) |item, i| {
-                    const result = entry.value_ptr.accumulators[i].result();
-                    output_row.setSlot(item.output_slot, resultToSlotValue(result, self.allocator));
+                    const result = entry.value_ptr.accumulators[i].result() catch
+                        return ctx.fail(OperatorError.EvaluationError, if (item.expr) |e| e.getLocation() else null, "Integer overflow: {s}() of these integers does not fit in a 64-bit integer", .{@tagName(item.func)});
+                    output_row.setSlot(item.output_slot, resultToSlotValue(result, self.allocator) catch return OperatorError.OutOfMemory);
                 }
 
                 return output_row;
@@ -452,6 +455,19 @@ pub const Aggregate = struct {
     fn close(ptr: *anyopaque, ctx: *ExecutionContext) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.input.close(ctx);
+    }
+
+    fn resetGroups(self: *Self) void {
+        var it = self.groups.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.groups.clearRetainingCapacity();
+        self.group_iterator = null;
+        if (self.global_group) |*group| group.deinit();
+        self.global_group = null;
+        self.consumed = false;
     }
 
     fn deinitOp(ptr: *anyopaque, allocator: Allocator) void {
@@ -481,9 +497,9 @@ pub const Aggregate = struct {
 };
 
 /// Convert an EvalResult to a SlotValue
-fn resultToSlotValue(result: EvalResult, allocator: Allocator) SlotValue {
+fn resultToSlotValue(result: EvalResult, allocator: Allocator) Allocator.Error!SlotValue {
     return switch (result) {
-        .null_val => .{ .empty = {} },
+        .null_val => .{ .property = .{ .null_val = {} } },
         .node_ref => |id| .{ .node_ref = id },
         .edge_ref => |id| .{ .edge_ref = id },
         .bool_val => |b| .{ .property = .{ .bool_val = b } },
@@ -492,8 +508,24 @@ fn resultToSlotValue(result: EvalResult, allocator: Allocator) SlotValue {
         .string_val => |s| .{ .property = .{ .string_val = s } },
         .bytes_val => |b| .{ .property = .{ .bytes_val = b } },
         .vector_val => |v| .{ .property = .{ .vector_val = v } },
-        .list_val => .{ .property = result.toPropertyValue(allocator) },
-        .map_val => .{ .property = result.toPropertyValue(allocator) },
+        .list_val, .map_val => try result.containerToSlotValue(allocator),
+        .path_val => |p| .{ .path = p },
+    };
+}
+
+/// An aggregate that could not take a value, described.
+fn accumulateFailure(ctx: *const ExecutionContext, item: AggregateItem, err: Accumulator.Error, value: EvalResult) OperatorError {
+    @branchHint(.cold);
+    if (err == error.TypeError) {
+        return ctx.fail(OperatorError.TypeError, if (item.expr) |e| e.getLocation() else null, "Type error: {s}() takes numbers, but was given a {s}", .{ @tagName(item.func), expression.typeName(value) });
+    }
+    return mapAccumulateError(err);
+}
+
+fn mapAccumulateError(err: Accumulator.Error) OperatorError {
+    return switch (err) {
+        error.OutOfMemory => OperatorError.OutOfMemory,
+        error.TypeError => OperatorError.TypeError,
     };
 }
 
@@ -504,6 +536,7 @@ fn mapEvalError(err: EvalError) OperatorError {
         EvalError.TypeError => OperatorError.TypeError,
         EvalError.UnboundVariable => OperatorError.UnboundVariable,
         EvalError.PropertyNotFound => OperatorError.PropertyNotFound,
+        EvalError.StorageError => OperatorError.StorageError,
         else => OperatorError.EvaluationError,
     };
 }
@@ -524,6 +557,37 @@ pub fn containsAggregate(expr: *const ast.Expression) bool {
         .binary => |b| containsAggregate(b.left) or containsAggregate(b.right),
         .unary => |u| containsAggregate(u.operand),
         .property_access => |p| containsAggregate(p.object),
+        .label_test => |t| containsAggregate(t.subject),
+        .list => |l| for (l.elements) |e| {
+            if (containsAggregate(e)) break true;
+        } else false,
+        .map => |m| for (m.entries) |e| {
+            if (containsAggregate(e.value)) break true;
+        } else false,
+        .index => |i| containsAggregate(i.object) or containsAggregate(i.index),
+        .slice => |s| containsAggregate(s.object) or
+            (if (s.from) |f| containsAggregate(f) else false) or
+            (if (s.to) |t| containsAggregate(t) else false),
+        .case_expr => |c| blk: {
+            if (c.subject) |subject| {
+                if (containsAggregate(subject)) break :blk true;
+            }
+            for (c.branches) |branch| {
+                if (containsAggregate(branch.when) or containsAggregate(branch.then)) break :blk true;
+            }
+            if (c.else_expr) |e| break :blk containsAggregate(e);
+            break :blk false;
+        },
+        .comprehension => |c| containsAggregate(c.list) or
+            (if (c.where) |w| containsAggregate(w) else false) or
+            (if (c.map) |m| containsAggregate(m) else false),
+        .reduce => |r| containsAggregate(r.initial) or containsAggregate(r.list) or containsAggregate(r.expression),
+        .map_projection => |m| for (m.entries) |e| {
+            if (e.value) |v| if (containsAggregate(v)) break true;
+        } else false,
+        // Its WHERE and value belong to its own matches, not to the rows
+        // being grouped.
+        .subquery => false,
         else => false,
     };
 }
@@ -589,7 +653,7 @@ test "Accumulator count" {
     try acc.accumulate(.{ .null_val = {} });
     try acc.accumulate(.{ .int_val = 3 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectEqual(@as(i64, 3), result.int_val);
 }
 
@@ -602,8 +666,48 @@ test "Accumulator sum" {
     try acc.accumulate(.{ .int_val = 20 });
     try acc.accumulate(.{ .float_val = 5.5 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectApproxEqAbs(@as(f64, 35.5), result.float_val, 0.001);
+}
+
+test "Accumulator sum of integers is an exact integer" {
+    const allocator = std.testing.allocator;
+    var acc = Accumulator.init(allocator, .sum, false);
+    defer acc.deinit();
+
+    try acc.accumulate(.{ .int_val = 9007199254740993 }); // 2^53 + 1
+    try acc.accumulate(.{ .int_val = 10 });
+    try acc.accumulate(.{ .null_val = {} });
+    try std.testing.expectEqual(@as(i64, 9007199254741003), (try acc.result()).int_val);
+
+    try acc.accumulate(.{ .int_val = std.math.maxInt(i64) });
+    try std.testing.expectError(error.IntegerOverflow, acc.result());
+    try std.testing.expectError(error.TypeError, acc.accumulate(.{ .string_val = "x" }));
+}
+
+test "Accumulator skips nulls" {
+    const allocator = std.testing.allocator;
+    var avg = Accumulator.init(allocator, .avg, false);
+    defer avg.deinit();
+    try avg.accumulate(.{ .int_val = 10 });
+    try avg.accumulate(.{ .null_val = {} });
+    try avg.accumulate(.{ .int_val = 30 });
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), (try avg.result()).float_val, 0.001);
+
+    var collect = Accumulator.init(allocator, .collect, false);
+    defer collect.deinit();
+    try collect.accumulate(.{ .null_val = {} });
+    try collect.accumulate(.{ .int_val = 1 });
+    try std.testing.expectEqual(@as(usize, 1), (try collect.result()).list_val.len);
+
+    var empty_avg = Accumulator.init(allocator, .avg, false);
+    defer empty_avg.deinit();
+    try empty_avg.accumulate(.{ .null_val = {} });
+    try std.testing.expect((try empty_avg.result()) == .null_val);
+
+    var empty_sum = Accumulator.init(allocator, .sum, false);
+    defer empty_sum.deinit();
+    try std.testing.expectEqual(@as(i64, 0), (try empty_sum.result()).int_val);
 }
 
 test "Accumulator avg" {
@@ -615,7 +719,7 @@ test "Accumulator avg" {
     try acc.accumulate(.{ .int_val = 20 });
     try acc.accumulate(.{ .int_val = 30 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectApproxEqAbs(@as(f64, 20.0), result.float_val, 0.001);
 }
 
@@ -636,8 +740,8 @@ test "Accumulator min/max" {
     try max_acc.accumulate(.{ .int_val = 10 });
     try max_acc.accumulate(.{ .int_val = 20 });
 
-    try std.testing.expectEqual(@as(i64, 10), min_acc.result().int_val);
-    try std.testing.expectEqual(@as(i64, 30), max_acc.result().int_val);
+    try std.testing.expectEqual(@as(i64, 10), (try min_acc.result()).int_val);
+    try std.testing.expectEqual(@as(i64, 30), (try max_acc.result()).int_val);
 }
 
 test "Accumulator collect" {
@@ -649,7 +753,7 @@ test "Accumulator collect" {
     try acc.accumulate(.{ .int_val = 2 });
     try acc.accumulate(.{ .int_val = 3 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectEqual(@as(usize, 3), result.list_val.len);
 }
 
@@ -663,7 +767,7 @@ test "Accumulator collect preserves values" {
     try acc.accumulate(.{ .bool_val = true });
     try acc.accumulate(.{ .float_val = 2.5 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectEqual(@as(usize, 4), result.list_val.len);
     try std.testing.expectEqual(@as(i64, 10), result.list_val[0].int_val);
     try std.testing.expectEqualStrings("hello", result.list_val[1].string_val);
@@ -689,7 +793,7 @@ test "Accumulator DISTINCT keeps long shared-prefix strings distinct" {
     try acc.accumulate(.{ .string_val = s1 });
     try acc.accumulate(.{ .string_val = s2 });
 
-    const result = acc.result();
+    const result = try acc.result();
     try std.testing.expectEqual(@as(i64, 2), result.int_val);
 }
 
@@ -702,7 +806,7 @@ test "resultToSlotValue converts list" {
     };
     const list_result = EvalResult{ .list_val = &items };
 
-    const slot = resultToSlotValue(list_result, allocator);
+    const slot = try resultToSlotValue(list_result, allocator);
     defer allocator.free(slot.asProperty().?.list_val);
 
     const prop = slot.asProperty().?;
@@ -715,7 +819,7 @@ test "resultToSlotValue converts vector" {
     const vec = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
     const vec_result = EvalResult{ .vector_val = &vec };
 
-    const slot = resultToSlotValue(vec_result, std.testing.allocator);
+    const slot = try resultToSlotValue(vec_result, std.testing.allocator);
 
     const prop = slot.asProperty().?;
     try std.testing.expectEqual(@as(usize, 4), prop.vector_val.len);
@@ -731,7 +835,7 @@ test "resultToSlotValue converts map" {
     };
     const map_result = EvalResult{ .map_val = &entries };
 
-    const slot = resultToSlotValue(map_result, allocator);
+    const slot = try resultToSlotValue(map_result, allocator);
     defer allocator.free(slot.asProperty().?.map_val);
 
     const prop = slot.asProperty().?;

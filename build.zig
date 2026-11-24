@@ -1,5 +1,5 @@
 const std = @import("std");
-const version = "0.15.0";
+const version = "0.18.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -94,7 +94,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lattice", .module = lib_module },
         },
     });
-    unit_test_module.addImport("cli_main", cli_main_test_module);
     unit_test_module.addImport("compat", compat_module);
     unit_test_module.link_libc = true;
 
@@ -152,6 +151,14 @@ pub fn build(b: *std.Build) void {
         .root_module = cli_key_test_module,
     });
     const run_cli_key_tests = b.addRunArtifact(cli_key_tests);
+
+    // The rest of the CLI: main.zig and the files it pulls in. Importing the CLI
+    // into another test module does not run these, because a test binary only
+    // collects the tests of its own module.
+    const cli_main_tests = b.addTest(.{
+        .root_module = cli_main_test_module,
+    });
+    const run_cli_main_tests = b.addRunArtifact(cli_main_tests);
 
     // ReleaseSmall: strip symbols, disable unwind tables, omit frame pointers
     if (optimize == .ReleaseSmall) {
@@ -211,6 +218,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_cli_args_tests.step);
     test_step.dependOn(&run_cli_key_tests.step);
+    test_step.dependOn(&run_cli_main_tests.step);
 
     // Integration test module - imports the library module
     const import_export_module = b.createModule(.{
@@ -236,6 +244,11 @@ pub fn build(b: *std.Build) void {
     integration_test_module.addImport("compat", compat_module);
     integration_test_module.link_libc = true;
 
+    // The CLI tests run the built binary, so they are handed its path.
+    const integration_options = b.addOptions();
+    integration_options.addOptionPath("cli_path", cli.getEmittedBin());
+    integration_test_module.addOptions("build_options", integration_options);
+
     // Integration tests
     const integration_tests = b.addTest(.{
         .root_module = integration_test_module,
@@ -244,6 +257,30 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("integration-test", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // The W3C Turtle and N-Triples suites, run against a checkout of
+    // github.com/w3c/rdf-tests named on the command line. Not part of `test`:
+    // the suite is not in this repository.
+    const rdf_syntax_module = b.createModule(.{
+        .root_source_file = b.path("src/cli/rdf/syntax.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const rdf_w3c_module = b.createModule(.{
+        .root_source_file = b.path("tests/rdf/w3c_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rdf_syntax", .module = rdf_syntax_module },
+            .{ .name = "compat", .module = compat_module },
+        },
+    });
+    rdf_w3c_module.link_libc = true;
+    const rdf_w3c = b.addExecutable(.{ .name = "rdf-w3c", .root_module = rdf_w3c_module });
+    const run_rdf_w3c = b.addRunArtifact(rdf_w3c);
+    if (b.args) |args| run_rdf_w3c.addArgs(args);
+    const rdf_w3c_step = b.step("rdf-w3c", "Run the W3C Turtle and N-Triples suites: zig build rdf-w3c -- <rdf-tests checkout>");
+    rdf_w3c_step.dependOn(&run_rdf_w3c.step);
 
     // Crash test module - imports the library module
     const crash_test_module = b.createModule(.{
@@ -306,7 +343,7 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(&bench_exe.step);
 
-    const bench_step = b.step("benchmark", "Run performance benchmarks");
+    const bench_step = b.step("benchmark", "Run internal-path micro-benchmarks (developer use; published figures come from capi-benchmark)");
     bench_step.dependOn(&run_bench.step);
 
     // Stress test module
@@ -382,8 +419,53 @@ pub fn build(b: *std.Build) void {
         run_vector_bench.addArgs(args);
     }
 
-    const vector_bench_step = b.step("vector-benchmark", "Run HNSW vector performance benchmarks");
+    const vector_bench_step = b.step("vector-benchmark", "Run HNSW index benchmarks without the database around it (developer use; see capi-benchmark)");
     vector_bench_step.dependOn(&run_vector_bench.step);
+
+    // Storage-core micro-benchmarks (checksums, page allocation, B+Tree)
+    const storage_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark/storage_benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "lattice", .module = bench_lib_module },
+        },
+    });
+    storage_bench_module.addImport("compat", compat_module);
+    storage_bench_module.link_libc = true;
+
+    const storage_bench_exe = b.addExecutable(.{
+        .name = "storage-benchmark",
+        .root_module = storage_bench_module,
+    });
+
+    const run_storage_bench = b.addRunArtifact(storage_bench_exe);
+    const storage_bench_step = b.step("storage-benchmark", "Run storage-core micro-benchmarks");
+    storage_bench_step.dependOn(&run_storage_bench.step);
+
+    // Space report: where a database file's bytes go, tree by tree.
+    const space_report_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark/space_report.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "lattice", .module = bench_lib_module },
+        },
+    });
+    space_report_module.addImport("compat", compat_module);
+    space_report_module.link_libc = true;
+
+    const space_report_exe = b.addExecutable(.{
+        .name = "space-report",
+        .root_module = space_report_module,
+    });
+
+    const run_space_report = b.addRunArtifact(space_report_exe);
+    if (b.args) |args| {
+        run_space_report.addArgs(args);
+    }
+    const space_report_step = b.step("space-report", "Report each B+Tree's pages and fill: zig build space-report -- <db>");
+    space_report_step.dependOn(&run_space_report.step);
 
     // SQLite comparison benchmark module
     const sqlite_bench_module = b.createModule(.{
@@ -407,7 +489,7 @@ pub fn build(b: *std.Build) void {
     const run_sqlite_bench = b.addRunArtifact(sqlite_bench_exe);
     run_sqlite_bench.step.dependOn(&sqlite_bench_exe.step);
 
-    const sqlite_bench_step = b.step("sqlite-benchmark", "Run SQLite vs LatticeDB comparison benchmark");
+    const sqlite_bench_step = b.step("sqlite-benchmark", "Run in-process traversal vs SQLite, log off, adjacency cache (developer use; not the published comparison, see capi-benchmark)");
     sqlite_bench_step.dependOn(&run_sqlite_bench.step);
 
     // Graph DFS benchmark module
@@ -434,8 +516,49 @@ pub fn build(b: *std.Build) void {
         run_graph_bench.addArgs(args);
     }
 
-    const graph_bench_step = b.step("graph-benchmark", "Run DFS graph traversal benchmarks (LatticeDB vs SQLite)");
+    const graph_bench_step = b.step("graph-benchmark", "Run in-process DFS over the adjacency cache vs SQLite (developer use; queries never use the cache, see capi-benchmark)");
     graph_bench_step.dependOn(&run_graph_bench.step);
+
+    // Public-API benchmark: the program behind the published performance
+    // tables. It is C against include/lattice.h and a ReleaseFast liblattice,
+    // so it measures what an application or a binding gets, with the default
+    // options; the steps above call internal Zig paths. The Python driver runs
+    // each workload in fresh processes and reports medians and spreads.
+    const capi_bench_lib = b.addLibrary(.{
+        .name = "lattice-capi-bench",
+        .root_module = bench_lib_module,
+        .linkage = .static,
+    });
+    const capi_bench_module = b.createModule(.{
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    capi_bench_module.addCSourceFile(.{
+        .file = b.path("tests/benchmark/capi_bench.c"),
+        .flags = &.{ "-std=gnu11", "-O2" },
+    });
+    capi_bench_module.addIncludePath(b.path("include"));
+    capi_bench_module.linkLibrary(capi_bench_lib);
+    capi_bench_module.linkSystemLibrary("sqlite3", .{});
+    const capi_bench_exe = b.addExecutable(.{
+        .name = "capi-bench",
+        .root_module = capi_bench_module,
+    });
+    // Installed (zig-out/bin/capi-bench) by this step only, so one workload
+    // can be run by hand; the default install does not build it.
+    const install_capi_bench = b.addInstallArtifact(capi_bench_exe, .{});
+    const run_capi_bench = b.addSystemCommand(&.{"python3"});
+    run_capi_bench.step.dependOn(&install_capi_bench.step);
+    run_capi_bench.addFileArg(b.path("tests/benchmark/capi_bench.py"));
+    run_capi_bench.addArg("--bin");
+    run_capi_bench.addArtifactArg(capi_bench_exe);
+    run_capi_bench.has_side_effects = true;
+    if (b.args) |args| {
+        run_capi_bench.addArgs(args);
+    }
+    const capi_bench_step = b.step("capi-benchmark", "Run the public C API benchmarks behind the published tables (see book/src/performance/benchmarks.md)");
+    capi_bench_step.dependOn(&run_capi_bench.step);
 
     // Compile every benchmark without running one.
     //
@@ -455,6 +578,8 @@ pub fn build(b: *std.Build) void {
         vector_bench_exe,
         sqlite_bench_exe,
         graph_bench_exe,
+        space_report_exe,
+        capi_bench_exe,
     }) |exe| {
         bench_build_step.dependOn(&exe.step);
     }

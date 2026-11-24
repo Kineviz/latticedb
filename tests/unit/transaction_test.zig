@@ -310,24 +310,35 @@ test "txn: nested savepoints work correctly" {
 // 8.1 WAL Integration Tests
 // ============================================================================
 
-test "txn: begin writes TXN_BEGIN to WAL" {
+test "txn: TXN_BEGIN is written with the first record, not at begin" {
     const allocator = std.testing.allocator;
     var ctx = try TestContext.init(allocator, "/tmp/lattice_txn_wal_begin.wal");
     defer ctx.deinit();
 
     var txn = try ctx.tm.begin(.read_write, .snapshot);
-
-    // Sync WAL to flush buffered records
-    try ctx.wal.sync();
-
-    // Verify WAL contains TXN_BEGIN
-    var iter = ctx.wal.iterate(1);
     var buf: [256]u8 = undefined;
 
-    const record = try iter.next(&buf);
-    try std.testing.expect(record != null);
-    try std.testing.expectEqual(WalRecordType.txn_begin, record.?.header.record_type);
-    try std.testing.expectEqual(txn.id, record.?.header.txn_id);
+    // Beginning a transaction puts nothing in the log.
+    try ctx.wal.sync();
+    {
+        var iter = ctx.wal.iterate(1);
+        try std.testing.expect(try iter.next(&buf) == null);
+    }
+
+    // The first record it logs brings TXN_BEGIN with it.
+    _ = try ctx.tm.logOperation(&txn, .insert, "op");
+    try ctx.wal.sync();
+    {
+        var iter = ctx.wal.iterate(1);
+        const begin_record = try iter.next(&buf);
+        try std.testing.expect(begin_record != null);
+        try std.testing.expectEqual(WalRecordType.txn_begin, begin_record.?.header.record_type);
+        try std.testing.expectEqual(txn.id, begin_record.?.header.txn_id);
+        const op_record = try iter.next(&buf);
+        try std.testing.expect(op_record != null);
+        try std.testing.expectEqual(WalRecordType.insert, op_record.?.header.record_type);
+        try std.testing.expectEqual(begin_record.?.header.lsn, op_record.?.header.prev_lsn);
+    }
 
     try ctx.tm.commit(&txn);
 }
@@ -338,41 +349,70 @@ test "txn: commit writes TXN_COMMIT and syncs" {
     defer ctx.deinit();
 
     var txn = try ctx.tm.begin(.read_write, .snapshot);
+    _ = try ctx.tm.logOperation(&txn, .insert, "op");
     try ctx.tm.commit(&txn); // Commit syncs the WAL
 
-    // Verify WAL contains TXN_BEGIN and TXN_COMMIT
     var iter = ctx.wal.iterate(1);
     var buf: [256]u8 = undefined;
 
-    // TXN_BEGIN
     const begin_record = try iter.next(&buf);
     try std.testing.expect(begin_record != null);
     try std.testing.expectEqual(WalRecordType.txn_begin, begin_record.?.header.record_type);
 
-    // TXN_COMMIT
+    const op_record = try iter.next(&buf);
+    try std.testing.expect(op_record != null);
+    try std.testing.expectEqual(WalRecordType.insert, op_record.?.header.record_type);
+
     const commit_record = try iter.next(&buf);
     try std.testing.expect(commit_record != null);
     try std.testing.expectEqual(WalRecordType.txn_commit, commit_record.?.header.record_type);
 }
 
-test "txn: abort writes TXN_ABORT and syncs" {
+test "txn: a transaction that logged nothing ends without touching the WAL" {
+    const allocator = std.testing.allocator;
+    var ctx = try TestContext.init(allocator, "/tmp/lattice_txn_wal_untouched.wal");
+    defer ctx.deinit();
+
+    const lsn_before = ctx.wal.getCurrentLsn();
+
+    var reader = try ctx.tm.begin(.read_only, .snapshot);
+    try ctx.tm.commit(&reader);
+    var idle_writer = try ctx.tm.begin(.read_write, .snapshot);
+    try ctx.tm.commit(&idle_writer);
+    var aborted = try ctx.tm.begin(.read_write, .snapshot);
+    try ctx.tm.abort(&aborted);
+
+    try std.testing.expectEqual(lsn_before, ctx.wal.getCurrentLsn());
+    try std.testing.expectEqual(@as(u64, 0), ctx.wal.header.frame_count);
+    try std.testing.expect(!ctx.tm.hasLoggedActiveTxn());
+}
+
+test "txn: abort writes TXN_ABORT" {
     const allocator = std.testing.allocator;
     var ctx = try TestContext.init(allocator, "/tmp/lattice_txn_wal_abort.wal");
     defer ctx.deinit();
 
     var txn = try ctx.tm.begin(.read_write, .snapshot);
-    try ctx.tm.abort(&txn); // Abort syncs the WAL
+    _ = try ctx.tm.logOperation(&txn, .insert, "op");
+    try std.testing.expect(ctx.tm.hasLoggedActiveTxn());
+    try ctx.tm.abort(&txn);
+    try std.testing.expect(!ctx.tm.hasLoggedActiveTxn());
 
-    // Verify WAL contains TXN_BEGIN and TXN_ABORT
+    // The abort record is not synced by the abort itself; it reaches the
+    // disk with whatever is flushed next.
+    try ctx.wal.sync();
+
     var iter = ctx.wal.iterate(1);
     var buf: [256]u8 = undefined;
 
-    // TXN_BEGIN
     const begin_record = try iter.next(&buf);
     try std.testing.expect(begin_record != null);
     try std.testing.expectEqual(WalRecordType.txn_begin, begin_record.?.header.record_type);
 
-    // TXN_ABORT
+    const op_record = try iter.next(&buf);
+    try std.testing.expect(op_record != null);
+    try std.testing.expectEqual(WalRecordType.insert, op_record.?.header.record_type);
+
     const abort_record = try iter.next(&buf);
     try std.testing.expect(abort_record != null);
     try std.testing.expectEqual(WalRecordType.txn_abort, abort_record.?.header.record_type);
@@ -1965,4 +2005,185 @@ test "rollback: label removal is undone on abort" {
         allocator.free(restored_labels);
     }
     try std.testing.expectEqual(@as(usize, 2), restored_labels.len);
+}
+
+fn expectLabelMembers(db: *Database, txn: ?*Transaction, label: []const u8, expected: []const u64) !void {
+    const allocator = std.testing.allocator;
+    const sorted = try allocator.dupe(u64, expected);
+    defer allocator.free(sorted);
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+
+    const ids = try db.getNodesByLabelInTxn(txn, label);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u64, sorted, ids);
+}
+
+fn expectLabelCount(db: *Database, txn: ?*Transaction, cypher: []const u8, expected: i64) !void {
+    var result = if (txn) |t| try db.queryInTxn(t, cypher) else try db.query(cypher);
+    defer result.deinit();
+    try expectSingleIntResult(&result, expected);
+}
+
+test "txn-aware reads: label scans see the transaction's own creates, deletes and label changes" {
+    if (!databaseSupportsTransactions()) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_txn_label_scan_overlay_test.ltdb";
+
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer @import("compat").fs.cwd().deleteFile(path) catch {};
+    defer @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+
+    var db = try Database.open(allocator, path, .{
+        .create = true,
+        .config = .{
+            .enable_wal = true,
+            .enable_fts = false,
+            .enable_vector = false,
+        },
+    });
+    defer db.close();
+
+    // Committed starting state.
+    var setup = try db.beginTransaction(.read_write);
+    const a1 = try db.createNode(&setup, &[_][]const u8{"A"});
+    const a2 = try db.createNode(&setup, &[_][]const u8{"A"});
+    const ab = try db.createNode(&setup, &[_][]const u8{ "A", "B" });
+    const b_only = try db.createNode(&setup, &[_][]const u8{"B"});
+    const a_deleted = try db.createNode(&setup, &[_][]const u8{"A"});
+    const a_unlabelled = try db.createNode(&setup, &[_][]const u8{"A"});
+    const b_gains_a = try db.createNode(&setup, &[_][]const u8{"B"});
+    try db.commitTransaction(&setup);
+
+    const committed_a = [_]u64{ a1, a2, ab, a_deleted, a_unlabelled };
+    try expectLabelMembers(db, null, "A", &committed_a);
+
+    // A reader that starts before the writer keeps its snapshot throughout.
+    var reader = try db.beginTransaction(.read_only);
+
+    var writer = try db.beginTransaction(.read_write);
+    const created = try db.createNode(&writer, &[_][]const u8{"A"});
+    const created_then_deleted = try db.createNode(&writer, &[_][]const u8{"A"});
+    try db.deleteNode(&writer, created_then_deleted);
+    const created_then_labelled = try db.createNode(&writer, &[_][]const u8{"C"});
+    try db.addNodeLabel(&writer, created_then_labelled, "A");
+    const created_then_unlabelled = try db.createNode(&writer, &[_][]const u8{ "A", "C" });
+    try db.removeNodeLabel(&writer, created_then_unlabelled, "A");
+    try db.deleteNode(&writer, a_deleted);
+    try db.removeNodeLabel(&writer, a_unlabelled, "A");
+    try db.addNodeLabel(&writer, b_gains_a, "A");
+    // A property write puts a1 in the overlay without touching its labels.
+    try db.setNodeProperty(&writer, a1, "touched", .{ .bool_val = true });
+    // A label the scan is not about changes nothing for it.
+    try db.addNodeLabel(&writer, a2, "D");
+    _ = b_only;
+
+    const writer_a = [_]u64{ a1, a2, ab, b_gains_a, created, created_then_labelled };
+    try expectLabelMembers(db, &writer, "A", &writer_a);
+    try expectLabelCount(db, &writer, "MATCH (n:A) RETURN count(n)", writer_a.len);
+    try expectLabelCount(db, &writer, "MATCH (n:C) RETURN count(n)", 2);
+    try expectLabelCount(db, &writer, "MATCH (n:D) RETURN count(n)", 1);
+
+    // Neither the reader nor a transaction-less read sees uncommitted work.
+    try expectLabelMembers(db, &reader, "A", &committed_a);
+    try expectLabelMembers(db, null, "A", &committed_a);
+    try expectLabelCount(db, &reader, "MATCH (n:A) RETURN count(n)", committed_a.len);
+    try expectLabelCount(db, &reader, "MATCH (n:C) RETURN count(n)", 0);
+
+    try db.commitTransaction(&writer);
+
+    // The reader still answers from its snapshot, including the node the
+    // writer deleted and the one it took the label from.
+    try expectLabelMembers(db, &reader, "A", &committed_a);
+    try expectLabelCount(db, &reader, "MATCH (n:A) RETURN count(n)", committed_a.len);
+    try expectLabelCount(db, &reader, "MATCH (n:D) RETURN count(n)", 0);
+    try db.commitTransaction(&reader);
+
+    // New readers see the committed result.
+    var after = try db.beginTransaction(.read_only);
+    defer db.commitTransaction(&after) catch {};
+    try expectLabelMembers(db, &after, "A", &writer_a);
+    try expectLabelMembers(db, null, "A", &writer_a);
+    try expectLabelCount(db, &after, "MATCH (n:A) RETURN count(n)", writer_a.len);
+    try expectLabelCount(db, null, "MATCH (n:A) RETURN count(n)", writer_a.len);
+
+    var limited = try db.queryInTxn(&after, "MATCH (n:A) RETURN n LIMIT 2");
+    defer limited.deinit();
+    try std.testing.expectEqual(@as(usize, 2), limited.rows.len);
+}
+
+test "query cache: cached queries see labels, types and properties that writes create" {
+    if (!databaseSupportsTransactions()) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_query_cache_new_symbols_test.ltdb";
+
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer @import("compat").fs.cwd().deleteFile(path) catch {};
+    defer @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+
+    var db = try Database.open(allocator, path, .{
+        .create = true,
+        .config = .{
+            .enable_wal = true,
+            .enable_fts = false,
+            .enable_vector = false,
+        },
+    });
+    defer db.close();
+
+    const by_label = "MATCH (n:Fresh) RETURN count(n)";
+    const by_property = "MATCH (n:Fresh) WHERE n.brand_new = 7 RETURN count(n)";
+    const by_type = "MATCH (:Fresh)-[r:NEVER_SEEN]->(:Fresh) RETURN count(r)";
+
+    // Cache all three while none of their labels, types or keys exist.
+    try expectLabelCount(db, null, by_label, 0);
+    try expectLabelCount(db, null, by_property, 0);
+    try expectLabelCount(db, null, by_type, 0);
+    const primed = db.queryCacheStats();
+    try std.testing.expectEqual(@as(u32, 3), primed.entries);
+
+    // Inside a transaction, the cached queries see what it writes.
+    var txn = try db.beginTransaction(.read_write);
+    const a = try db.createNode(&txn, &[_][]const u8{"Fresh"});
+    const b = try db.createNode(&txn, &[_][]const u8{"Fresh"});
+    try db.setNodeProperty(&txn, a, "brand_new", .{ .int_val = 7 });
+    const edge = try db.createEdgeAndGetId(&txn, a, b, "NEVER_SEEN");
+    try expectLabelCount(db, &txn, by_label, 2);
+    try expectLabelCount(db, &txn, by_property, 1);
+    try expectLabelCount(db, &txn, by_type, 1);
+    try db.commitTransaction(&txn);
+
+    // After commit, and without a transaction.
+    try expectLabelCount(db, null, by_label, 2);
+    try expectLabelCount(db, null, by_property, 1);
+    try expectLabelCount(db, null, by_type, 1);
+
+    // Deletes are seen too.
+    var del = try db.beginTransaction(.read_write);
+    try db.deleteEdgeById(&del, edge);
+    try db.removeNodeLabel(&del, b, "Fresh");
+    try db.commitTransaction(&del);
+    try expectLabelCount(db, null, by_label, 1);
+    try expectLabelCount(db, null, by_property, 1);
+    try expectLabelCount(db, null, by_type, 0);
+
+    // Writes without a transaction, too.
+    const c = try db.createNode(null, &[_][]const u8{"Fresh"});
+    try db.setNodeProperty(null, c, "brand_new", .{ .int_val = 7 });
+    try expectLabelCount(db, null, by_label, 2);
+    try expectLabelCount(db, null, by_property, 2);
+
+    // Every execution after the first three was served from the cache:
+    // writes no longer throw the parsed queries away.
+    const after = db.queryCacheStats();
+    try std.testing.expectEqual(primed.misses, after.misses);
+    try std.testing.expectEqual(@as(u32, 3), after.entries);
+    try std.testing.expectEqual(primed.hits + 11, after.hits);
 }

@@ -8,7 +8,7 @@ TypeScript/Node.js bindings for [LatticeDB](https://github.com/jeffhajewski/latt
 npm install @hajewski/latticedb
 ```
 
-Published package tarballs are expected to bundle the native shared library for supported platforms.
+Published package tarballs bundle the native shared library for Linux (x64, arm64), macOS (x64, arm64) and Windows (x64, arm64).
 
 If you are working from a source checkout, stage the native library into the package with:
 
@@ -29,6 +29,10 @@ Installed-prefix workflow:
 zig build install --prefix /tmp/lattice-install
 export LATTICE_PREFIX=/tmp/lattice-install
 ```
+
+`LATTICE_PREFIX` is searched under `<prefix>/lib`. On Windows, where `zig build install`
+puts `lattice.dll` in `<prefix>/bin` and only the import library in `<prefix>/lib`,
+`<prefix>/bin` is searched first, then `<prefix>/lib`.
 
 Alternatively, discovery can use `pkg-config`:
 
@@ -136,12 +140,59 @@ const db = new Database(path: string, options?: DatabaseOptions);
 interface DatabaseOptions {
   create?: boolean;          // Create if not exists (default: false)
   readOnly?: boolean;        // Open read-only (default: false)
-  cacheSizeMb?: number;      // Cache size in MB (default: 100)
-  enableVectors?: boolean;   // Preferred vector config flag
+  cacheSizeMb?: number;      // Cache size in MB; unset: LATTICE_BUFFER_POOL_MB, else 100
+  enableWal?: boolean;       // log commits so they survive a crash (default: true)
+  enableAdjacencyCache?: boolean; // Accepted; no effect on queries (default: false)
+  enableVectors?: boolean;   // Create a vector index if the file has none
   enableVector?: boolean;    // Deprecated compatibility alias
-  vectorDimensions?: number; // Vector dimensions (default: 128)
+  vectorDimensions?: number; // Vector dimensions (default: 128; 0 = the file's)
+  lock?: boolean;            // Take a file lock (default: true)
+  syncMode?: 'full' | 'normal';   // Unset: LATTICE_SYNC_MODE, else 'full'
+  fullFsync?: boolean;            // macOS F_FULLFSYNC; unset: LATTICE_FULL_FSYNC, else off
+  vectorMetric?: 'cosine' | 'euclidean' | 'dot_product'; // For a new index (default: cosine)
+  vectorM?: number;               // HNSW connections per node, 2..32 (default: 16)
+  vectorEfConstruction?: number;  // HNSW build candidate list, 1..4096 (default: 200)
+  changefeedRetention?: ChangefeedRetention; // 'all', 'off', 'last:N', 'age:7d' (default: the file's)
 }
 ```
+
+A database file records its vector index: dimensions, metric, `vectorM` and
+`vectorEfConstruction`. A database that has an index opens with it whether or
+not `enableVectors` is set, so reopening needs no vector options at all. Any
+vector option you do pass (and `vectorDimensions` when `enableVectors` is set)
+must match the file, or `open()` throws a `LatticeError` with code -18
+(`ConfigMismatch`). The metric decides search distances, smallest first: cosine
+distance (vectors stored at unit length), L2 distance, or the negative dot
+product (vectors stored as given).
+
+`syncMode: 'normal'` returns from a commit once the operating system has it: the
+commit survives the process being killed, but a power cut or OS crash can lose
+the most recent commits. The default, `'full'`, syncs the log on every commit.
+
+A `syncMode` or `fullFsync` you pass wins over the `LATTICE_SYNC_MODE` and
+`LATTICE_FULL_FSYNC` environment variables, which apply only when the option is
+left unset.
+
+`enableWal: false` logs nothing. Transactions, rollback, streams and the
+changefeed work as with the log, but a commit reaches the file at the next
+flush (`close()`, or when half the page cache holds changes) rather than when it
+returns.
+
+`changefeedRetention` sets how much of the changefeed the file keeps (see
+[Durable Streams and Changefeeds](#durable-streams-and-changefeeds)).
+
+`syncMode`, `fullFsync`, the three vector index options and
+`changefeedRetention` need a native library with `lattice_open_v5`; against an
+older one, setting any of them throws with code -14 (`Unsupported`). `deserialize()` takes the same options and passes
+them through `lattice_deserialize_v5`, which needs the same newer library.
+
+`readOnly: true` on a database that was not closed cleanly recovers it in
+memory: the handle sees every committed transaction and nothing is written to
+the files. A recovery that needs more than 64 MB plus four times the size of the
+log and journal throws with code -10 (`Full`); open the database read-write once
+to recover it on disk.
+
+Node IDs, edge IDs and stream sequence numbers are `bigint`.
 
 #### Methods
 
@@ -150,18 +201,33 @@ interface DatabaseOptions {
 - `await db.read(fn)` - Execute a read-only transaction
 - `await db.write(fn)` - Execute a read-write transaction
 - `await db.query(cypher, params?)` - Execute a Cypher query
+- `await db.getNodesByLabel(label)` - IDs of every node with a label
 - `await db.vectorSearch(vector, options?)` - k-NN vector search
-- `await db.ftsSearch(query, options?)` - Full-text search
-- `await db.ftsSearchFuzzy(query, options?)` - Fuzzy full-text search
-- `await db.createNodePropertyIndex(label, property)` / `dropNodePropertyIndex(...)` - Manage explicit node equality indexes
-- `await db.createEdgePropertyIndex(edgeType, property)` / `dropEdgePropertyIndex(...)` - Manage explicit edge equality indexes
-- `await db.readStream(stream, options?)` - Read durable stream records by cursor
+- `await db.createNodeFtsIndex(label, property)` / `dropNodeFtsIndex(...)` / `hasNodeFtsIndex(...)` - Manage full-text indexes on node properties
+- `await db.createEdgeFtsIndex(edgeType, property)` / `dropEdgeFtsIndex(...)` / `hasEdgeFtsIndex(...)` - Manage full-text indexes on edge properties. A node index and a relationship index cannot share a name and property: the second is rejected as already existing
+- `await db.ftsSearch(label, property, query, options?)` - Full-text search over one declared index
+- `await db.ftsSearchFuzzy(label, property, query, options?)` - Fuzzy full-text search
+- `await db.createNodePropertyIndex(label, property)` / `dropNodePropertyIndex(...)` - Manage explicit node property indexes
+- `await db.createEdgePropertyIndex(edgeType, property)` / `dropEdgePropertyIndex(...)` - Manage explicit edge property indexes
+- `await db.readStream(stream, options?)` - Read durable stream records by cursor. With `timeoutMs > 0` the wait runs on a worker thread, so the event loop keeps running and a commit from the same process can end the wait
 - `await db.getStreamOffset(stream, consumer)` - Read a committed consumer offset
-- `await db.changes(options?)` - Read the built-in graph changefeed
+- `await db.changes(options?)` - Read the built-in graph changefeed. Rejects with `LatticeChangesTrimmedError` when retention has dropped the events after `afterSequence`, and with code -14 (`Unsupported`) when the policy is `'off'`
+- `await db.changefeedStatus()` - The changefeed's policy and range: `{ retention, oldestSequence, lastSequence }`, `oldestSequence` null when it holds no events
+- `await db.trimChangefeed()` - Apply the retention policy in full now; resolves to the number of events dropped
+- `await db.checkpoint(mode = 'truncate')` - Fold the log into the database file now; resolves to `CheckpointStats` (see [Checkpoints](#checkpoints))
+- `await db.setAutoCheckpoint(maxWalFrames, minIntervalMs = 0)` - Set when commits checkpoint from now on; `0` frames switches automatic checkpoints off
 - `await db.cacheClear()` - Clear the query cache
 - `await db.cacheStats()` - Get cache hit/miss statistics
 - `db.isOpen()` - Check if database is open
 - `db.getPath()` - Get database file path
+- `db.serialize()` - Return the whole database as a `Uint8Array`
+
+`deserialize(bytes, options?, copy = true)` opens a database from bytes produced by `serialize()`.
+Its options mean what they mean to `new Database()`, apart from `create` and
+`readOnly`, which it ignores. Bytes that hold a vector index open with the
+configuration they record, and any vector option you pass must match it (code
+-18, `ConfigMismatch`); `enableVectors` with the vector options creates and
+configures an index in bytes that have none.
 
 ### Transaction
 
@@ -169,31 +235,37 @@ interface DatabaseOptions {
 
 - `await txn.getNode(nodeId)` - Get a node by ID, returns `Node` or `null`
 - `await txn.nodeExists(nodeId)` - Check if a node exists
-- `await txn.getProperty(nodeId, key)` - Get a property value
+- `await txn.getProperty(nodeId, key)` - Get a property value, or `null` when the node does not have it
+- `await txn.getVector(nodeId, key = "embedding")` - The node's vector as a `Float32Array`, or `null` if it has none. Rejects with code -4 (`NotFound`) if the node does not exist. Under the cosine metric, the default, a committed vector reads back normalised to unit length (`[3, 4]` reads back as `[0.6, 0.8]`); an uncommitted one reads back as written.
 - `await txn.getOutgoingEdges(nodeId)` - Get outgoing edges from a node
 - `await txn.getIncomingEdges(nodeId)` - Get incoming edges to a node
+- `await txn.getOutgoingEdgesByType(nodeId, edgeType, ...)` / `getIncomingEdgesByType(...)` - Edges of one type
+- `await txn.getNodesByLabel(label)` - IDs of every node with a label, as this transaction sees them
+- `await txn.query(cypher, params?)` - Run Cypher inside this transaction
+- `await txn.vectorSearch(...)` / `ftsSearch(...)` / `ftsSearchFuzzy(...)` - Searches inside this transaction
 - `await txn.findNodesByLabelProperty(label, property, value, limit?)` - Indexed node equality lookup
 - `await txn.findEdgesByTypeProperty(edgeType, property, value, limit?)` - Indexed edge equality lookup
 - `txn.isReadOnly()` / `txn.isActive()` - Transaction state
 
 #### Write Operations
 
-- `await txn.createNode({ labels, properties })` - Create a node
-- `await txn.deleteNode(nodeId)` - Delete a node
-- `await txn.setProperty(nodeId, key, value)` - Set a property
-- `await txn.setVector(nodeId, key, vector)` - Set a vector embedding
+- `await txn.createNode({ labels, properties })` - Create a node. A property whose value is `null` is left out, as in Cypher's `CREATE`
+- `await txn.deleteNode(nodeId, { detach })` - Delete a node. A node that still has relationships is refused with code -17 (`HasRelationships`) and nothing is deleted, as Cypher's `DELETE` does; `{ detach: true }` deletes its relationships with it, as `DETACH DELETE` does. Deleting a node that does not exist does nothing.
+- `await txn.setProperty(nodeId, key, value)` - Set a property. If a full-text index is declared for one of the node's labels and this property, the index is kept current. A `null` value removes the property, as Cypher's `SET n.x = null` does; before 0.18.1 it stored the `null`.
+- `await txn.setVector(nodeId, key, vector)` - Set the node's vector embedding. A node has one vector, which Cypher reads as `n.embedding`; `key` must be `"embedding"` (or `""`), and any other key is rejected with an unsupported-operation error. A vector with NaN or infinite components is rejected as an invalid argument. On a database created without a vector index, `setVector`, `batchInsertVectors` (before it creates any node) and `vectorSearch` reject with a `LatticeError` whose code is `Unsupported` and whose message says so; before 0.18.1 the code was `IoError`. Opening the database with `enableVectors: true` and `vectorDimensions` adds an index.
+- `await txn.removeVector(nodeId, key = "embedding")` - Remove the node's vector. The node keeps its labels and properties, and vector search no longer returns it. Removing a vector the node does not have does nothing. Rejects with code -4 (`NotFound`) if the node does not exist.
 - `await txn.batchInsertVectors(label, vectors)` - Insert vector-bearing nodes in one call
 - `await txn.batchInsert(label, vectors)` - Deprecated compatibility alias for `batchInsertVectors`
-- `await db.createNodeFtsIndex(label, property)` - Declare a full-text index; writing that property keeps it current
-- `await txn.createEdge(sourceId, targetId, edgeType, options?)` - Create an edge
+- `await txn.createEdge(sourceId, targetId, edgeType, options?)` - Create an edge. A property whose value is `null` is left out
 - `await txn.deleteEdge(sourceId, targetId, edgeType)` - Delete an edge
-- `await txn.setEdgeProperty(edgeId, key, value)` - Set an edge property by stable edge ID
+- `await txn.setEdgeProperty(edgeId, key, value)` - Set an edge property by stable edge ID. A `null` value removes it
 - `await txn.getEdgeProperty(edgeId, key)` - Get an edge property by stable edge ID
 - `await txn.removeEdgeProperty(edgeId, key)` - Remove an edge property by stable edge ID
 - `txn.publishStream(stream, payload, kind?)` - Publish a durable stream record
+- `txn.publishStreamGetSequence(stream, payload, kind?)` - Publish and return the record's sequence (`bigint`)
 - `txn.setStreamOffset(stream, consumer, sequence)` - Commit a durable consumer offset
 - `txn.trimStream(stream, throughSequence)` - Delete stream records through a sequence
-- `txn.commit()` / `txn.rollback()` - Commit or rollback
+- `txn.commit()` / `txn.rollback()` - Commit or rollback. A commit that throws with code -7 (`TxnAborted`) has ended the transaction, and `rollback()` afterwards does nothing; after any other failure it stays open for `rollback()`
 
 ### Bulk Vector Insertion
 
@@ -222,9 +294,10 @@ await db.close();
 
 ### Property Indexes
 
-Property equality indexes are explicit and durable. Create them outside an
-active write transaction; lookup fails instead of silently scanning when the
-requested index does not exist.
+Property indexes are explicit and durable. Create them outside an active write
+transaction; lookup fails instead of silently scanning when the requested index
+does not exist. The lookup methods find equal values; Cypher also reads the
+indexes for ranges, `STARTS WITH` and `ORDER BY ... LIMIT`.
 
 ```typescript
 await db.createNodePropertyIndex("Person", "email");
@@ -287,16 +360,16 @@ Connect to Ollama, OpenAI, or compatible APIs:
 ```typescript
 import { EmbeddingClient, EmbeddingApiFormat } from "@hajewski/latticedb/embedding";
 
-// Ollama (default)
+// Ollama (default). The endpoint is the full URL the client POSTs to.
 const client = new EmbeddingClient({
-  endpoint: "http://localhost:11434",
+  endpoint: "http://localhost:11434/api/embeddings",
 });
 const vec = client.embed("hello world");
 client.close();
 
 // OpenAI-compatible API
 const openaiClient = new EmbeddingClient({
-  endpoint: "https://api.openai.com/v1",
+  endpoint: "https://api.openai.com/v1/embeddings",
   model: "text-embedding-3-small",
   apiFormat: EmbeddingApiFormat.OpenAI,
   apiKey: "sk-...",
@@ -363,6 +436,46 @@ console.log(
 await db.cacheClear();
 ```
 
+### Checkpoints
+
+A commit is durable once it is in the log (the `-wal` file beside the database).
+A checkpoint writes the pages the log's commits changed into the database file
+and can then empty the log. By default a commit runs one once the log reaches an
+eighth of the page cache, never less than 1000 frames (one frame per page, 4096
+bytes) and never more than 64 MB: 3,200 frames with the default 100 MB cache,
+16,384 with `cache_size_mb` of 512 or more. The `LATTICE_AUTO_CHECKPOINT_FRAMES`
+environment variable sets a fixed frame count instead (`0` for none), and
+`setAutoCheckpoint` wins over it; either is used as given, so `1000` brings back the
+interval of releases before the default followed the cache. Closing a database always folds the log into
+the file.
+
+```typescript
+import type { CheckpointStats } from '@hajewski/latticedb';
+
+await db.setAutoCheckpoint(0);   // commits never checkpoint; the log grows
+// ... a burst of commits ...
+const stats: CheckpointStats = await db.checkpoint('truncate');
+console.log(stats.pagesFlushed, stats.durationNs, stats.checkpointLsn, stats.walTruncated);
+
+await db.setAutoCheckpoint(4000, 1000); // every 4000 frames, at most once a second
+```
+
+Modes (`CheckpointMode`): `'passive'` writes the changed pages unless one is in
+use (then it writes nothing and reports 0 pages) and leaves the log in place;
+`'full'` writes every changed page and leaves the log in place; `'truncate'` (the
+default) does what `'full'` does and then empties the log, the only mode that
+bounds its size. Any other mode throws a `TypeError`, and a negative or
+fractional argument to `setAutoCheckpoint` a `RangeError`. `durationNs` and
+`checkpointLsn` are `bigint`. `checkpoint` rejects with code -9 (`ReadOnly`) on a
+read-only database and -8 (`LockTimeout`) if a transaction already has records
+in the log; `setAutoCheckpoint` has no effect on a read-only database. Against a
+native library without `lattice_checkpoint`, both reject with code -14
+(`Unsupported`).
+
+The interval is a trade-off. A larger one means fewer checkpoints, each a longer
+pause for the commit that runs it, a longer `-wal` file and more to replay after
+a crash. A smaller one means shorter pauses, more often.
+
 ### Durable Streams and Changefeeds
 
 Streams are durable named event logs stored inside the database file. Records are
@@ -394,16 +507,26 @@ await db.write(async (txn) => {
 graph events such as `node.insert`, `node.property_set`, `edge.delete`, and
 `edge.property_remove`, with payloads represented as normal TypeScript values.
 
+A transaction's events describe its net effect (a property set several times
+is one event, from its value before the transaction to its last value) and
+come in an order that can be replayed as it comes: the edges it deletes, then
+the nodes that exist after it, then the edges that exist after it, then the
+nodes it deletes, each group by ascending id. So an edge is created after both
+its nodes and deleted before either. See the
+[changefeed guide](https://docs.latticedb.org/guides/changefeed) for the details
+and for retention policies.
+
 ## Supported Property Types
 
 - `null` - Null value
 - `boolean` - Boolean
 - `number` - Integer or float
+- `bigint` - 64-bit integer
 - `string` - UTF-8 string
 - `Uint8Array` - Binary data
 - `Float32Array` - Vector embeddings
-
-Nested arrays/objects are not currently exposed by the public bindings/C API.
+- Arrays of any of these values, nested to any depth
+- Plain objects with string keys, whose values are any of these, nested to any depth
 
 ## Error Handling
 
@@ -425,6 +548,43 @@ try {
   console.error("Database error:", error);
 }
 ```
+
+Errors from the native library are `LatticeError`s whose `code` is the C error
+code; `LatticeErrorCode` (exported from the package root, with `QueryErrorStage`
+for `LatticeQueryError.stage`; both are plain enums, readable at run time) names
+them. For example -4 (not found, also from `createEdge` when either end does not
+exist), -16 (another process holds the file), -17 (a plain `deleteNode` of a node
+with relationships), -18 (open options that contradict the file's vector
+index), -19 (`NeedsNewerWriter`: a writable open of a file that a newer
+release has marked as not writable by this one; it still opens with
+`readOnly: true`) and -11 (`VersionMismatch`: a file in a format too new for
+this release to read at all, read-only or not).
+
+A failed Cypher query throws a `LatticeQueryError`, a `LatticeError` that also
+says where the query failed:
+
+```typescript
+import { Database, LatticeQueryError } from "@hajewski/latticedb";
+
+try {
+  await db.query("RETURN 1/0");
+} catch (e) {
+  if (e instanceof LatticeQueryError) {
+    console.log(e.message);        // Division by zero: 1 / 0
+    console.log(e.code);           // -1
+    console.log(e.stage);          // 4 (execution)
+    console.log(e.diagnosticCode); // DivisionByZero
+    console.log(e.location);       // { line: 1, column: 9, length: 1 }
+  }
+}
+```
+
+`stage` is a `QueryErrorStage`: 1 parse, 2 semantic, 3 plan, 4 execution. Parse
+and semantic failures have code -6 and execution failures -1, except that a
+`DELETE` of a node with relationships has code -17 and a relationship created
+to a node deleted earlier in the query -4, as `deleteNode` and `createEdge`
+report them. A storage failure under a query has code -2 and an allocation
+failure -13.
 
 ## Electron
 
@@ -483,8 +643,10 @@ let the loader find it under `process.resourcesPath`:
 }
 ```
 
-Pick the source directory for the platform you are building; Linux bundles carry
-a libc suffix (`linux-x64-gnu`, `linux-x64-musl`). The loader also accepts
+Pick the source directory for the platform you are building. The published package
+uses `lib/linux-x64` and `lib/linux-arm64` for Linux (glibc builds only); a package
+staged locally with `npm run bundle:native` may carry a libc suffix instead
+(`linux-x64-gnu`). The loader also accepts
 `resources/lib/<platform>-<arch>/`, `resources/<platform>-<arch>/`, and the
 library sitting next to the executable (electron-builder `extraFiles`).
 
@@ -506,8 +668,8 @@ and the `asarUnpack` glob to add.
 
 ### Windows
 
-Both Windows architectures are supported. Published package tarballs are
-expected to bundle `lib/win32-x64/lattice.dll` and `lib/win32-arm64/lattice.dll`,
+Windows x64 is built and tested in CI; Windows ARM64 is built but not run.
+Published package tarballs bundle `lib/win32-x64/lattice.dll` and `lib/win32-arm64/lattice.dll`,
 and koffi ships matching prebuilt `win32_x64` and `win32_arm64` binaries, so
 nothing has to be compiled at install time.
 
@@ -548,7 +710,7 @@ npm test
 
 ## Requirements
 
-- Node.js 18+, or Electron 23+ (main process, Node 18 — see [Electron](#electron))
+- Node.js 18+, or Electron's main process (see [Electron](#electron); the loader's asar handling is tested without running Electron, and no Electron version is tested)
 - The native LatticeDB library (`liblattice.dylib` / `liblattice.so` /
   `lattice.dll`)
 

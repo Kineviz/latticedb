@@ -10,7 +10,7 @@ LatticeDB is an embedded, single-file graph database that lets local application
 - **One query layer.** Graph traversal, HNSW vector similarity, and BM25 full-text — in the same query language.
 - **One event log.** Durable named streams and a built-in graph changefeed share the same transaction/WAL path as graph writes.
 - **Local-first.** Designed for one owning process on one machine, with WAL-backed durability.
-- **Fast.** 0.13 μs node lookups. 0.83 ms vector search at 1M vectors with 100% recall.
+- **Fast.** 0.2 μs reads by node id and 2.3 μs Cypher lookups through the C API; top-10 vector search over 100K vectors in 0.12 ms (see [Performance](#performance)).
 
 ```cypher
 // Find chunks similar to a query, traverse to their document, then to the author
@@ -30,13 +30,15 @@ LIMIT 10
 curl -fsSL https://raw.githubusercontent.com/jeffhajewski/latticedb/main/dist/install.sh | bash
 ```
 
+The installer runs on Linux and macOS. On Windows, download the `.zip` archive from the [releases page](https://github.com/jeffhajewski/latticedb/releases); it holds `lattice.exe` and `lattice.dll`.
+
 **Python**
 
 ```bash
 pip install latticedb
 ```
 
-Published wheels are expected to bundle `liblattice` on supported platforms. Source installs can also bundle a staged native library during wheel builds with `LATTICE_BUNDLE_LIB_DIR=/path/to/lib`.
+Published wheels bundle `liblattice` for Linux (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x64, ARM64). Source installs can also bundle a staged native library during wheel builds with `LATTICE_BUNDLE_LIB_DIR=/path/to/lib`.
 
 **TypeScript / Node.js**
 
@@ -44,7 +46,7 @@ Published wheels are expected to bundle `liblattice` on supported platforms. Sou
 npm install @hajewski/latticedb
 ```
 
-Published package tarballs are expected to bundle `liblattice` on supported platforms. Source checkouts can stage the native library into the package with `LATTICE_BUNDLE_LIB_DIR=/path/to/lib npm run bundle:native`.
+The published package bundles `liblattice` for the same six platforms. Source checkouts can stage the native library into the package with `LATTICE_BUNDLE_LIB_DIR=/path/to/lib npm run bundle:native`.
 
 Electron apps run the bindings in the main process and must unpack the native library from `app.asar`; see [Electron](bindings/typescript/README.md#electron).
 
@@ -57,7 +59,7 @@ Requires JDK 21+. See [bindings/java/README.md](bindings/java/README.md) for the
 See [bindings/go/README.md](bindings/go/README.md) for the current cgo workflow. The default consumer path uses installed `pkg-config` metadata; in-repo development can use `-tags repolocal` against `zig-out/lib`.
 There is also a runnable graph/vector/text retrieval example in [examples/go](examples/go).
 
-Recent binding-surface cleanups moved embedding helpers into dedicated modules and subpackages. See [docs/client_api_migration.md](docs/client_api_migration.md) for the preferred imports and current compatibility aliases.
+Version 0.5 moved embedding helpers into dedicated modules and subpackages. See [docs/client_api_migration.md](docs/client_api_migration.md) for the preferred imports and current compatibility aliases.
 
 ## Start Here
 
@@ -69,9 +71,10 @@ Recent binding-surface cleanups moved embedding helpers into dedicated modules a
 
 A complete example: create a small knowledge graph with documents and authors, store embeddings, index text, then query across all three search modes.
 
-The examples use the built-in `hash_embed` / `hashEmbed` / `HashEmbed` helper so they run with no
-external service. It is a deterministic placeholder, not a semantic embedding: similar text does not
-produce nearby vectors, so a distance threshold is arbitrary and a similarity query may match nothing.
+The examples use the built-in hash embedding helper (`hash_embed` / `hashEmbed` / `Hash` / `Embedding.hashEmbed`) so they run with no
+external service. It is a deterministic bag-of-words hash, not a semantic embedding: texts that share words get
+nearby vectors, but synonyms and paraphrases do not, so a distance threshold is arbitrary and a
+similarity query may match nothing.
 Use a real embedding model for anything where the results should mean something — see
 [Working with Embeddings](https://docs.latticedb.org/guides/embeddings).
 
@@ -86,7 +89,7 @@ with Database("knowledge.db", create=True, enable_vectors=True, vector_dimension
     # --- Build the graph ---
     db.create_node_fts_index("Chunk", "text")
 
-with db.write() as txn:
+    with db.write() as txn:
         # Create authors
         alice = txn.create_node(labels=["Person"], properties={"name": "Alice", "field": "ML"})
         bob = txn.create_node(labels=["Person"], properties={"name": "Bob", "field": "Systems"})
@@ -189,6 +192,7 @@ await db.close();
 ### Go
 
 ```go
+// import latticeembedding "github.com/jeffhajewski/latticedb/bindings/go/embedding"
 db, err := latticedb.Open("knowledge.db", latticedb.OpenOptions{
     Create: true,
     EnableVectors: true,
@@ -211,7 +215,7 @@ err = db.Update(func(tx *latticedb.Tx) error {
     if err != nil {
         return err
     }
-    embedding, err := latticedb.HashEmbed("The transformer architecture uses self-attention...", 128)
+    embedding, err := latticeembedding.Hash("The transformer architecture uses self-attention...", 128)
     if err != nil {
         return err
     }
@@ -265,159 +269,93 @@ See [bindings/java/README.md](bindings/java/README.md) for build instructions an
 
 ## Performance
 
-Benchmarked on Apple M1, single-threaded, with auto-scaled buffer pool. Run `zig build benchmark` to reproduce.
-For the repeated-term FTS indexing workload that previously exposed quadratic append behavior, run `zig build fts-benchmark`.
+Measured on 0.17.0 through the public C API with the default options (log on and
+fsynced on every commit, 100 MB cache), ReleaseFast, on an Apple M5 (10 cores,
+24 GB, macOS 26.5), 2026-11-13. Medians of five runs; the full tables, the method
+and the spreads are in [Benchmarks](book/src/performance/benchmarks.md), and
+`zig build capi-benchmark` reproduces them.
 
-### Core Operations
+| Operation | p50 | p99 |
+|-----------|----:|----:|
+| Create a node, one durable commit | 44 μs | 70 μs |
+| Create nodes, 1,000 per transaction | 332,000 nodes/s | |
+| Read a property by node id (C API, open read transaction) | 0.22 μs | 0.24 μs |
+| Cypher lookup by an indexed property, 100K nodes | 2.3 μs | 2.5 μs |
+| Cypher 2-hop count from an indexed node, 100K nodes / 500K edges | 8.8 μs | 12 μs |
+| Cypher `*1..5` path count (3,905 paths), 100K nodes | 600 μs | 661 μs |
+| Full-text top-10, one word, 10K / 100K documents | 8.5 / 104 μs | 103 μs / 1.2 ms |
+| Vector top-10, 100K vectors, 128-d (recall@10 98.3%) | 122 μs | 192 μs |
+| Vector top-10, 1M vectors, default 100 MB cache (recall@10 95.6%) | 1.34 ms | 3.1 ms |
+| Vector top-10, 1M vectors, 2 GB cache | 0.21 ms | 0.46 ms |
 
-| Operation | Latency | Throughput | Target | Status |
-|-----------|---------|------------|--------|--------|
-| Node lookup | 0.13 μs | 7.9M ops/sec | < 1 μs | PASS |
-| Node creation | 0.65 μs | 1.5M ops/sec | — | — |
-| Edge traversal | 9 μs | 111K ops/sec | — | — |
-| Full-text search (100 docs) | 19 μs | 53K ops/sec | — | — |
-| 10-NN vector search (1M vectors) | 0.83 ms | 1.2K ops/sec | < 10 ms @ 1M | PASS |
+With `sync_mode = normal` a single commit takes 6.4 μs.
 
-### Vector Search (HNSW) at Scale
+Batched writes and bulk loads were measured again on the build after 0.18.1,
+which creates format-5 files (2026-11-20 and 2026-11-22). Nodes in transactions
+of 1,000 go in at 408,000 a second. 1M nodes and 2M edges load in 23 s with the
+defaults in transactions of 10,000, in 11 s in transactions of 100,000, and in
+6.4 s with the
+[bulk-load recipe](book/src/configuration/durability.md#bulk-loading); 0.18.1
+took 36 s, 34 s and 8 s.
 
-128-dimensional cosine vectors, M=16, ef_construction=200, ef_search=64, k=10. Run `zig build vector-benchmark` to reproduce.
-
-| Scale | Mean Latency | P99 Latency | Recall@10 | Memory |
-|-------|-------------|-------------|-----------|--------|
-| 1,000 | 65 μs | 70 μs | 100% | 1 MB |
-| 10,000 | 174 μs | 695 μs | 99% | 10 MB |
-| 100,000 | 438 μs | 1.2 ms | 99% | 101 MB |
-| 1,000,000 | 832 μs | 1.8 ms | 100% | 1,040 MB |
-
-Search latency scales sub-linearly (O(log N)) with 99–100% recall@10. Uses heuristic neighbor selection (HNSW paper Algorithm 4) for diverse graph connectivity, connection page packing for ~4.5x memory reduction, and pre-normalized dot product for fast cosine distance.
-
-**ef_search Sensitivity (1M vectors)**
-
-| ef_search | Mean Latency | Recall@10 |
-|-----------|-------------|-----------|
-| 16 | 506 μs | 57% |
-| 32 | 1.9 ms | 79% |
-| 64 | 990 μs | 100% |
-| 128 | 3.2 ms | 100% |
-| 256 | 11.6 ms | 100% |
-
-### Competitive Analysis
-
-#### Point Lookups
-
-| System | Latency | Type | Source |
-|--------|---------|------|--------|
-| **LatticeDB** | **0.13 μs** | Embedded | `zig build benchmark` |
-| RocksDB (in-memory) | 0.14 μs | Embedded | [RocksDB wiki](https://github.com/facebook/rocksdb/wiki/RocksDB-In-Memory-Workload-Performance-Benchmarks) |
-| SQLite (in-memory) | ~0.2 μs | Embedded | [Turso blog](https://turso.tech/blog/microsecond-level-sql-query-latency-with-libsql-local-replicas-5e4ae19b628b) |
-| SQLite (WAL, disk) | 3 μs (p90) | Embedded | [marending.dev](https://marending.dev/notes/sqlite-benchmarks/) |
-| Neo4j | 28 ms (p99) | Server | [Memgraph comparison](https://memgraph.com/blog/memgraph-vs-neo4j-performance-benchmark-comparison) |
-
-LatticeDB's B+Tree achieves sub-microsecond cached lookups, matching RocksDB in-memory and outperforming SQLite on disk by 23x.
-
-#### Vector Search
-
-| System | Latency (10-NN) | Scale | Type | Source |
-|--------|-----------------|-------|------|--------|
-| **LatticeDB** | **0.83 ms mean, 100% recall** | 1M | Embedded | `zig build vector-benchmark` |
-| FAISS HNSW (single-thread) | 0.5–3 ms | 1M | Library | [FAISS wiki](https://github.com/facebookresearch/faiss/wiki/Indexing-1M-vectors) |
-| Weaviate | 1.4 ms mean, 3.1 ms P99 | 1M | Server | [Weaviate benchmarks](https://docs.weaviate.io/weaviate/benchmarks/ann) |
-| Qdrant | ~1–2 ms | 1M | Server | [Qdrant benchmarks](https://qdrant.tech/benchmarks/) |
-| Milvus + SQ8 | 2.2 ms P99 | 1M | Server | [VectorDBBench](https://zilliz.com/vdbbench-leaderboard) |
-| pgvector HNSW | ~5 ms @ 99% recall | 1M | Extension | [Jonathan Katz](https://jkatz05.com/post/postgres/pgvector-performance-150x-speedup/) |
-| LanceDB | 3–5 ms | 1M | Embedded | [LanceDB blog](https://medium.com/etoai/benchmarking-lancedb-92b01032874a) |
-| Chroma | 4–5 ms mean | 1M | Embedded | [Chroma docs](https://docs.trychroma.com/production/administration/performance) |
-| Pinecone P2 | ~15 ms (incl. network) | 1M | Cloud | [Pinecone blog](https://www.pinecone.io/blog/dedicated-read-nodes/) |
-| sqlite-vec (brute force) | 17 ms | 1M | Extension | [Alex Garcia](https://alexgarcia.xyz/blog/2024/sqlite-vec-stable-release/index.html) |
-
-LatticeDB at 1M achieves 0.83 ms mean with 100% recall@10 — faster than FAISS single-threaded HNSW and competitive with Weaviate and Qdrant server-based systems (which add network overhead in practice).
-
-#### Graph Traversal
-
-| System | 2-hop (100K nodes) | Type | Source |
-|--------|-------------------|------|--------|
-| **LatticeDB** | **39 μs** | Embedded | `zig build sqlite-benchmark` |
-| SQLite (recursive CTE) | 548 μs | Embedded | `zig build sqlite-benchmark` |
-| Kuzu *(archived Oct 2025)* | 19 ms | Embedded | [The Data Quarry](https://thedataquarry.com/blog/embedded-db-2/) |
-| Neo4j | 10 ms (1M nodes) | Server | [Neo4j blog](https://neo4j.com/news/how-much-faster-is-a-graph-database-really/) |
-
-Only the SQLite rows are measured head to head on the same machine in the same harness. The Kuzu and Neo4j figures come from third-party posts on hardware and with methodology we do not control, so treat them as order-of-magnitude orientation rather than a benchmark result.
-
-**LatticeDB vs SQLite** — Social network graph with power-law degree distribution, adjacency cache pre-warmed:
-
-**Small Scale (10K nodes, 50K edges)**
-
-| Workload | LatticeDB | SQLite | Speedup |
-|----------|-----------|--------|--------:|
-| 1-hop traversal | 560 ns | 13.0 μs | **23x** |
-| 2-hop traversal | 3.0 μs | 37.5 μs | **13x** |
-| 3-hop traversal | 19.1 μs | 178.5 μs | **9x** |
-| Variable path (1..5) | 82.4 μs | 4.3 ms | **52x** |
-
-**Medium Scale (100K nodes, 500K edges)**
-
-| Workload | LatticeDB | SQLite | Speedup |
-|----------|-----------|--------|--------:|
-| 1-hop traversal | 8.0 μs | 290.0 μs | **36x** |
-| 2-hop traversal | 38.7 μs | 548.3 μs | **14x** |
-| 3-hop traversal | 197.3 μs | 1.2 ms | **6x** |
-| Variable path (1..5) | 134.4 μs | 10.1 ms | **75x** |
-
-**Depth-Limited Traversal (10K nodes, 50K edges)**
-
-| Depth | LatticeDB | SQLite | Speedup |
-|------:|----------:|-------:|--------:|
-| 10    | 311 μs    | 121 ms | **390x** |
-| 15    | 380 μs    | 271 ms | **713x** |
-| 25    | 318 μs    | 587 ms | **1,848x** |
-| 50    | 500 μs    | 1.4 s  | **2,819x** |
-
-LatticeDB uses BFS with adjacency cache and bitset visited tracking. SQLite uses a recursive CTE with `UNION` deduplication. Both compute identical reachable node sets (~8K nodes). The gap widens at deeper depths as SQLite's CTE overhead grows with each recursion level. Run `zig build graph-benchmark -- --quick` to reproduce.
-
-#### Full-Text Search (BM25)
-
-| System | Search Latency | Type | Source |
-|--------|----------------|------|--------|
-| **LatticeDB** | **19 μs** | Embedded | `zig build benchmark` |
-| SQLite FTS5 | < 6 ms | Embedded | [SQLite Cloud](https://blog.sqlite.ai/real-time-full-text-site-search-with-sqlite-fts5-extension) |
-| Elasticsearch | 1–10 ms | Server | Various |
-| Tantivy | 10–100 μs | Library | Various |
-
-LatticeDB's inverted index with BM25 scoring is ~300x faster than SQLite FTS5 and competitive with Tantivy (a dedicated Rust search library).
+Against SQLite through its own C API with the same durability, LatticeDB is
+level for one to three hops and about twice as fast for `*1..5`, while SQLite
+inserts rows several times faster; see
+[Competitive Analysis](book/src/performance/competitive-analysis.md),
+which also lists other systems' published figures, as citations kept apart from
+these measurements.
 
 ## Features
 
 **Graph**
 - Nodes and edges with labels and arbitrary properties
-- Durable explicit equality indexes for scoped node and edge properties
+- Durable property indexes on node and relationship properties, kept in order, so
+  Cypher reads equality, ranges, `STARTS WITH` and `ORDER BY ... LIMIT` from them
 - Multi-hop traversal, variable-length paths (`*1..3`)
 - ACID transactions with commit/rollback and crash recovery
+- Deleting a node that still has relationships is refused unless asked to detach
+  them, and a relationship needs both of its ends
 - MERGE, WITH, UNWIND, aggregations (`count`, `sum`, `avg`, `min`, `max`, `collect`)
 
 **Vector Search**
-- HNSW approximate nearest neighbor with configurable M, ef
+- HNSW approximate nearest neighbor, with `ef_search` tunable per query
+- Cosine, Euclidean or dot-product distance, chosen when the index is created; the
+  file records the index, so reopening needs no vector options
+- Set, read and remove a node's vector from any binding, or from Cypher with
+  `SET n.embedding = $vector` and `REMOVE n.embedding`
 - Built-in hash embeddings or HTTP client for Ollama/OpenAI
 - Bulk vector node insertion for fast ingestion
 
 **Full-Text Search**
-- BM25-ranked inverted index with tokenization and stemming
+- BM25-ranked inverted index; words split by Unicode, lowercased and accent-folded, with English stop words dropped
+- One query language everywhere: `OR`, `-exclusions`, `"phrases"`, `prefix*` and `fuzzy~`
 - Fuzzy search with configurable Levenshtein distance
 
 **Cypher Query Language**
-- MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE
-- ORDER BY, LIMIT, SKIP, DETACH DELETE
+- MATCH, OPTIONAL MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE, MERGE, WITH, UNWIND, FOREACH
+- ORDER BY, LIMIT, SKIP, DETACH DELETE, UNION, CASE, `CALL { }` subqueries
+- Named paths, `shortestPath`, list and pattern comprehensions, `EXISTS`, `COUNT` and `COLLECT` subqueries, map projection, label expressions
 - Vector distance operator: `<=>`
 - Full-text search operator: `@@`
+- Regular expressions: `=~`
 - Parameters: `$name`
+- Errors that give the stage, a message and the line and column
 
 **Operations**
-- Single-file storage with write-ahead log for crash recovery
+- Single-file storage with write-ahead log for crash recovery, tested by cutting
+  the power at every sync point of a simulated disk
+- Choose per database whether a commit waits for the disk (`sync_mode`), and on
+  macOS whether syncs flush the drive's cache (`full_fsync`)
+- Read-only opens of a crashed database see every committed transaction, without
+  writing to it
 - Continuous backup: ship changes to a directory and restore to a point in time
 - Hot backup with `lattice backup`, taken without closing the database
 - Serialize a database to bytes and open one from bytes, for keeping many small
   databases in object storage
 - In-memory databases with `:memory:`, touching no files at all
 - Durable named streams with explicit consumer offsets, manual trim, and graph changefeeds
+- A compact changefeed with a retention policy (`all`, `last:N`, `age:7d` or `off`)
+- Import and export JSON, JSONL, CSV and RDF (Turtle, N-Triples)
 - Online freelist reuse plus `lattice compact` for safe physical tail reclamation
 - Zero configuration — open a file and start working
 - Embedded single-writer model for local applications
@@ -445,14 +383,14 @@ If your data fits naturally into rows and columns — sales records, user accoun
 LatticeDB stores everything in one file on one machine. It can ship that file's changes elsewhere continuously, so a disk failure costs you seconds rather than everything, but that is backup rather than clustering. If you need sharding, multi-node replicas serving reads, or distributed queries across billions of nodes, look at Neo4j cluster, Dgraph, or a managed service like Neptune.
 
 **You need the full Cypher language.**
-LatticeDB supports most of Cypher but not all of it. Features like `OPTIONAL MATCH` and `CALL` procedures are not yet implemented. If your queries depend on these, Neo4j is the complete implementation.
+LatticeDB implements most of the Cypher people write day to day, including `OPTIONAL MATCH`, `UNION`, `CASE`, `CALL { }` subqueries, list and pattern comprehensions, named paths and `shortestPath`, but not all of it. Quantified path patterns, `LOAD CSV`, user-defined procedures, temporal and spatial types, and schema statements are not implemented. If your queries depend on these, Neo4j is the complete implementation.
 
 **You need mature tooling and ecosystem.**
 Neo4j has visualization tools, admin dashboards, monitoring, drivers in every language, and years of community resources. PostgreSQL has decades of tooling. LatticeDB is new and lean — which is a strength for embedding, but a weakness if you need a rich operational ecosystem around your database.
 
 ## Building from Source
 
-Written in Zig. No dependencies.
+Written in Zig. Building needs only Zig (the engine links the C library).
 
 ```bash
 git clone https://github.com/jeffhajewski/latticedb.git
@@ -465,7 +403,7 @@ zig build -Doptimize=ReleaseFast   # optimized build
 ## Documentation
 
 The full documentation lives at **[docs.latticedb.org](https://docs.latticedb.org)** — the Cypher
-reference, the C, Python, TypeScript, and Go API references, guides, and the storage engine
+reference, the C, Python, TypeScript, Go, and Java API references, guides, and the storage engine
 internals. [latticedb.org](https://latticedb.org) is the project site.
 
 The links below are the in-repo copies and design notes.
@@ -476,6 +414,14 @@ The links below are the in-repo copies and design notes.
 - [Examples Overview](examples/README.md)
 - [CLI Quickstart](examples/cli/README.md)
 - [Architecture Overview](docs/00_introduction.md)
+- [0.18.1 Release Notes](docs/release_notes_0.18.1.md)
+- [0.18.0 Release Notes](docs/release_notes_0.18.0.md)
+- [0.17.0 Release Notes](docs/release_notes_0.17.0.md)
+- [0.16.0 Release Notes](docs/release_notes_0.16.0.md)
+- [0.15.0 Release Notes](docs/release_notes_0.15.0.md)
+- [0.14.0 Release Notes](docs/release_notes_0.14.0.md)
+- [0.13.0 Release Notes](docs/release_notes_0.13.0.md)
+- [0.12.0 Release Notes](docs/release_notes_0.12.0.md)
 - [0.11.1 Release Notes](docs/release_notes_0.11.1.md)
 - [0.11.0 Release Notes](docs/release_notes_0.11.0.md)
 - [0.10.0 Release Notes](docs/release_notes_0.10.0.md)

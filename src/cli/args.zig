@@ -4,7 +4,10 @@ const std = @import("std");
 const lattice = @import("lattice");
 
 const types = lattice.core.types;
+const rdf_options = @import("rdf/options.zig");
 const page_manager = lattice.storage.page_manager;
+const VectorMetric = lattice.storage.database.VectorMetric;
+const Retention = lattice.stream.changefeed.Retention;
 
 /// Managed array list for allocator tracking
 fn ManagedArrayList(comptime T: type) type {
@@ -30,6 +33,7 @@ pub const Command = enum {
     info,
     compact,
     checkpoint,
+    changefeed,
     backup,
     replicate,
     restore,
@@ -60,6 +64,7 @@ pub const Command = enum {
         if (std.mem.eql(u8, s, "info")) return .info;
         if (std.mem.eql(u8, s, "compact")) return .compact;
         if (std.mem.eql(u8, s, "checkpoint")) return .checkpoint;
+        if (std.mem.eql(u8, s, "changefeed")) return .changefeed;
         if (std.mem.eql(u8, s, "backup")) return .backup;
         if (std.mem.eql(u8, s, "replicate")) return .replicate;
         if (std.mem.eql(u8, s, "restore")) return .restore;
@@ -92,6 +97,7 @@ pub const Command = enum {
             .info => "Show database information",
             .compact => "Reclaim free pages from the end of a database file",
             .checkpoint => "Flush pending writes and reset the write-ahead log",
+            .changefeed => "Show or trim the changefeed and set how much of it to keep",
             .backup => "Copy a database to another file without closing it",
             .replicate => "Ship changes to a directory, once or continuously",
             .restore => "Rebuild a database from what replication shipped",
@@ -231,13 +237,33 @@ pub const Args = struct {
     // Database options
     enable_vector: bool = false,
     vector_dims: u16 = 128,
+    /// Whether --vector-dims was given. Opening an existing database without
+    /// it takes the dimensions from the file.
+    vector_dims_set: bool = false,
+    /// --vector-metric, --vector-m and --vector-ef-construction, for `create`.
+    vector_metric: ?VectorMetric = null,
+    vector_m: ?u16 = null,
+    vector_ef_construction: ?u16 = null,
     enable_fts: bool = true,
-    cache_size_mb: u32 = 64,
+    /// --changefeed=<policy>: replaces the file's changefeed retention
+    /// policy when the database is opened for writing.
+    changefeed_retention: ?Retention = null,
+    /// --trim, for `changefeed`.
+    trim: bool = false,
+    /// --cache-size; null when not given: LATTICE_BUFFER_POOL_MB if set, else 64.
+    cache_size_mb: ?u32 = null,
+    /// --auto-checkpoint: log frames between the checkpoints commits run, 0
+    /// for none; null when not given (LATTICE_AUTO_CHECKPOINT_FRAMES, else
+    /// the engine's default, scaled to the cache).
+    auto_checkpoint_frames: ?u64 = null,
     page_size: u32 = 4096,
 
     // Import options
     batch_size: u32 = 1000,
     on_error_skip: bool = false,
+
+    // RDF import and export options
+    rdf: rdf_options.Options = .{},
 
     // Filter options
     label_filter: ?[]const u8 = null,
@@ -246,6 +272,8 @@ pub const Args = struct {
     to: ?[]const u8 = null,
     follow: bool = false,
     interval_secs: u32 = 10,
+    /// Whether --interval was given; it means something only with --follow.
+    interval_set: bool = false,
 
     /// Skip the file lock. For filesystems where locking does not work, not
     /// for arranging concurrent access.
@@ -255,6 +283,14 @@ pub const Args = struct {
     output: ?[]const u8 = null,
     at_ms: ?i64 = null,
     force: bool = false,
+
+    /// --upgrade-indexes, for `compact`.
+    upgrade_indexes: bool = false,
+    /// --upgrade-id-keys, for `compact`.
+    upgrade_id_keys: bool = false,
+    /// --apply, for `compact --upgrade-id-keys`: without it the command says
+    /// what the upgrade costs and changes nothing.
+    apply: bool = false,
 
     // Remaining positional args
     positional: []const []const u8 = &.{},
@@ -276,9 +312,13 @@ pub const Args = struct {
                     args.command = .version;
                 } else if (std.mem.startsWith(u8, arg, "--format=")) {
                     const value = arg["--format=".len..];
-                    args.format = OutputFormat.fromString(value) orelse {
-                        return error.InvalidFormat;
-                    };
+                    if (rdf_options.syntaxFromName(value)) |syntax| {
+                        args.rdf.syntax = syntax;
+                    } else {
+                        args.format = OutputFormat.fromString(value) orelse {
+                            return error.InvalidFormat;
+                        };
+                    }
                 } else if (std.mem.eql(u8, arg, "--enable-vector")) {
                     args.enable_vector = true;
                 } else if (std.mem.startsWith(u8, arg, "--vector-dims=")) {
@@ -288,6 +328,25 @@ pub const Args = struct {
                     };
                     types.validateVectorDimensions(parsed_dims) catch return error.InvalidVectorDims;
                     args.vector_dims = @intCast(parsed_dims);
+                    args.vector_dims_set = true;
+                } else if (std.mem.startsWith(u8, arg, "--vector-metric=")) {
+                    const value = arg["--vector-metric=".len..];
+                    args.vector_metric = VectorMetric.fromName(value) orelse return error.InvalidVectorMetric;
+                } else if (std.mem.startsWith(u8, arg, "--vector-m=")) {
+                    const value = arg["--vector-m=".len..];
+                    const m = std.fmt.parseInt(u16, value, 10) catch return error.InvalidVectorM;
+                    if (m < 2 or m > 32) return error.InvalidVectorM;
+                    args.vector_m = m;
+                } else if (std.mem.startsWith(u8, arg, "--vector-ef-construction=")) {
+                    const value = arg["--vector-ef-construction=".len..];
+                    const ef = std.fmt.parseInt(u16, value, 10) catch return error.InvalidVectorEfConstruction;
+                    if (ef < 1 or ef > 4096) return error.InvalidVectorEfConstruction;
+                    args.vector_ef_construction = ef;
+                } else if (std.mem.startsWith(u8, arg, "--changefeed=")) {
+                    args.changefeed_retention = Retention.parse(arg["--changefeed=".len..]) orelse
+                        return error.InvalidChangefeedRetention;
+                } else if (std.mem.eql(u8, arg, "--trim")) {
+                    args.trim = true;
                 } else if (std.mem.eql(u8, arg, "--enable-fts")) {
                     args.enable_fts = true;
                 } else if (std.mem.eql(u8, arg, "--no-fts")) {
@@ -296,6 +355,11 @@ pub const Args = struct {
                     const value = arg["--cache-size=".len..];
                     args.cache_size_mb = std.fmt.parseInt(u32, value, 10) catch {
                         return error.InvalidCacheSize;
+                    };
+                } else if (std.mem.startsWith(u8, arg, "--auto-checkpoint=")) {
+                    const value = arg["--auto-checkpoint=".len..];
+                    args.auto_checkpoint_frames = std.fmt.parseInt(u64, value, 10) catch {
+                        return error.InvalidAutoCheckpoint;
                     };
                 } else if (std.mem.startsWith(u8, arg, "--page-size=")) {
                     const value = arg["--page-size=".len..];
@@ -324,12 +388,19 @@ pub const Args = struct {
                         return error.InvalidInterval;
                     };
                     if (args.interval_secs == 0) return error.InvalidInterval;
+                    args.interval_set = true;
                 } else if (std.mem.eql(u8, arg, "--no-lock")) {
                     args.no_lock = true;
                 } else if (std.mem.startsWith(u8, arg, "--output=")) {
                     args.output = arg["--output=".len..];
                 } else if (std.mem.eql(u8, arg, "--force")) {
                     args.force = true;
+                } else if (std.mem.eql(u8, arg, "--upgrade-indexes")) {
+                    args.upgrade_indexes = true;
+                } else if (std.mem.eql(u8, arg, "--upgrade-id-keys")) {
+                    args.upgrade_id_keys = true;
+                } else if (std.mem.eql(u8, arg, "--apply")) {
+                    args.apply = true;
                 } else if (std.mem.startsWith(u8, arg, "--at=")) {
                     args.at_ms = parseTimestamp(arg["--at=".len..]) orelse {
                         return error.InvalidTimestamp;
@@ -338,6 +409,8 @@ pub const Args = struct {
                     args.file = arg["--file=".len..];
                 } else if (std.mem.startsWith(u8, arg, "--query=")) {
                     args.query_string = arg["--query=".len..];
+                } else if (try rdf_options.parseArg(&args.rdf, arg)) {
+                    // An RDF import or export option.
                 } else {
                     return error.UnknownOption;
                 }
@@ -372,6 +445,17 @@ pub const Args = struct {
             }
         }
 
+        // An option that only means something with another one would
+        // otherwise be ignored without a word: a database created with
+        // --vector-dims and no --enable-vector has no vector index.
+        if (!args.enable_vector and (args.vector_dims_set or args.vector_metric != null or
+            args.vector_m != null or args.vector_ef_construction != null))
+        {
+            return error.VectorOptionWithoutEnableVector;
+        }
+        if (args.interval_set and !args.follow) return error.IntervalWithoutFollow;
+        if (args.apply and !args.upgrade_id_keys) return error.ApplyWithoutUpgradeIdKeys;
+
         args.positional = try positional.toOwnedSlice();
         return args;
     }
@@ -386,7 +470,15 @@ pub const Error = error{
     InvalidInterval,
     InvalidTimestamp,
     InvalidVectorDims,
+    InvalidVectorMetric,
+    InvalidVectorM,
+    InvalidVectorEfConstruction,
+    InvalidChangefeedRetention,
+    VectorOptionWithoutEnableVector,
+    IntervalWithoutFollow,
+    ApplyWithoutUpgradeIdKeys,
     InvalidCacheSize,
+    InvalidAutoCheckpoint,
     InvalidPageSize,
     InvalidBatchSize,
     UnknownOption,
@@ -428,6 +520,43 @@ test "parse format option" {
     try std.testing.expectEqual(OutputFormat.json, args.format);
 }
 
+test "parse the index upgrade option for compact" {
+    const allocator = std.testing.allocator;
+    var plain = try Args.parse(allocator, &.{ "lattice", "compact", "test.db" });
+    defer plain.deinit(allocator);
+    try std.testing.expect(!plain.upgrade_indexes);
+
+    var args = try Args.parse(allocator, &.{ "lattice", "compact", "test.db", "--upgrade-indexes" });
+    defer args.deinit(allocator);
+    try std.testing.expectEqual(Command.compact, args.command.?);
+    try std.testing.expectEqualStrings("test.db", args.path.?);
+    try std.testing.expect(args.upgrade_indexes);
+}
+
+test "parse the id key upgrade option for compact, alone and with the index upgrade" {
+    const allocator = std.testing.allocator;
+    var plain = try Args.parse(allocator, &.{ "lattice", "compact", "test.db" });
+    defer plain.deinit(allocator);
+    try std.testing.expect(!plain.upgrade_id_keys);
+
+    var both = try Args.parse(allocator, &.{ "lattice", "compact", "test.db", "--upgrade-id-keys", "--upgrade-indexes" });
+    defer both.deinit(allocator);
+    try std.testing.expect(both.upgrade_id_keys);
+    try std.testing.expect(both.upgrade_indexes);
+    try std.testing.expect(!both.apply);
+}
+
+test "parse --apply, which only goes with the id key upgrade" {
+    const allocator = std.testing.allocator;
+    var args = try Args.parse(allocator, &.{ "lattice", "compact", "test.db", "--upgrade-id-keys", "--apply" });
+    defer args.deinit(allocator);
+    try std.testing.expect(args.upgrade_id_keys);
+    try std.testing.expect(args.apply);
+
+    try std.testing.expectError(error.ApplyWithoutUpgradeIdKeys, Args.parse(allocator, &.{ "lattice", "compact", "test.db", "--apply" }));
+    try std.testing.expectError(error.ApplyWithoutUpgradeIdKeys, Args.parse(allocator, &.{ "lattice", "compact", "test.db", "--upgrade-indexes", "--apply" }));
+}
+
 test "parse vector dimensions range" {
     const allocator = std.testing.allocator;
     var args = try Args.parse(allocator, &.{ "lattice", "create", "test.db", "--enable-vector", "--vector-dims=4096" });
@@ -438,6 +567,64 @@ test "parse vector dimensions range" {
 
     try std.testing.expectError(error.InvalidVectorDims, Args.parse(allocator, &.{ "lattice", "create", "test.db", "--vector-dims=0" }));
     try std.testing.expectError(error.InvalidVectorDims, Args.parse(allocator, &.{ "lattice", "create", "test.db", "--vector-dims=4097" }));
+}
+
+test "parse vector index options for create" {
+    const allocator = std.testing.allocator;
+    var args = try Args.parse(allocator, &.{ "lattice", "create", "test.db", "--enable-vector", "--vector-dims=8", "--vector-metric=dot_product", "--vector-m=24", "--vector-ef-construction=64" });
+    defer args.deinit(allocator);
+    try std.testing.expect(args.vector_dims_set);
+    try std.testing.expectEqual(@as(?VectorMetric, .dot_product), args.vector_metric);
+    try std.testing.expectEqual(@as(?u16, 24), args.vector_m);
+    try std.testing.expectEqual(@as(?u16, 64), args.vector_ef_construction);
+
+    var plain = try Args.parse(allocator, &.{ "lattice", "info", "test.db", "--enable-vector" });
+    defer plain.deinit(allocator);
+    try std.testing.expect(!plain.vector_dims_set);
+    try std.testing.expect(plain.vector_metric == null);
+
+    try std.testing.expectError(error.InvalidVectorMetric, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--vector-metric=manhattan" }));
+    try std.testing.expectError(error.InvalidChangefeedRetention, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--changefeed=sometimes" }));
+    var feed = try Args.parse(allocator, &.{ "lattice", "changefeed", "t.db", "--changefeed=last:1000", "--trim" });
+    defer feed.deinit(allocator);
+    try std.testing.expectEqual(@as(?Command, .changefeed), feed.command);
+    try std.testing.expectEqual(@as(u64, 1000), feed.changefeed_retention.?.keep_last);
+    try std.testing.expect(feed.trim);
+    // One spelling: the one the bindings and `lattice info` use.
+    try std.testing.expectError(error.InvalidVectorMetric, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--enable-vector", "--vector-metric=dot" }));
+    try std.testing.expectError(error.InvalidVectorMetric, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--enable-vector", "--vector-metric=inner_product" }));
+    try std.testing.expectError(error.InvalidVectorM, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--vector-m=1" }));
+    try std.testing.expectError(error.InvalidVectorM, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--vector-m=33" }));
+    try std.testing.expectError(error.InvalidVectorEfConstruction, Args.parse(allocator, &.{ "lattice", "create", "t.db", "--vector-ef-construction=0" }));
+}
+
+test "lfmt vector options without --enable-vector are refused, not ignored" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "--vector-dims=8", "--vector-metric=cosine", "--vector-m=16", "--vector-ef-construction=64" }) |option| {
+        try std.testing.expectError(error.VectorOptionWithoutEnableVector, Args.parse(allocator, &.{ "lattice", "create", "t.db", option }));
+        try std.testing.expectError(error.VectorOptionWithoutEnableVector, Args.parse(allocator, &.{ "lattice", "info", "t.db", option }));
+        var with = try Args.parse(allocator, &.{ "lattice", "create", "t.db", option, "--enable-vector" });
+        with.deinit(allocator);
+    }
+}
+
+test "lfmt --auto-checkpoint takes a frame count, 0 for none" {
+    const allocator = std.testing.allocator;
+    var off = try Args.parse(allocator, &.{ "lattice", "exec", "t.db", "--auto-checkpoint=0" });
+    defer off.deinit(allocator);
+    try std.testing.expectEqual(@as(?u64, 0), off.auto_checkpoint_frames);
+    var plain = try Args.parse(allocator, &.{ "lattice", "exec", "t.db" });
+    defer plain.deinit(allocator);
+    try std.testing.expect(plain.auto_checkpoint_frames == null);
+    try std.testing.expectError(error.InvalidAutoCheckpoint, Args.parse(allocator, &.{ "lattice", "exec", "t.db", "--auto-checkpoint=-1" }));
+}
+
+test "lfmt --interval without --follow is refused, not ignored" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.IntervalWithoutFollow, Args.parse(allocator, &.{ "lattice", "replicate", "t.db", "--to=r", "--interval=5" }));
+    var with = try Args.parse(allocator, &.{ "lattice", "replicate", "t.db", "--to=r", "--follow", "--interval=5" });
+    defer with.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 5), with.interval_secs);
 }
 
 test "parse page size option" {

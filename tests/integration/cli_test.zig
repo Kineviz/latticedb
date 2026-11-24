@@ -1,0 +1,1113 @@
+//! The `lattice` command-line tool, run as a separate process.
+//!
+//! These drive the built binary through pipes, the way a script or another
+//! program would, so they see exactly what reaches the other end: what was
+//! printed is not the same as what was delivered.
+
+const std = @import("std");
+const lattice = @import("lattice");
+const build_options = @import("build_options");
+const compat = @import("compat");
+
+const Database = lattice.storage.database.Database;
+const Child = std.process.Child;
+
+const io = std.testing.io;
+
+/// How long the REPL gets to show its prompt before the test stops waiting.
+const prompt_timeout_ms = 10_000;
+
+/// Closes the child's input if the prompt has not arrived in time.
+///
+/// Without this a REPL that never flushes would leave the test blocked in a
+/// read forever. Closing its input ends the REPL, which then exits and prints
+/// everything it was holding, so the test sees the prompt either way and has
+/// to know whether it arrived before the deadline or only because of it.
+const Watchdog = struct {
+    child: *Child,
+    state: std.atomic.Value(u8) = .init(waiting),
+
+    const waiting: u8 = 0;
+    const answered: u8 = 1;
+    const timed_out: u8 = 2;
+
+    fn run(self: *Watchdog) void {
+        var waited_ms: u32 = 0;
+        while (waited_ms < prompt_timeout_ms) : (waited_ms += 10) {
+            if (self.state.load(.acquire) != waiting) return;
+            compat.sleep(10 * std.time.ns_per_ms);
+        }
+        if (self.claim(timed_out)) closeInput(self.child);
+    }
+
+    /// Whoever moves the state off `waiting` owns the child's input.
+    fn claim(self: *Watchdog, outcome: u8) bool {
+        return self.state.cmpxchgStrong(waiting, outcome, .acq_rel, .acquire) == null;
+    }
+};
+
+fn closeInput(child: *Child) void {
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        // `wait` closes whatever is left, so this one must not be left.
+        child.stdin = null;
+    }
+}
+
+test "cli: the REPL shows its prompt while it is waiting for input" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_repl.ltdb";
+    const wal_path = "/tmp/lattice_cli_repl.ltdb-wal";
+
+    compat.fs.cwd().deleteFile(path) catch {};
+    compat.fs.cwd().deleteFile(wal_path) catch {};
+    defer compat.fs.cwd().deleteFile(path) catch {};
+    defer compat.fs.cwd().deleteFile(wal_path) catch {};
+
+    {
+        const db = try Database.open(allocator, path, .{
+            .create = true,
+            .config = .{ .enable_fts = false, .enable_vector = false },
+        });
+        db.close();
+    }
+
+    // Without a home directory the REPL keeps its history in memory, so the
+    // test leaves the history file of whoever runs it alone.
+    var environ = try std.testing.environ.createMap(allocator);
+    defer environ.deinit();
+    _ = environ.swapRemove("HOME");
+    _ = environ.swapRemove("USERPROFILE");
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.cli_path, "query", path },
+        .environ_map = &environ,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    var watchdog = Watchdog{ .child = &child };
+    const thread = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
+
+    // Nothing is written to the REPL, so its input stays open and it sits at
+    // the prompt. Whatever it has shown by then is what a user would see.
+    var seen: [4096]u8 = undefined;
+    var len: usize = 0;
+    const prompt_seen = while (len < seen.len) {
+        const n = child.stdout.?.readStreaming(io, &.{seen[len..]}) catch |err| switch (err) {
+            error.EndOfStream => break false,
+            else => return err,
+        };
+        len += n;
+        if (std.mem.indexOf(u8, seen[0..len], "lattice> ") != null) break true;
+    } else false;
+
+    const in_time = watchdog.claim(Watchdog.answered);
+    if (in_time) {
+        try child.stdin.?.writeStreamingAll(io, ".exit\n");
+        closeInput(&child);
+    }
+    thread.join();
+    _ = try child.wait(io);
+
+    try std.testing.expect(prompt_seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen[0..len], "Connected to:") != null);
+    // Arriving only once the input was closed means the REPL held it until
+    // exit, which at a terminal is a blank screen.
+    try std.testing.expect(in_time);
+}
+
+/// What one run of the command-line tool produced.
+const CliRun = struct {
+    exit_code: ?u8,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: CliRun, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+
+    fn succeeded(self: CliRun) bool {
+        return self.exit_code != null and self.exit_code.? == 0;
+    }
+};
+
+/// Run `lattice` with these arguments and collect everything it printed.
+fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !CliRun {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, build_options.cli_path);
+    try argv.appendSlice(allocator, args);
+
+    const result = try std.process.run(allocator, io, .{ .argv = argv.items });
+    return .{
+        .exit_code = switch (result.term) {
+            .exited => |code| code,
+            else => null,
+        },
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+fn deleteDatabaseFiles(path: []const u8) void {
+    compat.fs.cwd().deleteFile(path) catch {};
+    var wal_buf: [256]u8 = undefined;
+    const wal = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return;
+    compat.fs.cwd().deleteFile(wal) catch {};
+}
+
+/// Windows enforces the database's file lock on reads, so the file of a
+/// database that is still open cannot be copied there. A test that needs such
+/// a copy is skipped on Windows.
+fn skipIfLockedOnWindows(err: anyerror) anyerror {
+    if (@import("builtin").os.tag == .windows and err == error.LockViolation) return error.SkipZigTest;
+    return err;
+}
+
+fn copyFile(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    _ = allocator;
+    const in = try compat.fs.cwd().openFile(src, .{});
+    defer in.close();
+    const out = try compat.fs.cwd().createFile(dst, .{ .truncate = true });
+    defer out.close();
+    var buf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = in.preadAll(&buf, offset) catch |err| return skipIfLockedOnWindows(err);
+        if (n == 0) break;
+        try out.pwriteAll(buf[0..n], offset);
+        offset += n;
+    }
+}
+
+/// Copy a database and its log while the handle is still open, so the copy is
+/// what the next process finds after the writer was killed.
+fn copyAsIfKilled(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    try copyFile(allocator, src, dst);
+    var src_wal_buf: [256]u8 = undefined;
+    var dst_wal_buf: [256]u8 = undefined;
+    try copyFile(
+        allocator,
+        try std.fmt.bufPrint(&src_wal_buf, "{s}-wal", .{src}),
+        try std.fmt.bufPrint(&dst_wal_buf, "{s}-wal", .{dst}),
+    );
+}
+
+const killed_vector_dims = 8;
+
+/// A vector database whose log still holds a committed vector, as a killed
+/// writer leaves it. Opening it replays that vector, which needs the index.
+fn makeKilledVectorDatabase(allocator: std.mem.Allocator, source: []const u8, killed: []const u8) !void {
+    deleteDatabaseFiles(source);
+    deleteDatabaseFiles(killed);
+    defer deleteDatabaseFiles(source);
+
+    var db = try Database.open(allocator, source, .{
+        .create = true,
+        .config = .{
+            .enable_fts = false,
+            .enable_vector = true,
+            .vector_dimensions = killed_vector_dims,
+            .auto_checkpoint = null,
+        },
+    });
+    defer db.close();
+
+    var vector = [_]f32{0} ** killed_vector_dims;
+    vector[0] = 1;
+    var txn = try db.beginTransaction(.read_write);
+    const node_id = try db.createNode(&txn, &.{"Chunk"});
+    try db.setNodeVectorInTxn(&txn, node_id, &vector);
+    try db.commitTransaction(&txn);
+    try copyAsIfKilled(allocator, source, killed);
+}
+
+test "cli: every command that opens a database opens its vector index, and refuses other dimensions" {
+    const allocator = std.testing.allocator;
+    const source = "/tmp/lattice_cli_vecopen_source.ltdb";
+    const killed = "/tmp/lattice_cli_vecopen_killed.ltdb";
+    const backup = "/tmp/lattice_cli_vecopen_backup.ltdb";
+    const replica = "/tmp/lattice_cli_vecopen_replica";
+    const import_file = "/tmp/lattice_cli_vecopen_import.json";
+    defer deleteDatabaseFiles(killed);
+    defer deleteDatabaseFiles(backup);
+    defer compat.fs.cwd().deleteTree(replica) catch {};
+    defer compat.fs.cwd().deleteFile(import_file) catch {};
+
+    {
+        const file = try compat.fs.cwd().createFile(import_file, .{ .truncate = true });
+        defer file.close();
+        try file.deprecatedWriter().writeAll("{\"nodes\":[],\"edges\":[]}\n");
+    }
+
+    const commands = [_][]const []const u8{
+        &.{ "exec", killed, "--query=MATCH (n) RETURN count(n)" },
+        &.{ "query", killed },
+        &.{ "checkpoint", killed },
+        &.{ "compact", killed },
+        &.{ "backup", killed, "--file=" ++ backup },
+        &.{ "replicate", killed, "--to=" ++ replica },
+        &.{ "import", killed, "--file=" ++ import_file },
+    };
+
+    for (commands) |command| {
+        // The file records its vector index, so the vector changes in its log
+        // replay without vector options (0.16.0 refused this open), with
+        // options that agree, and not with options that contradict it.
+        const variants = [_]struct { extra: []const []const u8, ok: bool }{
+            .{ .extra = &.{}, .ok = true },
+            .{ .extra = &.{ "--enable-vector", "--vector-dims=8" }, .ok = true },
+            .{ .extra = &.{ "--enable-vector", "--vector-dims=16" }, .ok = false },
+        };
+        for (variants) |variant| {
+            try makeKilledVectorDatabase(allocator, source, killed);
+            deleteDatabaseFiles(backup);
+            compat.fs.cwd().deleteTree(replica) catch {};
+
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(allocator);
+            try argv.appendSlice(allocator, command);
+            try argv.appendSlice(allocator, variant.extra);
+
+            const run = try runCli(allocator, argv.items);
+            defer run.deinit(allocator);
+            const as_expected = if (variant.ok)
+                run.succeeded()
+            else
+                !run.succeeded() and std.mem.indexOf(u8, run.stderr, "leave out --vector-dims") != null;
+            if (!as_expected) {
+                std.debug.print("{s} {s}: exit {?d}\nstderr: {s}\n", .{ command[0], if (variant.extra.len > 0) variant.extra[1] else "(no vector options)", run.exit_code, run.stderr });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "cli: a database that needs a newer writer is read by read-only commands and refused by the rest" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_min_writer.ltdb";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_fts = false } });
+        defer db.close();
+        _ = try db.createNode(null, &.{"A"});
+    }
+    {
+        const file = try compat.fs.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        var buf: [4096]u8 = undefined;
+        _ = try file.preadAll(&buf, 0);
+        const at = @offsetOf(lattice.storage.page.FileHeader, "min_writer_version");
+        std.mem.writeInt(u16, buf[at..][0..2], lattice.core.types.FORMAT_VERSION + 1, .little);
+        try file.pwriteAll(&buf, 0);
+    }
+
+    const count = try runCli(allocator, &.{ "count", path });
+    defer count.deinit(allocator);
+    try std.testing.expect(count.succeeded());
+
+    const write = try runCli(allocator, &.{ "exec", path, "--query=CREATE (:A)" });
+    defer write.deinit(allocator);
+    try std.testing.expect(!write.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, write.stderr, "newer LatticeDB") != null);
+
+    // A statement that only reads, and a backup, open it read-only.
+    const read = try runCli(allocator, &.{ "exec", path, "--query=MATCH (n:A) RETURN count(n) AS c" });
+    defer read.deinit(allocator);
+    if (!read.succeeded()) {
+        std.debug.print("exec read: exit {?d}\nstderr: {s}\n", .{ read.exit_code, read.stderr });
+        return error.TestUnexpectedResult;
+    }
+    const backup_path = "/tmp/lattice_cli_min_writer_backup.ltdb";
+    deleteDatabaseFiles(backup_path);
+    defer deleteDatabaseFiles(backup_path);
+    const backup = try runCli(allocator, &.{ "backup", path, "--file=" ++ backup_path });
+    defer backup.deinit(allocator);
+    if (!backup.succeeded()) {
+        std.debug.print("backup: exit {?d}\nstderr: {s}\n", .{ backup.exit_code, backup.stderr });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "cli: exec of a read and backup leave the file alone, and a backup of a killed database has its log's commits" {
+    const allocator = std.testing.allocator;
+    const source = "/tmp/lfmt_cli_ro_source.ltdb";
+    const killed = "/tmp/lfmt_cli_ro_killed.ltdb";
+    const backup_path = "/tmp/lfmt_cli_ro_backup.ltdb";
+    deleteDatabaseFiles(source);
+    deleteDatabaseFiles(killed);
+    deleteDatabaseFiles(backup_path);
+    defer deleteDatabaseFiles(source);
+    defer deleteDatabaseFiles(killed);
+    defer deleteDatabaseFiles(backup_path);
+    {
+        var db = try Database.open(allocator, source, .{ .create = true, .config = .{ .enable_fts = false, .auto_checkpoint = null } });
+        defer db.close();
+        try db.sync();
+        var txn = try db.beginTransaction(.read_write);
+        for (0..3) |_| _ = try db.createNode(&txn, &.{"A"});
+        try db.commitTransaction(&txn);
+        // Committed and in the log only, as a killed writer leaves them.
+        try copyAsIfKilled(allocator, source, killed);
+    }
+    const before = try readWholeFile(allocator, killed);
+    defer allocator.free(before);
+    const wal_before = try readWholeFile(allocator, killed ++ "-wal");
+    defer allocator.free(wal_before);
+
+    const read = try runCli(allocator, &.{ "exec", killed, "--format=csv", "--query=MATCH (n:A) RETURN count(n) AS c" });
+    defer read.deinit(allocator);
+    try std.testing.expect(read.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, read.stdout, "3") != null);
+
+    const backup = try runCli(allocator, &.{ "backup", killed, "--file=" ++ backup_path });
+    defer backup.deinit(allocator);
+    try std.testing.expect(backup.succeeded());
+
+    // Neither changed the database or its log: both opened it read-only.
+    const after = try readWholeFile(allocator, killed);
+    defer allocator.free(after);
+    const wal_after = try readWholeFile(allocator, killed ++ "-wal");
+    defer allocator.free(wal_after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqualSlices(u8, wal_before, wal_after);
+
+    // The backup is complete on its own, without the log.
+    var copy = try Database.open(allocator, backup_path, .{ .read_only = true, .config = .{ .enable_fts = false } });
+    defer copy.close();
+    try std.testing.expectEqual(@as(u64, 3), copy.nodeCount());
+}
+
+fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try compat.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+}
+
+test "cli: a database in a format too new to read says so, from open and from check" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lfmt_cli_min_reader.ltdb";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_fts = false } });
+        defer db.close();
+        _ = try db.createNode(null, &.{"A"});
+    }
+    {
+        const file = try compat.fs.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, lattice.core.types.FORMAT_VERSION + 1, .little);
+        try file.pwriteAll(&bytes, @offsetOf(lattice.storage.page.FileHeader, "min_reader_version"));
+    }
+    for ([_][]const u8{ "count", "exec", "check" }) |command| {
+        const run = if (std.mem.eql(u8, command, "exec"))
+            try runCli(allocator, &.{ command, path, "--query=MATCH (n) RETURN n" })
+        else
+            try runCli(allocator, &.{ command, path });
+        defer run.deinit(allocator);
+        if (run.succeeded() or std.mem.indexOf(u8, run.stderr, "format this version cannot read") == null) {
+            std.debug.print("{s}: exit {?d}\nstderr: {s}\n", .{ command, run.exit_code, run.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "cli: check finishes an interrupted flush from the journal, in memory" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lfmt_cli_check_journal.ltdb";
+    const journal_path = "/tmp/lfmt_cli_check_journal.ltdb-journal";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+    compat.fs.cwd().deleteFile(journal_path) catch {};
+    defer compat.fs.cwd().deleteFile(journal_path) catch {};
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_fts = false } });
+        defer db.close();
+        _ = try db.createNode(null, &.{"A"});
+    }
+
+    // A crash in the middle of a flush: the journal holds page 1 whole, and
+    // page 1 in place is half written.
+    const page_size = 4096;
+    const before = try readWholeFile(allocator, path);
+    defer allocator.free(before);
+    {
+        var header: lattice.storage.page.FileHeader = undefined;
+        @memcpy(std.mem.asBytes(&header), before[0..@sizeOf(lattice.storage.page.FileHeader)]);
+        var posix = lattice.storage.vfs.PosixVfs.init(allocator);
+        var journal = try lattice.storage.journal.Journal.open(allocator, posix.vfs(), journal_path);
+        defer journal.deinit();
+        try journal.write(header.file_uuid, page_size, &.{.{ .page_id = 1, .data = before[page_size..][0..page_size] }});
+
+        const file = try compat.fs.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        const torn = [_]u8{0xA5} ** (page_size / 2);
+        try file.pwriteAll(&torn, page_size + page_size / 2);
+    }
+    const torn_file = try readWholeFile(allocator, path);
+    defer allocator.free(torn_file);
+    const journal_before = try readWholeFile(allocator, journal_path);
+    defer allocator.free(journal_before);
+
+    const run = try runCli(allocator, &.{ "check", path, "--format=json" });
+    defer run.deinit(allocator);
+    if (!run.succeeded() or std.mem.indexOf(u8, run.stdout, "\"journal_applied\":true") == null) {
+        std.debug.print("exit {?d}\nstdout: {s}\nstderr: {s}\n", .{ run.exit_code, run.stdout, run.stderr });
+        return error.TestUnexpectedResult;
+    }
+
+    // The check wrote nothing: the file and the journal are as they were.
+    const file_after = try readWholeFile(allocator, path);
+    defer allocator.free(file_after);
+    try std.testing.expectEqualSlices(u8, torn_file, file_after);
+    const journal_after = try readWholeFile(allocator, journal_path);
+    defer allocator.free(journal_after);
+    try std.testing.expectEqualSlices(u8, journal_before, journal_after);
+}
+
+test "cli: info and check say when and why 0.16.0 cannot open a database" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lfmt_cli_reader_reasons.ltdb";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+
+    // A file laid out as 0.17 and 0.18 lay one out, little-endian id keys:
+    // only there does the reader version start at 3. The CLI creates
+    // format-5 files.
+    {
+        const db = try lattice.storage.database.Database.open(allocator, path, .{
+            .create = true,
+            .config = .{ .new_database_id_keys = .little },
+        });
+        db.close();
+    }
+    for ([_][]const u8{ "info", "check" }) |command| {
+        const run = try runCli(allocator, &.{ command, path, "--format=json" });
+        defer run.deinit(allocator);
+        if (!run.succeeded() or std.mem.indexOf(u8, run.stdout, "\"min_reader_version\":3,\"min_reader_reasons\":[]") == null) {
+            std.debug.print("{s}: exit {?d}\nstdout: {s}\nstderr: {s}\n", .{ command, run.exit_code, run.stdout, run.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The first change records changefeed events, which need format 4, not
+    // this release's format: 0.17 and 0.18 can still open the file.
+    const wrote = try runCli(allocator, &.{ "exec", path, "--query=CREATE (:Person {name: 'Ada'})" });
+    defer wrote.deinit(allocator);
+    try std.testing.expect(wrote.succeeded());
+    for ([_][]const u8{ "info", "check" }) |command| {
+        const json = try runCli(allocator, &.{ command, path, "--format=json" });
+        defer json.deinit(allocator);
+        const table = try runCli(allocator, &.{ command, path });
+        defer table.deinit(allocator);
+        if (!json.succeeded() or
+            std.mem.indexOf(u8, json.stdout, "\"min_reader_version\":4,\"min_reader_reasons\":[\"changefeed events\"]") == null or
+            std.mem.indexOf(u8, table.stdout, "v4, so 0.16.0 cannot open it (changefeed events)") == null)
+        {
+            std.debug.print("{s}: exit {?d}\njson: {s}\ntable: {s}\n", .{ command, json.exit_code, json.stdout, table.stdout });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const info = try runCli(allocator, &.{ "info", path, "--format=json" });
+    defer info.deinit(allocator);
+    if (std.mem.indexOf(u8, info.stdout, "\"format_version\":5,\"id_keys\":\"little-endian\"") == null) {
+        std.debug.print("info: {s}\n", .{info.stdout});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "cli: info and check say a format-5 file is closed to 0.18 and earlier, and info shows its id keys" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lfmt_cli_ordered_keys.ltdb";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+
+    const created = try runCli(allocator, &.{ "create", path });
+    defer created.deinit(allocator);
+    try std.testing.expect(created.succeeded());
+    const wrote = try runCli(allocator, &.{ "exec", path, "--query=CREATE (:Person {name: 'Ada'})" });
+    defer wrote.deinit(allocator);
+    try std.testing.expect(wrote.succeeded());
+
+    for ([_][]const u8{ "info", "check" }) |command| {
+        const json = try runCli(allocator, &.{ command, path, "--format=json" });
+        defer json.deinit(allocator);
+        const table = try runCli(allocator, &.{ command, path });
+        defer table.deinit(allocator);
+        if (!json.succeeded() or
+            std.mem.indexOf(u8, json.stdout, "\"min_reader_version\":5,\"min_reader_reasons\":[\"changefeed events\",\"ordered id keys\"]") == null or
+            std.mem.indexOf(u8, table.stdout, "v5, so 0.18 and earlier cannot open it (changefeed events, ordered id keys)") == null)
+        {
+            std.debug.print("{s}: exit {?d}\njson: {s}\ntable: {s}\n", .{ command, json.exit_code, json.stdout, table.stdout });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    const json = try runCli(allocator, &.{ "info", path, "--format=json" });
+    defer json.deinit(allocator);
+    const table = try runCli(allocator, &.{ "info", path });
+    defer table.deinit(allocator);
+    const csv = try runCli(allocator, &.{ "info", path, "--format=csv" });
+    defer csv.deinit(allocator);
+    if (std.mem.indexOf(u8, json.stdout, "\"format_version\":5,\"id_keys\":\"big-endian\"") == null or
+        std.mem.indexOf(u8, table.stdout, "Id keys:      big-endian") == null or
+        std.mem.indexOf(u8, csv.stdout, "id_keys,big-endian") == null)
+    {
+        std.debug.print("json: {s}\ntable: {s}\ncsv: {s}\n", .{ json.stdout, table.stdout, csv.stdout });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "cli: the dot product metric has one name, from create to info" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lfmt_cli_dot_product.ltdb";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+
+    const refused = try runCli(allocator, &.{ "create", path, "--enable-vector", "--vector-dims=2", "--vector-metric=dot" });
+    defer refused.deinit(allocator);
+    try std.testing.expect(!refused.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "dot_product") != null);
+
+    const created = try runCli(allocator, &.{ "create", path, "--enable-vector", "--vector-dims=2", "--vector-metric=dot_product", "--vector-m=8" });
+    defer created.deinit(allocator);
+    try std.testing.expect(created.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, created.stdout, "metric: dot_product") != null);
+
+    const info = try runCli(allocator, &.{ "info", path, "--format=json" });
+    defer info.deinit(allocator);
+    if (!info.succeeded() or std.mem.indexOf(u8, info.stdout, "\"vector_dimensions\":2,\"vector_metric\":\"dot_product\",\"vector_m\":8,") == null) {
+        std.debug.print("exit {?d}\nstdout: {s}\nstderr: {s}\n", .{ info.exit_code, info.stdout, info.stderr });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "cli: a JSON export carries the vector index's metric and settings to the database an import indexes" {
+    const allocator = std.testing.allocator;
+    const source = "/tmp/lfmt_cli_vexport_source.ltdb";
+    const target = "/tmp/lfmt_cli_vexport_target.ltdb";
+    const indexed = "/tmp/lfmt_cli_vexport_indexed.ltdb";
+    const input = "/tmp/lfmt_cli_vexport_input.json";
+    const exported = "/tmp/lfmt_cli_vexport.json";
+    for ([_][]const u8{ source, target, indexed }) |path| deleteDatabaseFiles(path);
+    defer for ([_][]const u8{ source, target, indexed }) |path| deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(input) catch {};
+    defer compat.fs.cwd().deleteFile(exported) catch {};
+
+    try writeFile(input,
+        \\{"version":2,"vector_dimensions":3,"nodes":[{"id":"1","labels":["Doc"],"properties":{},"vector":[3.0,4.0,0.0]}],"edges":[]}
+    );
+    const steps = [_][]const []const u8{
+        &.{ "create", source, "--enable-vector", "--vector-dims=3", "--vector-metric=euclidean", "--vector-m=8", "--vector-ef-construction=50" },
+        &.{ "import", source, "--file=" ++ input },
+        &.{ "export", source, "--file=" ++ exported },
+        &.{ "create", target },
+        &.{ "import", target, "--file=" ++ exported, "--enable-vector" },
+        // A database that has an index keeps its own settings.
+        &.{ "create", indexed, "--enable-vector", "--vector-dims=3" },
+        &.{ "import", indexed, "--file=" ++ exported, "--enable-vector" },
+    };
+    for (steps) |argv| {
+        const run = try runCli(allocator, argv);
+        defer run.deinit(allocator);
+        if (!run.succeeded()) {
+            std.debug.print("{s}: exit {?d}\nstderr: {s}\n", .{ argv[0], run.exit_code, run.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    const content = try readWholeFile(allocator, exported);
+    defer allocator.free(content);
+    const settings = "\"vector_dimensions\":3,\"vector_metric\":\"euclidean\",\"vector_m\":8,\"vector_ef_construction\":50,";
+    try std.testing.expect(std.mem.indexOf(u8, content, settings) != null);
+
+    for ([_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = target, .expected = settings },
+        .{ .path = indexed, .expected = "\"vector_dimensions\":3,\"vector_metric\":\"cosine\",\"vector_m\":16,\"vector_ef_construction\":200," },
+    }) |case| {
+        const info = try runCli(allocator, &.{ "info", case.path, "--format=json" });
+        defer info.deinit(allocator);
+        if (!info.succeeded() or std.mem.indexOf(u8, info.stdout, case.expected) == null) {
+            std.debug.print("{s}: {s}\n{s}\n", .{ case.path, info.stdout, info.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The vector came through, and under the euclidean metric it is stored
+    // as written, not normalised.
+    const exported_again = "/tmp/lfmt_cli_vexport_again.json";
+    defer compat.fs.cwd().deleteFile(exported_again) catch {};
+    const again = try runCli(allocator, &.{ "export", target, "--file=" ++ exported_again });
+    defer again.deinit(allocator);
+    try std.testing.expect(again.succeeded());
+    const round_trip = try readWholeFile(allocator, exported_again);
+    defer allocator.free(round_trip);
+    try std.testing.expect(std.mem.indexOf(u8, round_trip, "\"vector\":[3.0,4.0,0.0]") != null);
+}
+
+test "cli: help for every command that opens a database lists the vector options" {
+    const allocator = std.testing.allocator;
+    const commands = [_][]const u8{
+        "info",   "compact", "checkpoint", "backup", "replicate", "query",  "exec",
+        "import", "export",  "dump",       "labels", "types",     "schema", "count",
+    };
+    for (commands) |command| {
+        const help = try runCli(allocator, &.{ command, "--help" });
+        defer help.deinit(allocator);
+        if (std.mem.indexOf(u8, help.stdout, "--enable-vector") == null or
+            std.mem.indexOf(u8, help.stdout, "--vector-dims=<n>") == null)
+        {
+            std.debug.print("help for {s} does not list the vector options:\n{s}\n", .{ command, help.stdout });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try compat.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1 << 30);
+}
+
+test "cli: export includes vectors, with or without the vector options" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_export_vectors.ltdb";
+    const out = "/tmp/lattice_cli_export_vectors.json";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(out) catch {};
+
+    {
+        var db = try Database.open(allocator, path, .{
+            .create = true,
+            .config = .{ .enable_fts = false, .enable_vector = true, .vector_dimensions = 4 },
+        });
+        defer db.close();
+        const node = try db.createNode(null, &.{"Chunk"});
+        try db.setNodeVector(node, &[_]f32{ 1, 0, 0, 0 });
+    }
+
+    // The file says what its index is, so no vector options are needed.
+    const without = try runCli(allocator, &.{ "export", path, "--file=" ++ out });
+    defer without.deinit(allocator);
+    try std.testing.expect(without.succeeded());
+    try std.testing.expectEqual(@as(usize, 0), without.stderr.len);
+    const plain = try readFileAlloc(allocator, out);
+    defer allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"vector\":[1.0,0.0,0.0,0.0]") != null);
+
+    const with = try runCli(allocator, &.{ "export", path, "--file=" ++ out, "--enable-vector", "--vector-dims=4" });
+    defer with.deinit(allocator);
+    try std.testing.expect(with.succeeded());
+    try std.testing.expectEqual(@as(usize, 0), with.stderr.len);
+    const full = try readFileAlloc(allocator, out);
+    defer allocator.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "\"vector\":[1.0,0.0,0.0,0.0]") != null);
+}
+
+test "cli: export --query exports what the query returns, not the whole graph" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_export_query.ltdb";
+    const out = "/tmp/lattice_cli_export_query.json";
+    deleteDatabaseFiles(path);
+    defer deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(out) catch {};
+
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_fts = false } });
+        defer db.close();
+        const alice = try db.createNode(null, &.{"Person"});
+        const acme = try db.createNode(null, &.{"Company"});
+        _ = try db.createEdgeAndGetId(null, alice, acme, "WORKS_AT");
+    }
+
+    const run = try runCli(allocator, &.{ "export", path, "--file=" ++ out, "--query=MATCH (c:Company) RETURN c" });
+    defer run.deinit(allocator);
+    try std.testing.expect(run.succeeded());
+    const exported = try readFileAlloc(allocator, out);
+    defer allocator.free(exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "Company") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "Person") == null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "WORKS_AT") == null);
+
+    const scalars = try runCli(allocator, &.{ "export", path, "--file=" ++ out, "--query=MATCH (c:Company) RETURN count(c)" });
+    defer scalars.deinit(allocator);
+    try std.testing.expect(!scalars.succeeded());
+}
+
+fn writeFile(path: []const u8, content: []const u8) !void {
+    const file = try compat.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.deprecatedWriter().writeAll(content);
+}
+
+fn createEmptyDatabase(allocator: std.mem.Allocator, path: []const u8) !void {
+    deleteDatabaseFiles(path);
+    var db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_fts = false } });
+    db.close();
+}
+
+test "cli: CSV import resolves _id values and keeps edge properties" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_csv_ids.ltdb";
+    const nodes = "/tmp/lattice_cli_csv_ids_nodes.csv";
+    const edges = "/tmp/lattice_cli_csv_ids_edges.csv";
+    const export_name = "/tmp/lattice_cli_csv_ids.csv";
+    defer deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(nodes) catch {};
+    defer compat.fs.cwd().deleteFile(edges) catch {};
+
+    try createEmptyDatabase(allocator, path);
+    try writeFile(nodes, "_id,_labels,name\nalice,Person,Alice\nbob,Person,Bob\n");
+    try writeFile(edges, "_source,_target,_type,since\nalice,bob,KNOWS,2020\n");
+
+    // The --file value a CSV export was given names both of its files.
+    const run = try runCli(allocator, &.{ "import", path, "--file=" ++ export_name });
+    defer run.deinit(allocator);
+    if (!run.succeeded()) {
+        std.debug.print("import failed: {s}\n", .{run.stderr});
+        return error.TestUnexpectedResult;
+    }
+
+    const query = try runCli(allocator, &.{
+        "exec",                                                            path,
+        "--query=MATCH (a)-[r:KNOWS]->(b) RETURN a.name, r.since, b.name", "--format=csv",
+    });
+    defer query.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, query.stdout, "Alice,2020,Bob") != null);
+
+    // An edges file on its own names nodes by database id, and its property
+    // columns are kept too.
+    try writeFile(edges, "_source,_target,_type,weight\n2,1,LIKES,0.5\n");
+    const alone = try runCli(allocator, &.{ "import", path, "--file=" ++ edges });
+    defer alone.deinit(allocator);
+    try std.testing.expect(alone.succeeded());
+    const likes = try runCli(allocator, &.{ "exec", path, "--query=MATCH ()-[r:LIKES]->() RETURN r.weight", "--format=csv" });
+    defer likes.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, likes.stdout, "0.5") != null);
+}
+
+test "cli: import stops at an edge whose node is missing, and says which" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_missing_endpoint.ltdb";
+    const edges = "/tmp/lattice_cli_missing_endpoint_edges.csv";
+    defer deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(edges) catch {};
+
+    try createEmptyDatabase(allocator, path);
+    const node = try runCli(allocator, &.{ "exec", path, "--query=CREATE (:Person {name: 'Alice'})" });
+    defer node.deinit(allocator);
+    try std.testing.expect(node.succeeded());
+
+    // Node 99 does not exist; an edge to it is not imported as an edge to nowhere.
+    try writeFile(edges, "_source,_target,_type\n1,99,KNOWS\n");
+    const failed = try runCli(allocator, &.{ "import", path, "--file=" ++ edges });
+    defer failed.deinit(allocator);
+    try std.testing.expect(!failed.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, failed.stderr, "line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed.stderr, "_target 99") != null);
+
+    const count = try runCli(allocator, &.{ "exec", path, "--query=MATCH ()-[r]->() RETURN count(r)", "--format=csv" });
+    defer count.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, count.stdout, "\n0") != null);
+
+    // Skipping goes on past it, and still says what it left out.
+    try writeFile(edges, "_source,_target,_type\n1,99,KNOWS\n1,1,SELF\n");
+    const skipped = try runCli(allocator, &.{ "import", path, "--file=" ++ edges, "--on-error=skip" });
+    defer skipped.deinit(allocator);
+    try std.testing.expect(skipped.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, skipped.stderr, "Skipped line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skipped.stdout, "Edges imported: 1") != null);
+}
+
+test "cli: output redirected with >> is appended to the file" {
+    // The redirect is done by /bin/sh, which Windows does not have.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const out = "/tmp/lattice_cli_append.txt";
+    defer compat.fs.cwd().deleteFile(out) catch {};
+    try writeFile(out, "first line\n");
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "/bin/sh", "-c", "\"$0\" version >> \"$1\"", build_options.cli_path, out },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const content = try readFileAlloc(allocator, out);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.startsWith(u8, content, "first line\nLatticeDB"));
+}
+
+test "cli: a failed export leaves no file behind" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_cli_failed_export.ltdb";
+    const out = "/tmp/lattice_cli_failed_export.json";
+    defer deleteDatabaseFiles(path);
+    defer compat.fs.cwd().deleteFile(out) catch {};
+
+    try createEmptyDatabase(allocator, path);
+    const node = try runCli(allocator, &.{ "exec", path, "--query=CREATE (:Person {name: 'Alice'})" });
+    defer node.deinit(allocator);
+
+    // The query returns a name, not a node, so there is nothing to export.
+    const failed = try runCli(allocator, &.{ "export", path, "--file=" ++ out, "--query=MATCH (n) RETURN n.name" });
+    defer failed.deinit(allocator);
+    try std.testing.expect(!failed.succeeded());
+    try std.testing.expectError(error.FileNotFound, compat.fs.cwd().access(out, .{}));
+}
+
+const lupk = @import("lupk_upgrade_id_keys_test.zig");
+
+fn expectOutput(run: CliRun, needles: []const []const u8) !void {
+    for (needles) |needle| {
+        if (!run.succeeded() or std.mem.indexOf(u8, run.stdout, needle) == null) {
+            std.debug.print("expected {s}\nexit {?d}\nstdout: {s}\nstderr: {s}\n", .{ needle, run.exit_code, run.stdout, run.stderr });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "cli: compact --upgrade-id-keys upgrades a little-endian file, in every output format, and info points to it" {
+    const allocator = std.testing.allocator;
+    const paths = [_][]const u8{ "/tmp/lupk_cli_table.ltdb", "/tmp/lupk_cli_json.ltdb", "/tmp/lupk_cli_csv.ltdb" };
+    for (paths) |path| lupk.cleanup(path);
+    defer for (paths) |path| lupk.cleanup(path);
+
+    const built = try lupk.buildLegacy(paths[0], 0);
+    var expected: lupk.Fingerprint = undefined;
+    {
+        var db = try Database.open(lupk.bulk_allocator, paths[0], .{ .config = lupk.legacy_config });
+        defer db.close();
+        expected = try lupk.fingerprint(db, built.last_event);
+    }
+    for (paths[1..]) |path| try copyFile(allocator, paths[0], path);
+
+    // info says how to upgrade a little-endian file, and that it is one-way.
+    {
+        const info = try runCli(allocator, &.{ "info", paths[0] });
+        defer info.deinit(allocator);
+        try expectOutput(info, &.{ "Id keys:      little-endian", "'lattice compact --upgrade-id-keys' converts them (one-way" });
+    }
+
+    {
+        const run = try runCli(allocator, &.{ "compact", paths[0], "--upgrade-id-keys", "--apply" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{
+            "Upgraded the id keys of",
+            "This is one-way: 0.18 and earlier can no longer open this file.",
+            "node tree: ",
+            "full-text document lengths: ",
+            "vector index node tree: ",
+            "Entries checked: ",
+            "Compacted database",
+        });
+    }
+    {
+        const run = try runCli(allocator, &.{ "compact", paths[1], "--upgrade-id-keys", "--apply", "--upgrade-indexes", "--format=json" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{ "\"indexes_rebuilt\":", "\"id_keys_upgraded\":true,\"id_keys\":\"big-endian\",\"id_key_entries_checked\":" });
+    }
+    {
+        const run = try runCli(allocator, &.{ "compact", paths[2], "--upgrade-id-keys", "--apply", "--format=csv" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{ "path,pages_before,pages_after,pages_removed,bytes_reclaimed,id_keys_upgraded,id_keys,id_key_entries_checked,id_key_pages_freed,upgrade_bytes_before,upgrade_bytes_after\n", ",true,big-endian," });
+    }
+
+    for (paths) |path| {
+        var buf: [256]u8 = undefined;
+        try std.testing.expect(!lupk.exists(try std.fmt.bufPrint(&buf, "{s}.upgrade-id-keys", .{path})));
+        const info = try runCli(allocator, &.{ "info", path });
+        defer info.deinit(allocator);
+        try expectOutput(info, &.{ "Id keys:      big-endian", "v5, so 0.18 and earlier cannot open it" });
+        try std.testing.expect(std.mem.indexOf(u8, info.stdout, "--upgrade-id-keys") == null);
+        var db = try Database.open(lupk.bulk_allocator, path, .{ .config = lupk.legacy_config });
+        defer db.close();
+        try std.testing.expectEqual(lattice.core.id_key.IdKeyOrder.big, db.id_key_order);
+        try lupk.Fingerprint.expectEqual(expected, try lupk.fingerprint(db, built.last_event));
+    }
+
+    // Again on a format-5 file: nothing to upgrade, so nothing to agree to
+    // with --apply, and it still compacts.
+    {
+        const run = try runCli(allocator, &.{ "compact", paths[0], "--upgrade-id-keys" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{ "Id keys are already big-endian (format 5); nothing to upgrade.", "Compacted database" });
+        const json = try runCli(allocator, &.{ "compact", paths[0], "--upgrade-id-keys", "--format=json" });
+        defer json.deinit(allocator);
+        try expectOutput(json, &.{"\"id_keys_upgraded\":false"});
+    }
+}
+
+test "cli: compact --upgrade-id-keys without --apply says what the upgrade costs and changes nothing" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lupk_cli_confirm.ltdb";
+    lupk.cleanup(path);
+    defer lupk.cleanup(path);
+    _ = try lupk.buildLegacy(path, 0);
+    const files = [_][]const u8{ "", "-wal", "-journal", ".upgrade-id-keys" };
+    const before = try lupk.hashFiles(path, &files);
+
+    for ([_][]const []const u8{
+        &.{ "compact", path, "--upgrade-id-keys" },
+        &.{ "compact", path, "--upgrade-id-keys", "--upgrade-indexes", "--format=json" },
+    }) |argv| {
+        const run = try runCli(allocator, argv);
+        defer run.deinit(allocator);
+        const needles = [_][]const u8{
+            path ++ " has not been changed. Upgrading it to format 5 needs --apply.",
+            "It cannot be undone. LatticeDB 0.18 and earlier cannot open",
+            "Replication starts over.",
+            "Replicate to a new, empty directory afterwards.",
+            "room on disk for a second copy",
+            "lattice compact " ++ path ++ " --upgrade-id-keys --apply",
+        };
+        for (needles) |needle| {
+            if (run.succeeded() or run.stdout.len != 0 or std.mem.indexOf(u8, run.stderr, needle) == null) {
+                std.debug.print("expected {s}\nexit {?d}\nstdout: {s}\nstderr: {s}\n", .{ needle, run.exit_code, run.stdout, run.stderr });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // Not the upgrade, and not the rest of compact either.
+        try std.testing.expectEqualSlices(u8, &before, &(try lupk.hashFiles(path, &files)));
+    }
+    {
+        const info = try runCli(allocator, &.{ "info", path });
+        defer info.deinit(allocator);
+        try expectOutput(info, &.{"Id keys:      little-endian"});
+    }
+
+    // --apply on its own asks for nothing.
+    {
+        const run = try runCli(allocator, &.{ "compact", path, "--apply" });
+        defer run.deinit(allocator);
+        try std.testing.expect(!run.succeeded());
+        try std.testing.expect(std.mem.indexOf(u8, run.stderr, "--apply goes with 'compact --upgrade-id-keys'.") != null);
+        try std.testing.expectEqualSlices(u8, &before, &(try lupk.hashFiles(path, &files)));
+    }
+
+    // With it, the same command upgrades.
+    const run = try runCli(allocator, &.{ "compact", path, "--upgrade-id-keys", "--apply" });
+    defer run.deinit(allocator);
+    try expectOutput(run, &.{"Upgraded the id keys of"});
+}
+
+test "cli: compact --upgrade-id-keys finishes the job after an earlier run stopped at any point" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lupk_cli_rerun.ltdb";
+    const upgrade = lattice.storage.id_key_upgrade;
+    const Stop = enum { garbage_copy, unswapped_copy, checked, sidecars_removed, renamed };
+    for (std.enums.values(Stop)) |stop| {
+        lupk.cleanup(path);
+        defer lupk.cleanup(path);
+        const built = try lupk.buildLegacy(path, 0);
+        var expected: lupk.Fingerprint = undefined;
+        {
+            var db = try Database.open(lupk.bulk_allocator, path, .{ .config = lupk.legacy_config });
+            defer db.close();
+            expected = try lupk.fingerprint(db, built.last_event);
+        }
+
+        const copy = path ++ ".upgrade-id-keys";
+        switch (stop) {
+            .garbage_copy => {
+                // A copy cut short, with a log beside it.
+                for ([_][]const u8{ copy, copy ++ "-wal", copy ++ ".partial" }) |name| {
+                    const file = try compat.fs.cwd().createFile(name, .{ .truncate = true });
+                    defer file.close();
+                    try file.pwriteAll("not a database", 0);
+                }
+            },
+            else => {
+                const held = try lupk.upgradeCopyHeld(path, copy);
+                const step: ?upgrade.SwapStep = switch (stop) {
+                    .checked => .checked,
+                    .sidecars_removed => .sidecars_removed,
+                    .renamed => .renamed,
+                    else => null,
+                };
+                if (step) |s| {
+                    try std.testing.expectError(error.StoppedForTesting, upgrade.replaceWithUpgraded(allocator, path, copy, held, s));
+                } else {
+                    // Stopped after the copy was verified, before the swap.
+                    held.unlock();
+                    held.close();
+                }
+            },
+        }
+
+        const run = try runCli(allocator, &.{ "compact", path, "--upgrade-id-keys", "--apply" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{if (stop == .renamed) "Id keys are already big-endian" else "Upgraded the id keys of"});
+        for ([_][]const u8{ copy, copy ++ "-wal", copy ++ ".partial", copy ++ "-journal" }) |name| {
+            try std.testing.expect(!lupk.exists(name));
+        }
+        var db = try Database.open(lupk.bulk_allocator, path, .{ .config = lupk.legacy_config });
+        defer db.close();
+        try std.testing.expectEqual(lattice.core.id_key.IdKeyOrder.big, db.id_key_order);
+        try lupk.Fingerprint.expectEqual(expected, try lupk.fingerprint(db, built.last_event));
+    }
+}
+
+test "cli: a second compact --upgrade-id-keys while the database is in use leaves the first run's copy alone" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lupk_cli_second.ltdb";
+    const copy = path ++ ".upgrade-id-keys";
+    lupk.cleanup(path);
+    defer lupk.cleanup(path);
+    _ = try lupk.buildLegacy(path, 0);
+
+    // The first run holds the database and has a copy in progress.
+    var db = try Database.open(lupk.bulk_allocator, path, .{ .config = lupk.legacy_config });
+    defer db.close();
+    {
+        const file = try compat.fs.cwd().createFile(copy, .{ .truncate = true });
+        defer file.close();
+        try file.pwriteAll("a copy being written", 0);
+    }
+    const before = try lupk.hashFiles(copy, &.{""});
+
+    const run = try runCli(allocator, &.{ "compact", path, "--upgrade-id-keys", "--apply" });
+    defer run.deinit(allocator);
+    try std.testing.expect(!run.succeeded());
+    try std.testing.expect(lupk.exists(copy));
+    try std.testing.expectEqualSlices(u8, &before, &(try lupk.hashFiles(copy, &.{""})));
+    try std.testing.expectEqual(lattice.core.id_key.IdKeyOrder.little, db.id_key_order);
+}
+
+test "cli: replicate says why it refuses a directory made before the id key upgrade" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lupk_cli_repl.ltdb";
+    const dir = "/tmp/lupk_cli_repl_dir";
+    lupk.cleanup(path);
+    compat.fs.cwd().deleteTree(dir) catch {};
+    defer {
+        lupk.cleanup(path);
+        compat.fs.cwd().deleteTree(dir) catch {};
+    }
+    _ = try lupk.buildLegacy(path, 0);
+    {
+        const run = try runCli(allocator, &.{ "replicate", path, "--to=" ++ dir });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{""});
+    }
+    {
+        const run = try runCli(allocator, &.{ "compact", path, "--upgrade-id-keys", "--apply" });
+        defer run.deinit(allocator);
+        try expectOutput(run, &.{"The file has a new id: replicate it to a new directory, not an old one."});
+    }
+    const run = try runCli(allocator, &.{ "replicate", path, "--to=" ++ dir });
+    defer run.deinit(allocator);
+    if (run.succeeded() or std.mem.indexOf(u8, run.stderr, "--upgrade-id-keys") == null) {
+        std.debug.print("exit {?d}\nstdout: {s}\nstderr: {s}\n", .{ run.exit_code, run.stdout, run.stderr });
+        return error.TestUnexpectedResult;
+    }
+}

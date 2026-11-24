@@ -37,10 +37,12 @@ export {
   Value,
   QueryResult,
   StreamRecord,
+  CheckpointStats,
   VectorSearchResult,
   PropertyValue,
   CreateNodeOptions,
   CreateEdgeOptions,
+  DeleteNodeOptions,
   VectorSearchOptions,
   FtsSearchOptions,
 } from './types';
@@ -57,28 +59,35 @@ export {
   isElectronRuntime,
   ELECTRON_ASAR_UNPACK_GLOB,
   LatticeError,
+  LatticeChangesTrimmedError,
+  LatticeErrorCode,
   LatticeQueryError,
   QueryErrorStage,
   QueryErrorLocation,
+  SyncMode,
+  VectorMetric,
+  ChangefeedRetention,
+  ChangefeedStatus,
+  CheckpointMode,
 } from './ffi';
 
 /**
- * @deprecated Use `@hajewski/latticedb/embedding` instead. Earliest removal is v0.6.0.
+ * @deprecated Use `@hajewski/latticedb/embedding` instead.
  */
 export const hashEmbed: typeof embeddingHashEmbed = embeddingHashEmbed;
 
 /**
- * @deprecated Use `@hajewski/latticedb/embedding` instead. Earliest removal is v0.6.0.
+ * @deprecated Use `@hajewski/latticedb/embedding` instead.
  */
 export const EmbeddingClient: typeof EmbeddingClientClass = EmbeddingClientClass;
 
 /**
- * @deprecated Use `@hajewski/latticedb/embedding` instead. Earliest removal is v0.6.0.
+ * @deprecated Use `@hajewski/latticedb/embedding` instead.
  */
 export const EmbeddingApiFormat: typeof embeddingApiFormat = embeddingApiFormat;
 
 /**
- * @deprecated Use `@hajewski/latticedb/embedding` instead. Earliest removal is v0.6.0.
+ * @deprecated Use `@hajewski/latticedb/embedding` instead.
  */
 export type EmbeddingConfig = EmbeddingConfigType;
 
@@ -91,6 +100,6 @@ export function version(): string {
     const { getFFI } = require('./ffi');
     return getFFI().version();
   } catch {
-    return '0.15.0';
+    return '0.18.1';
   }
 }

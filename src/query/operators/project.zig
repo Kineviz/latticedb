@@ -44,6 +44,9 @@ pub const Project = struct {
     output_row: ?*Row,
     /// Whether the input has been opened
     opened: bool,
+    /// Output slots whose item is the variable already in that slot
+    /// (`WITH d`), so a search's distance and score stay with the entity.
+    keeps_marks: u16 = 0,
 
     const Self = @This();
 
@@ -81,6 +84,13 @@ pub const Project = struct {
         // Allocate output row
         self.output_row = ctx.allocRow() catch return OperatorError.OutOfMemory;
 
+        self.keeps_marks = 0;
+        for (self.items) |item| {
+            if (item.expr.* == .variable and ctx.getVariableSlot(item.expr.variable.name) == item.output_slot) {
+                self.keeps_marks |= @as(u16, 1) << @intCast(item.output_slot);
+            }
+        }
+
         // Open the input operator
         try self.input.open(ctx);
         self.opened = true;
@@ -105,13 +115,19 @@ pub const Project = struct {
             };
 
             // Convert result to slot value
-            const slot_value = resultToSlotValue(result, self.evaluator.allocator);
+            const slot_value = resultToSlotValue(result, self.evaluator.allocator) catch return OperatorError.OutOfMemory;
             output_row.setSlot(item.output_slot, slot_value);
 
             // Copy distances and scores from input if this is a passthrough
             if (input_row.hasSlot(item.output_slot)) {
-                output_row.setDistance(item.output_slot, input_row.getDistance(item.output_slot));
-                output_row.setScore(item.output_slot, input_row.getScore(item.output_slot));
+                const s = item.output_slot;
+                output_row.distances[s] = input_row.distances[s];
+                output_row.scores[s] = input_row.scores[s];
+                // What a search measured stays with its entity only when the
+                // item is that variable, kept in its slot (`WITH d`).
+                if (self.keeps_marks & (@as(u16, 1) << @intCast(s)) != 0) {
+                    output_row.copySearchMarks(input_row, s);
+                }
             }
         }
 
@@ -141,9 +157,9 @@ pub const Project = struct {
 };
 
 /// Convert an EvalResult to a SlotValue
-fn resultToSlotValue(result: EvalResult, allocator: Allocator) SlotValue {
+fn resultToSlotValue(result: EvalResult, allocator: Allocator) Allocator.Error!SlotValue {
     return switch (result) {
-        .null_val => .{ .empty = {} },
+        .null_val => .{ .property = .{ .null_val = {} } },
         .node_ref => |id| .{ .node_ref = id },
         .edge_ref => |id| .{ .edge_ref = id },
         .bool_val => |b| .{ .property = .{ .bool_val = b } },
@@ -152,8 +168,8 @@ fn resultToSlotValue(result: EvalResult, allocator: Allocator) SlotValue {
         .string_val => |s| .{ .property = .{ .string_val = s } },
         .bytes_val => |b| .{ .property = .{ .bytes_val = b } },
         .vector_val => |v| .{ .property = .{ .vector_val = v } },
-        .list_val => .{ .property = result.toPropertyValue(allocator) },
-        .map_val => .{ .property = result.toPropertyValue(allocator) },
+        .list_val, .map_val => try result.containerToSlotValue(allocator),
+        .path_val => |p| .{ .path = p },
     };
 }
 
@@ -164,6 +180,7 @@ fn mapEvalError(err: EvalError) OperatorError {
         EvalError.TypeError => OperatorError.TypeError,
         EvalError.UnboundVariable => OperatorError.UnboundVariable,
         EvalError.PropertyNotFound => OperatorError.PropertyNotFound,
+        EvalError.StorageError => OperatorError.StorageError,
         else => OperatorError.EvaluationError,
     };
 }
@@ -182,13 +199,13 @@ test "Project basic structure" {
 }
 
 test "resultToSlotValue conversions" {
-    const node_slot = resultToSlotValue(.{ .node_ref = 123 }, std.testing.allocator);
+    const node_slot = try resultToSlotValue(.{ .node_ref = 123 }, std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 123), node_slot.asNodeId().?);
 
-    const bool_slot = resultToSlotValue(.{ .bool_val = true }, std.testing.allocator);
+    const bool_slot = try resultToSlotValue(.{ .bool_val = true }, std.testing.allocator);
     try std.testing.expectEqual(true, bool_slot.asProperty().?.bool_val);
 
-    const int_slot = resultToSlotValue(.{ .int_val = 42 }, std.testing.allocator);
+    const int_slot = try resultToSlotValue(.{ .int_val = 42 }, std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 42), int_slot.asProperty().?.int_val);
 }
 
@@ -202,7 +219,7 @@ test "resultToSlotValue converts list to property" {
     };
     const list_result = EvalResult{ .list_val = &items };
 
-    const slot = resultToSlotValue(list_result, allocator);
+    const slot = try resultToSlotValue(list_result, allocator);
     defer allocator.free(slot.asProperty().?.list_val);
 
     const prop = slot.asProperty().?;
@@ -216,7 +233,7 @@ test "resultToSlotValue converts vector to property" {
     const vec = [_]f32{ 1.0, 2.0, 3.0 };
     const vec_result = EvalResult{ .vector_val = &vec };
 
-    const slot = resultToSlotValue(vec_result, std.testing.allocator);
+    const slot = try resultToSlotValue(vec_result, std.testing.allocator);
 
     const prop = slot.asProperty().?;
     try std.testing.expectEqual(@as(usize, 3), prop.vector_val.len);
@@ -234,7 +251,7 @@ test "resultToSlotValue converts map to property" {
     };
     const map_result = EvalResult{ .map_val = &entries };
 
-    const slot = resultToSlotValue(map_result, allocator);
+    const slot = try resultToSlotValue(map_result, allocator);
     defer allocator.free(slot.asProperty().?.map_val);
 
     const prop = slot.asProperty().?;
@@ -245,7 +262,10 @@ test "resultToSlotValue converts map to property" {
     try std.testing.expectEqual(true, prop.map_val[1].value.bool_val);
 }
 
-test "resultToSlotValue null produces empty slot" {
-    const slot = resultToSlotValue(.{ .null_val = {} }, std.testing.allocator);
-    try std.testing.expect(slot.isEmpty());
+test "resultToSlotValue stores null as a bound null, not an empty slot" {
+    // An empty slot means "never bound", which reading it reports as an error.
+    // A projected null is bound, so it has to read back as null.
+    const slot = try resultToSlotValue(.{ .null_val = {} }, std.testing.allocator);
+    try std.testing.expect(!slot.isEmpty());
+    try std.testing.expect(slot.asProperty().? == .null_val);
 }

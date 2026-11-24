@@ -27,6 +27,17 @@ const (
 	ErrorUnsupported     ErrorCode = ErrorCode(cgobridge.ErrorUnsupported)
 	ErrorValueTooLarge   ErrorCode = ErrorCode(cgobridge.ErrorValueTooLarge)
 	ErrorDatabaseLocked  ErrorCode = ErrorCode(cgobridge.ErrorDatabaseLocked)
+	// ErrorHasRelationships: DeleteNode refused a node that still has
+	// relationships. DetachDeleteNode deletes them with it.
+	ErrorHasRelationships ErrorCode = ErrorCode(cgobridge.ErrorHasRelationships)
+	// ErrorConfigMismatch: the open options contradict the vector index the
+	// database file records (dimensions, metric, VectorM or
+	// VectorEfConstruction).
+	ErrorConfigMismatch ErrorCode = ErrorCode(cgobridge.ErrorConfigMismatch)
+	// ErrorNeedsNewerWriter: the file was written by a newer release that
+	// does not let this one write it. It opens with ReadOnly set; a writable
+	// open writes nothing.
+	ErrorNeedsNewerWriter ErrorCode = ErrorCode(cgobridge.ErrorNeedsNewerWriter)
 )
 
 type QueryErrorStage int
@@ -114,5 +125,18 @@ func wrapError(err error) error {
 		}
 	}
 
+	return err
+}
+
+// wrapVectorError is wrapError for a call that needs the vector index. On a
+// database created without one the code is ErrorUnsupported (ErrorIO before
+// 0.18.1), and the library's text for that code does not say why.
+func wrapVectorError(err error, action string) error {
+	err = wrapError(err)
+	var latticeErr *Error
+	if errors.As(err, &latticeErr) && latticeErr.Code == ErrorUnsupported {
+		return &Error{Code: ErrorUnsupported, Message: "cannot " + action + ": the database was created " +
+			"without a vector index; open it with EnableVectors and VectorDimensions to add one"}
+	}
 	return err
 }

@@ -81,10 +81,22 @@ LatticeDB uses a write-ahead log (WAL) for crash recovery:
 
 1. Changes are written to the WAL before being applied to data pages
 2. Commit means the WAL record is on disk (a fast sequential write)
-3. Data pages are written lazily during checkpointing
+3. Data pages are written later, all together: at checkpoints, at close, on `sync()`
 4. On crash, the WAL is replayed to recover committed transactions
 
-This means committed data survives process crashes and power failures.
+A commit that has returned survives the process crashing. Surviving a power cut as
+well depends on the settings: the default sync mode waits for the disk on every
+commit, `sync_mode` `normal` does not, and on macOS the disk's own cache is flushed
+only with `full_fsync` on. Both are open options in every API, and the
+`LATTICE_SYNC_MODE` and `LATTICE_FULL_FSYNC` environment variables apply when a
+program does not set them. A transaction is never applied in part, after a crash or
+a power cut. See [Durability and the Log](../configuration/durability.md#what-survives-what).
+
+A database opened without the log (`enable_wal = false`) has the same
+transactions: they commit and roll back, and a writing query is all or nothing.
+What changes is durability: a commit survives a crash only once a flush has
+written it to the file. See
+[Running without the log](../configuration/durability.md#running-without-the-log).
 
 ## Concurrency
 
@@ -115,7 +127,7 @@ run alongside the writer.
 |----------|--------------|
 | C | `LATTICE_ERROR_LOCK_TIMEOUT` (`-8`) returned from `lattice_begin` |
 | Python | `LatticeLockTimeoutError` raised |
-| TypeScript | `LatticeError` thrown, with `.code === LatticeErrorCode.LockTimeout` |
+| TypeScript | `LatticeError` thrown, with `.code === -8` |
 | Go | `ErrorLockTimeout` on the returned error's `Code` |
 
 The name says "lock timeout", which is a slightly misleading inheritance from the error
@@ -206,9 +218,9 @@ Error: social.lattice is open in another process. Close it first, or pass
 
 | Language | What you get |
 |----------|--------------|
-| C | `LATTICE_ERROR_DATABASE_LOCKED` (`-16`) returned from `lattice_open_v4` |
+| C | `LATTICE_ERROR_DATABASE_LOCKED` (`-16`) returned from `lattice_open_v5` (and the older open functions) |
 | Python | `LatticeDatabaseLockedError` raised |
-| TypeScript | `LatticeError` thrown, with `.code === LatticeErrorCode.DatabaseLocked` |
+| TypeScript | `LatticeError` thrown, with `.code === -16` |
 | Go | `ErrorDatabaseLocked` on the returned error's `Code` |
 | Zig | `DatabaseError.DatabaseLocked` from `Database.open` |
 
@@ -220,10 +232,13 @@ means the database belongs to a different process entirely.
 
 It would be convenient to let another process read while yours writes, and it
 would also be wrong. A reader in another process cannot see the writer's buffered
-pages, and a read-only handle does not open the write-ahead log at all. What it
-would read is a stale version of the file that a checkpoint may be rewriting
-underneath it, which can produce a structurally inconsistent view rather than
-merely an out-of-date one.
+pages or the commits it has not yet folded into the file. What it would read is a
+version of the file that a checkpoint may be rewriting underneath it, which can
+produce a structurally inconsistent view rather than merely an out-of-date one.
+
+After a crash, when no writer holds the database, a read-only open does see every
+committed transaction: it replays the log in memory, without writing to the files.
+See [Durability and the Log](../configuration/durability.md#opening-read-only-after-a-crash).
 
 The lock does not create that restriction. It reports it.
 

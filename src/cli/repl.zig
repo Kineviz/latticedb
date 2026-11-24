@@ -169,6 +169,14 @@ pub const Repl = struct {
         var in_multiline = false;
 
         while (self.running) {
+            // Both writers are buffered by the caller and a buffer only drains
+            // when it fills or the process exits, so whatever the last command
+            // printed has to be pushed out before waiting for the next one.
+            // Standard output goes first so an error lands after the results it
+            // interrupted, and the prompt after both.
+            try stdout.flush();
+            try stderr.flush();
+
             const action = try self.readLine(in_multiline, &line_buf, stdout);
             switch (action) {
                 .eof => {
@@ -245,6 +253,7 @@ pub const Repl = struct {
 
         if (!term.stdinIsTty()) {
             try stdout.writeAll(prompt);
+            try stdout.flush();
             readLineFromStdin(line_buf, 65536) catch |err| {
                 if (err == error.EndOfStream) return .eof;
                 return err;
@@ -274,6 +283,8 @@ pub const Repl = struct {
         var keys = key_mod.Reader(term.Source).init(&source);
 
         while (true) {
+            // The prompt, the echo of the last key, or the redraw it caused.
+            try stdout.flush();
             switch (try keys.readKey()) {
                 .eof => return .eof,
                 .enter => {
@@ -646,7 +657,7 @@ pub const Repl = struct {
         for (result.columns, 0..) |col, i| {
             try stdout.writeByte(' ');
             try stdout.writeAll(col);
-            const padding = col_widths[i] - col.len;
+            const padding = col_widths[i] -| col.len;
             for (0..padding) |_| try stdout.writeByte(' ');
             try stdout.writeAll(" │");
         }
@@ -661,7 +672,7 @@ pub const Repl = struct {
                 if (i < col_widths.len) {
                     try stdout.writeByte(' ');
                     const written = try self.writeValue(stdout, val);
-                    const padding = col_widths[i] - written;
+                    const padding = col_widths[i] -| written;
                     for (0..padding) |_| try stdout.writeByte(' ');
                     try stdout.writeAll(" │");
                 }
@@ -713,15 +724,20 @@ pub const Repl = struct {
             .bool_val => |b| if (b) 4 else 5, // "true" or "false"
             .int_val => |i| blk: {
                 if (i == 0) break :blk 1;
-                var n = if (i < 0) @as(u64, @intCast(-i)) else @as(u64, @intCast(i));
+                var n: u64 = @abs(i);
                 var len: usize = if (i < 0) 1 else 0;
                 while (n > 0) : (n /= 10) len += 1;
                 break :blk len;
             },
-            .float_val => 10, // Approximate
+            // Measured the way it is written. A guess narrower than the
+            // text made the padding that follows it underflow.
+            .float_val => |f| blk: {
+                var buf: [FLOAT_DISPLAY_MAX]u8 = undefined;
+                break :blk formatTableFloat(&buf, f).len;
+            },
             .string_val => |s| s.len + 2, // Include quotes
-            .node_id => 12, // "Node(xxxxx)"
-            .edge_id => 12, // "Edge(xxxxx)"
+            .node_id => |id| 6 + countDigits(id), // "Node(N)"
+            .edge_id => |id| 6 + countDigits(id), // "Edge(N)"
             .bytes_val => |b| 10 + countDigits(b.len), // "<bytes:N>"
             .vector_val => |v| 10 + countDigits(v.len), // "<vector:N>"
             .list_val => |list| blk: {
@@ -768,8 +784,8 @@ pub const Repl = struct {
                 return slice.len;
             },
             .float_val => |f| {
-                var buf: [32]u8 = undefined;
-                const slice = std.fmt.bufPrint(&buf, "{d:.6}", .{f}) catch return 0;
+                var buf: [FLOAT_DISPLAY_MAX]u8 = undefined;
+                const slice = formatTableFloat(&buf, f);
                 try writer.writeAll(slice);
                 return slice.len;
             },
@@ -842,55 +858,12 @@ pub const Repl = struct {
     /// Display result as JSON
     fn displayResultJson(self: *Self, result: *QueryResult, stdout: anytype) !void {
         _ = self;
-        try stdout.writeAll("{\"columns\":[");
-
-        for (result.columns, 0..) |col, i| {
-            if (i > 0) try stdout.writeByte(',');
-            try stdout.writeByte('"');
-            try stdout.writeAll(col);
-            try stdout.writeByte('"');
-        }
-
-        try stdout.writeAll("],\"rows\":[");
-
-        for (result.rows, 0..) |row, row_idx| {
-            if (row_idx > 0) try stdout.writeByte(',');
-            try stdout.writeByte('{');
-
-            for (row.values, 0..) |val, i| {
-                if (i > 0) try stdout.writeByte(',');
-                try stdout.writeByte('"');
-                if (i < result.columns.len) {
-                    try stdout.writeAll(result.columns[i]);
-                }
-                try stdout.writeAll("\":");
-                try writeJsonValue(stdout, val);
-            }
-
-            try stdout.writeByte('}');
-        }
-
-        try stdout.print("],\"count\":{d}}}\n", .{result.rows.len});
+        try writeResultJson(stdout, result);
     }
 
     /// Display result as CSV
     fn displayResultCsv(self: *Self, result: *QueryResult, stdout: anytype) !void {
-        _ = self;
-        // Header
-        for (result.columns, 0..) |col, i| {
-            if (i > 0) try stdout.writeByte(',');
-            try stdout.writeAll(col);
-        }
-        try stdout.writeByte('\n');
-
-        // Rows
-        for (result.rows) |row| {
-            for (row.values, 0..) |val, i| {
-                if (i > 0) try stdout.writeByte(',');
-                try writeCsvValue(stdout, val);
-            }
-            try stdout.writeByte('\n');
-        }
+        try writeResultCsv(self.allocator, stdout, result);
     }
 
     fn showLabels(self: *Self, stdout: anytype, stderr: anytype) !void {
@@ -1036,8 +1009,36 @@ pub const Repl = struct {
     }
 };
 
+/// Room for any float `formatTableFloat` writes.
+const FLOAT_DISPLAY_MAX = 64;
+
+/// A float as a table cell shows it: six decimals at ordinary magnitudes,
+/// and the shortest scientific form that reads back as the same number
+/// where six decimals would run to hundreds of digits (1e300) or show a
+/// non-zero number as 0.000000 (1e-300). JSON and CSV output are not
+/// affected; they print every float in full.
+fn formatTableFloat(buf: *[FLOAT_DISPLAY_MAX]u8, f: f64) []const u8 {
+    if (nonFiniteName(f)) |name| return name;
+    const magnitude = @abs(f);
+    const scientific = std.math.isFinite(f) and f != 0 and (magnitude >= 1e16 or magnitude < 1e-6);
+    const written = if (scientific)
+        std.fmt.bufPrint(buf, "{e}", .{f})
+    else
+        std.fmt.bufPrint(buf, "{d:.6}", .{f});
+    return written catch unreachable; // 1e16 has 17 digits before the point
+}
+
+/// What NaN and the infinities are written as in every output format: the
+/// spellings `toFloat` reads and a JSON export's `$float` carries, so a value
+/// printed here can be given back. Null for an ordinary number.
+fn nonFiniteName(f: f64) ?[]const u8 {
+    if (std.math.isNan(f)) return "NaN";
+    if (std.math.isInf(f)) return if (f > 0) "Infinity" else "-Infinity";
+    return null;
+}
+
 /// Count decimal digits in a number
-fn countDigits(n: usize) usize {
+fn countDigits(n: u64) usize {
     if (n == 0) return 1;
     var count: usize = 0;
     var val = n;
@@ -1051,21 +1052,15 @@ fn writeJsonValue(writer: anytype, val: ResultValue) !void {
         .null_val => try writer.writeAll("null"),
         .bool_val => |b| try writer.writeAll(if (b) "true" else "false"),
         .int_val => |i| try writer.print("{d}", .{i}),
-        .float_val => |f| try writer.print("{d}", .{f}),
-        .string_val => |s| {
-            try writer.writeByte('"');
-            for (s) |c| {
-                switch (c) {
-                    '"' => try writer.writeAll("\\\""),
-                    '\\' => try writer.writeAll("\\\\"),
-                    '\n' => try writer.writeAll("\\n"),
-                    '\r' => try writer.writeAll("\\r"),
-                    '\t' => try writer.writeAll("\\t"),
-                    else => try writer.writeByte(c),
-                }
-            }
-            try writer.writeByte('"');
+        // JSON has no number for NaN or an infinity, and a bare `nan` or
+        // `inf` makes the whole document unreadable. A string keeps which
+        // of the three it was; null would read as a value that is absent.
+        .float_val => |f| if (nonFiniteName(f)) |name| {
+            try writer.print("\"{s}\"", .{name});
+        } else {
+            try writer.print("{d}", .{f});
         },
+        .string_val => |s| try writeJsonString(writer, s),
         .node_id => |id| try writer.print("{d}", .{id}),
         .edge_id => |id| try writer.print("{d}", .{id}),
         .bytes_val => |b| {
@@ -1092,7 +1087,8 @@ fn writeJsonValue(writer: anytype, val: ResultValue) !void {
             try writer.writeByte('{');
             for (map, 0..) |entry, i| {
                 if (i > 0) try writer.writeByte(',');
-                try writer.print("\"{s}\":", .{entry.key});
+                try writeJsonString(writer, entry.key);
+                try writer.writeByte(':');
                 try writeJsonValue(writer, entry.value);
             }
             try writer.writeByte('}');
@@ -1100,46 +1096,118 @@ fn writeJsonValue(writer: anytype, val: ResultValue) !void {
     }
 }
 
+/// Write a result as JSON: the column names, then each row as an object
+/// keyed by them, then the row count.
+fn writeResultJson(writer: anytype, result: *const QueryResult) !void {
+    try writer.writeAll("{\"columns\":[");
+
+    for (result.columns, 0..) |col, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeJsonString(writer, col);
+    }
+
+    try writer.writeAll("],\"rows\":[");
+
+    for (result.rows, 0..) |row, row_idx| {
+        if (row_idx > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+
+        for (row.values, 0..) |val, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeJsonString(writer, if (i < result.columns.len) result.columns[i] else "");
+            try writer.writeByte(':');
+            try writeJsonValue(writer, val);
+        }
+
+        try writer.writeByte('}');
+    }
+
+    try writer.print("],\"count\":{d}}}\n", .{result.rows.len});
+}
+
+/// A JSON string: quotes, backslashes and control characters escaped.
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20)
+                try writer.print("\\u{x:0>4}", .{c})
+            else
+                try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+/// Write a result as CSV, as RFC 4180 has it: a header of the column
+/// names, then a line per row, with any field that holds a comma, a quote
+/// or a line break quoted and each quote in it doubled. A query that
+/// returns nothing, such as a bare CREATE, writes nothing, not even a
+/// header.
+fn writeResultCsv(allocator: std.mem.Allocator, writer: anytype, result: *const QueryResult) !void {
+    if (result.columns.len == 0) return;
+    for (result.columns, 0..) |col, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeCsvField(writer, col);
+    }
+    try writer.writeByte('\n');
+
+    for (result.rows) |row| {
+        for (row.values, 0..) |val, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeCsvValue(allocator, writer, val);
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+/// A CSV field, quoted when it has to be.
+fn writeCsvField(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        if (c == ',' or c == '"' or c == '\n' or c == '\r') return writeCsvQuoted(writer, s);
+    }
+    try writer.writeAll(s);
+}
+
+/// A CSV field in quotes, with each quote in it doubled.
+fn writeCsvQuoted(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        if (c == '"') try writer.writeByte('"');
+        try writer.writeByte(c);
+    }
+    try writer.writeByte('"');
+}
+
 /// Write a value as CSV
-fn writeCsvValue(writer: anytype, val: ResultValue) !void {
+fn writeCsvValue(allocator: std.mem.Allocator, writer: anytype, val: ResultValue) !void {
     switch (val) {
         .null_val => {},
         .bool_val => |b| try writer.writeAll(if (b) "true" else "false"),
         .int_val => |i| try writer.print("{d}", .{i}),
-        .float_val => |f| try writer.print("{d}", .{f}),
-        .string_val => |s| {
-            // Quote if contains comma, quote, or newline
-            var needs_quote = false;
-            for (s) |c| {
-                if (c == ',' or c == '"' or c == '\n' or c == '\r') {
-                    needs_quote = true;
-                    break;
-                }
-            }
-
-            if (needs_quote) {
-                try writer.writeByte('"');
-                for (s) |c| {
-                    if (c == '"') {
-                        try writer.writeAll("\"\"");
-                    } else {
-                        try writer.writeByte(c);
-                    }
-                }
-                try writer.writeByte('"');
-            } else {
-                try writer.writeAll(s);
-            }
+        .float_val => |f| if (nonFiniteName(f)) |name| {
+            try writer.writeAll(name);
+        } else {
+            try writer.print("{d}", .{f});
         },
+        .string_val => |s| try writeCsvField(writer, s),
         .node_id => |id| try writer.print("{d}", .{id}),
         .edge_id => |id| try writer.print("{d}", .{id}),
         .bytes_val => |b| try writer.print("<bytes:{d}>", .{b.len}),
         .vector_val => |v| try writer.print("<vector:{d}>", .{v.len}),
         .list_val, .map_val => {
-            // For CSV, output complex types as quoted JSON
-            try writer.writeByte('"');
-            try writeJsonValue(writer, val);
-            try writer.writeByte('"');
+            // As JSON, whose quotes are doubled like any other: written
+            // between quotes as they were, `{"k":"v"}` ended the field at
+            // the first quote inside it.
+            var json: std.Io.Writer.Allocating = .init(allocator);
+            defer json.deinit();
+            try writeJsonValue(&json.writer, val);
+            try writeCsvQuoted(writer, json.written());
         },
     }
 }
@@ -1149,4 +1217,89 @@ test "repl initialization" {
     const allocator = std.testing.allocator;
     _ = allocator;
     // Can't easily test full REPL without a database, but struct creation works
+}
+
+test "results in CSV quote what RFC 4180 says to, inside lists and maps too" {
+    const a = std.testing.allocator;
+    var columns = [_][]const u8{ "a,b", "say \"x\"", "m", "l" };
+    const entries = [_]ResultValue.MapEntry{
+        .{ .key = "k", .value = .{ .string_val = "say \"hi\"" } },
+        .{ .key = "odd\"key", .value = .{ .int_val = 1 } },
+    };
+    const list = [_]ResultValue{ .{ .string_val = "q" }, .{ .int_val = 1 } };
+    var values = [_]ResultValue{
+        .{ .string_val = "x,y" },
+        .{ .string_val = "plain" },
+        .{ .map_val = &entries },
+        .{ .list_val = &list },
+    };
+    var rows = [_]lattice.storage.database.ResultRow{.{ .values = &values }};
+    const result: QueryResult = .{ .columns = &columns, .rows = &rows, .allocator = a };
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    // A map was written between quotes with its own quotes as they were,
+    // "{"k":...}", which ends the field at the second character.
+    try writeResultCsv(a, &out.writer, &result);
+    try std.testing.expectEqualStrings("\"a,b\",\"say \"\"x\"\"\",m,l\n\"x,y\",plain,\"{\"\"k\"\":\"\"say \\\"\"hi\\\"\"\"\",\"\"odd\\\"\"key\"\":1}\",\"[\"\"q\"\",1]\"\n", out.written());
+
+    // The JSON escapes column names and map keys as it does strings.
+    out.clearRetainingCapacity();
+    try writeResultJson(&out.writer, &result);
+    try std.testing.expectEqualStrings("{\"columns\":[\"a,b\",\"say \\\"x\\\"\",\"m\",\"l\"],\"rows\":[{\"a,b\":\"x,y\",\"say \\\"x\\\"\":\"plain\",\"m\":{\"k\":\"say \\\"hi\\\"\",\"odd\\\"key\":1},\"l\":[\"q\",1]}],\"count\":1}\n", out.written());
+    out.clearRetainingCapacity();
+    try writeJsonValue(&out.writer, .{ .string_val = "tab\there\x01" });
+    try std.testing.expectEqualStrings("\"tab\\there\\u0001\"", out.written());
+
+    // A query that returns nothing writes nothing.
+    var no_columns = [_][]const u8{};
+    var no_rows = [_]lattice.storage.database.ResultRow{};
+    out.clearRetainingCapacity();
+    try writeResultCsv(a, &out.writer, &.{ .columns = &no_columns, .rows = &no_rows, .allocator = a });
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+test "table cells write huge and tiny floats in scientific form" {
+    var buf: [FLOAT_DISPLAY_MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("0.100000", formatTableFloat(&buf, 0.1));
+    try std.testing.expectEqualStrings("0.000000", formatTableFloat(&buf, 0));
+    try std.testing.expectEqualStrings("-12345.500000", formatTableFloat(&buf, -12345.5));
+    try std.testing.expectEqualStrings("9999999999999998.000000", formatTableFloat(&buf, 9999999999999998.0));
+    // Six decimals wrote 1e300 as 301 digits and 1e-300 as 0.000000.
+    try std.testing.expectEqualStrings("1e300", formatTableFloat(&buf, 1e300));
+    try std.testing.expectEqualStrings("-1.5e-300", formatTableFloat(&buf, -1.5e-300));
+    try std.testing.expectEqualStrings("1.7976931348623157e308", formatTableFloat(&buf, std.math.floatMax(f64)));
+    try std.testing.expectEqualStrings("Infinity", formatTableFloat(&buf, std.math.inf(f64)));
+    try std.testing.expectEqualStrings("-Infinity", formatTableFloat(&buf, -std.math.inf(f64)));
+    try std.testing.expectEqualStrings("NaN", formatTableFloat(&buf, std.math.nan(f64)));
+}
+
+test "NaN and the infinities are written so that JSON output stays JSON" {
+    const a = std.testing.allocator;
+    var columns = [_][]const u8{ "nan", "up", "down", "plain", "l", "m" };
+    const list = [_]ResultValue{ .{ .float_val = std.math.nan(f64) }, .{ .float_val = 2.5 } };
+    const entries = [_]ResultValue.MapEntry{.{ .key = "k", .value = .{ .float_val = -std.math.inf(f64) } }};
+    var values = [_]ResultValue{
+        .{ .float_val = std.math.nan(f64) },
+        .{ .float_val = std.math.inf(f64) },
+        .{ .float_val = -std.math.inf(f64) },
+        .{ .float_val = 1.5 },
+        .{ .list_val = &list },
+        .{ .map_val = &entries },
+    };
+    var rows = [_]lattice.storage.database.ResultRow{.{ .values = &values }};
+    const result: QueryResult = .{ .columns = &columns, .rows = &rows, .allocator = a };
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    // These were written as nan, inf and -inf, which no JSON parser accepts.
+    try writeResultJson(&out.writer, &result);
+    try std.testing.expectEqualStrings("{\"columns\":[\"nan\",\"up\",\"down\",\"plain\",\"l\",\"m\"],\"rows\":[{\"nan\":\"NaN\",\"up\":\"Infinity\",\"down\":\"-Infinity\",\"plain\":1.5,\"l\":[\"NaN\",2.5],\"m\":{\"k\":\"-Infinity\"}}],\"count\":1}\n", out.written());
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
+    parsed.deinit();
+
+    // CSV and the table use the same three words.
+    out.clearRetainingCapacity();
+    try writeResultCsv(a, &out.writer, &result);
+    try std.testing.expectEqualStrings("nan,up,down,plain,l,m\nNaN,Infinity,-Infinity,1.5,\"[\"\"NaN\"\",2.5]\",\"{\"\"k\"\":\"\"-Infinity\"\"}\"\n", out.written());
 }

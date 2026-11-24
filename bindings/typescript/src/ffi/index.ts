@@ -11,8 +11,13 @@ import {
   QueryErrorStage,
   LatticeTxnMode,
   LatticeValueType,
+  LatticeSyncMode,
+  LatticeFullFsync,
+  LatticeVectorMetric,
+  LatticeChangefeedRetention,
+  LatticeCheckpointMode,
 } from './types';
-import type { PropertyValue, StreamRecord } from '../types';
+import type { CheckpointStats, PropertyValue, StreamRecord } from '../types';
 
 export {
   isLibraryAvailable,
@@ -21,7 +26,22 @@ export {
   isElectronRuntime,
   ELECTRON_ASAR_UNPACK_GLOB,
 } from './library';
-export { LatticeErrorCode, QueryErrorStage, LatticeTxnMode, LatticeValueType } from './types';
+export {
+  LatticeErrorCode,
+  QueryErrorStage,
+  LatticeTxnMode,
+  LatticeValueType,
+  LatticeSyncMode,
+  LatticeFullFsync,
+  LatticeVectorMetric,
+  LatticeChangefeedRetention,
+  LatticeCheckpointMode,
+} from './types';
+
+/** Why a vector call fails on a database that has no vector index. */
+const NO_VECTOR_INDEX_MESSAGE =
+  'the database was created without a vector index; open it with enableVectors: true and ' +
+  'vectorDimensions to add one';
 
 /**
  * Error class for Lattice operations.
@@ -33,6 +53,19 @@ export class LatticeError extends Error {
   ) {
     super(message);
     this.name = 'LatticeError';
+  }
+}
+
+/**
+ * The changefeed no longer holds the events after the position read from:
+ * its retention policy, or a trim, dropped them, so the reader has missed
+ * changes. Reading from `afterSequence: 0n` starts at the oldest event held.
+ * Its code is `LatticeErrorCode.NotFound`.
+ */
+export class LatticeChangesTrimmedError extends LatticeError {
+  constructor(message: string) {
+    super(message, LatticeErrorCode.NotFound);
+    this.name = 'LatticeChangesTrimmedError';
   }
 }
 
@@ -107,6 +140,174 @@ export type StreamBatchHandle = unknown;
 export type EmbeddingClientHandle = unknown;
 
 /**
+ * When a commit waits for the disk: `'full'` syncs the log on every commit;
+ * `'normal'` hands it to the operating system and returns.
+ */
+export type SyncMode = 'full' | 'normal';
+
+/**
+ * How a vector index measures distance.
+ */
+export type VectorMetric = 'cosine' | 'euclidean' | 'dot_product';
+
+/**
+ * How much of the changefeed to keep: `'all'`, `'off'`, `'last:<events>'`, or
+ * `'age:<duration>'` with a duration such as `'500ms'`, `'90s'`, `'30m'`,
+ * `'12h'` or `'7d'`.
+ */
+export type ChangefeedRetention = 'all' | 'off' | `last:${number}` | `age:${string}`;
+
+/**
+ * The changefeed's retention policy and the events it holds.
+ */
+export interface ChangefeedStatus {
+  /** The policy in force, in the form `ChangefeedRetention` takes. */
+  retention: ChangefeedRetention;
+  /** The oldest event held, or null when the changefeed holds none. */
+  oldestSequence: bigint | null;
+  /** The last sequence handed to an event, 0n if none ever was. */
+  lastSequence: bigint;
+}
+
+const U64_MAX = (BigInt(1) << BigInt(64)) - BigInt(1);
+// Longest suffix first, so "ms" is not read as "s".
+const DURATION_UNITS: Array<[string, bigint]> = [
+  ['ms', BigInt(1)],
+  ['s', BigInt(1000)],
+  ['m', BigInt(60_000)],
+  ['h', BigInt(3_600_000)],
+  ['d', BigInt(86_400_000)],
+];
+
+/** Turn a policy such as `'last:1000'` into the C API's mode and value. */
+export function changefeedRetentionCode(policy: ChangefeedRetention | undefined): [number, bigint] {
+  if (policy === undefined) {
+    return [LatticeChangefeedRetention.Default, BigInt(0)];
+  }
+  if (typeof policy === 'string') {
+    const lowered = policy.toLowerCase();
+    if (lowered === 'all') {
+      return [LatticeChangefeedRetention.All, BigInt(0)];
+    }
+    if (lowered === 'off') {
+      return [LatticeChangefeedRetention.Off, BigInt(0)];
+    }
+    if (policy.startsWith('last:')) {
+      const digits = policy.slice(5);
+      if (/^[0-9]+$/.test(digits)) {
+        const n = BigInt(digits);
+        if (n > BigInt(0) && n <= U64_MAX) {
+          return [LatticeChangefeedRetention.Last, n];
+        }
+      }
+    } else if (policy.startsWith('age:')) {
+      const text = policy.slice(4);
+      for (const [suffix, ms] of DURATION_UNITS) {
+        const number = text.slice(0, text.length - suffix.length);
+        if (text.endsWith(suffix) && /^[0-9]+$/.test(number)) {
+          const value = BigInt(number) * ms;
+          if (value > BigInt(0) && value <= U64_MAX) {
+            return [LatticeChangefeedRetention.Age, value];
+          }
+          break;
+        }
+      }
+    }
+  }
+  throw new TypeError(
+    "changefeedRetention must be 'all', 'off', 'last:<events>' or 'age:<duration>' " +
+      `(such as 'age:7d', 'age:12h', 'age:500ms'), not ${String(policy)}`
+  );
+}
+
+function changefeedRetentionText(mode: number, value: bigint): ChangefeedRetention {
+  switch (mode) {
+    case LatticeChangefeedRetention.Off:
+      return 'off';
+    case LatticeChangefeedRetention.Last:
+      return `last:${value}` as ChangefeedRetention;
+    case LatticeChangefeedRetention.Age: {
+      for (const [suffix, ms] of DURATION_UNITS.slice(1).reverse()) {
+        if (value % ms === BigInt(0)) {
+          return `age:${value / ms}${suffix}` as ChangefeedRetention;
+        }
+      }
+      return `age:${value}ms` as ChangefeedRetention;
+    }
+    default:
+      return 'all';
+  }
+}
+
+/**
+ * How a checkpoint folds the log into the database file. `'passive'` writes
+ * the changed pages unless one is in use, and leaves the log in place;
+ * `'full'` writes every changed page and leaves the log in place;
+ * `'truncate'` does what `'full'` does and then empties the log.
+ */
+export type CheckpointMode = 'passive' | 'full' | 'truncate';
+
+function syncModeCode(mode: SyncMode | undefined): number {
+  switch (mode) {
+    case undefined:
+      return LatticeSyncMode.Default;
+    case 'full':
+      return LatticeSyncMode.Full;
+    case 'normal':
+      return LatticeSyncMode.Normal;
+    default:
+      throw new TypeError(`syncMode must be 'full' or 'normal', not ${String(mode)}`);
+  }
+}
+
+function fullFsyncCode(fullFsync: boolean | undefined): number {
+  if (fullFsync === undefined) {
+    return LatticeFullFsync.Default;
+  }
+  return fullFsync ? LatticeFullFsync.On : LatticeFullFsync.Off;
+}
+
+function vectorMetricCode(metric: VectorMetric | undefined): number {
+  switch (metric) {
+    case undefined:
+      return LatticeVectorMetric.Default;
+    case 'cosine':
+      return LatticeVectorMetric.Cosine;
+    case 'euclidean':
+      return LatticeVectorMetric.Euclidean;
+    case 'dot_product':
+      return LatticeVectorMetric.DotProduct;
+    default:
+      throw new TypeError(
+        `vectorMetric must be 'cosine', 'euclidean' or 'dot_product', not ${String(metric)}`
+      );
+  }
+}
+
+function checkpointModeCode(mode: CheckpointMode): number {
+  switch (mode) {
+    case 'passive':
+      return LatticeCheckpointMode.Passive;
+    case 'full':
+      return LatticeCheckpointMode.Full;
+    case 'truncate':
+      return LatticeCheckpointMode.Truncate;
+    default:
+      throw new TypeError(
+        `checkpoint mode must be 'passive', 'full' or 'truncate', not ${String(mode)}`
+      );
+  }
+}
+
+/** A count of frames or milliseconds: a non-negative safe integer. */
+function checkpointSetting(name: string, value: number): bigint {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative integer, not ${String(value)}`);
+  }
+  return BigInt(value);
+}
+
+/**
  * Options for opening a database.
  */
 export interface OpenOptions {
@@ -120,6 +321,27 @@ export interface OpenOptions {
   enableVector?: boolean;
   vectorDimensions?: number;
   lock?: boolean;
+  syncMode?: SyncMode;
+  fullFsync?: boolean;
+  vectorMetric?: VectorMetric;
+  vectorM?: number;
+  vectorEfConstruction?: number;
+  changefeedRetention?: ChangefeedRetention;
+}
+
+/**
+ * Copy `len` bytes of native memory into a new Uint8Array.
+ *
+ * koffi.view (koffi 2.11+) copies in one block; decoding to `number[]` first
+ * builds one JS number per byte, which for a serialized database is millions
+ * of them.
+ */
+function copyNativeBytes(ptr: unknown, len: number): Uint8Array {
+  const view = (koffi as unknown as { view?: (ref: unknown, len: number) => ArrayBuffer }).view;
+  if (typeof view === 'function') {
+    return new Uint8Array(view(ptr, len).slice(0));
+  }
+  return Uint8Array.from(koffi.decode(ptr as never, 'uint8_t', len) as number[]);
 }
 
 /**
@@ -131,6 +353,11 @@ export class LatticeFFI {
   private static readonly VALUE_SIZE = koffi.sizeof('lattice_value');
   private static readonly MAP_ENTRY_SIZE = koffi.sizeof('lattice_map_entry');
   private static readonly MAP_ENTRY_VALUE_OFFSET = koffi.offsetof('lattice_map_entry', 'value');
+  private static readonly CHECKPOINT_STATS_SIZE = koffi.sizeof('lattice_checkpoint_stats');
+  private static readonly CHECKPOINT_PAGES_OFFSET = koffi.offsetof('lattice_checkpoint_stats', 'pages_flushed');
+  private static readonly CHECKPOINT_DURATION_OFFSET = koffi.offsetof('lattice_checkpoint_stats', 'duration_ns');
+  private static readonly CHECKPOINT_LSN_OFFSET = koffi.offsetof('lattice_checkpoint_stats', 'checkpoint_lsn');
+  private static readonly CHECKPOINT_TRUNCATED_OFFSET = koffi.offsetof('lattice_checkpoint_stats', 'wal_truncated');
 
   constructor() {
     this.bindings = getBindings();
@@ -144,6 +371,18 @@ export class LatticeFFI {
       const message = this.bindings.lattice_error_message(code);
       throw new LatticeError(message, code as LatticeErrorCode);
     }
+  }
+
+  /**
+   * Check the code of a call that needs the vector index. On a database
+   * created without one it is `Unsupported` (`IoError` before 0.18.1), and
+   * the library's text for that code does not say why.
+   */
+  private checkVectorError(code: number, action: string): void {
+    if (code === LatticeErrorCode.Unsupported) {
+      throw new LatticeError(`cannot ${action}: ${NO_VECTOR_INDEX_MESSAGE}`, LatticeErrorCode.Unsupported);
+    }
+    this.checkError(code);
   }
 
   private normalizeQueryStage(stage: number): QueryErrorStage {
@@ -216,6 +455,30 @@ export class LatticeFFI {
     const enableWal = options.enableWal ?? true;
     const enableAdjacencyCache = options.enableAdjacencyCache ?? false;
     const lock = options.lock ?? true;
+    const syncMode = syncModeCode(options.syncMode);
+    const fullFsync = fullFsyncCode(options.fullFsync);
+    const vectorMetric = vectorMetricCode(options.vectorMetric);
+    const vectorM = options.vectorM ?? 0;
+    const vectorEfConstruction = options.vectorEfConstruction ?? 0;
+    const [changefeedRetention, changefeedRetentionValue] = changefeedRetentionCode(
+      options.changefeedRetention
+    );
+    if (changefeedRetention && !this.bindings.lattice_changefeed_status) {
+      throw new LatticeError(
+        'the native library is too old to support changefeedRetention',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    if (
+      !this.bindings.lattice_open_v5 &&
+      (syncMode || fullFsync || vectorMetric || vectorM || vectorEfConstruction)
+    ) {
+      throw new LatticeError(
+        'lattice_open_v5 is required for syncMode, fullFsync, vectorMetric, vectorM ' +
+          'and vectorEfConstruction',
+        LatticeErrorCode.Unsupported
+      );
+    }
     if (!this.bindings.lattice_open_v4 && !lock) {
       throw new LatticeError(
         'lattice_open_v4 is required to disable the file lock',
@@ -238,7 +501,7 @@ export class LatticeFFI {
     const baseOpts = {
       create: options.create ?? false,
       read_only: options.readOnly ?? false,
-      cache_size_mb: options.cacheSizeMb ?? 100,
+      cache_size_mb: options.cacheSizeMb ?? 0,
       page_size: options.pageSize ?? 4096,
       enable_vector: options.enableVectors ?? options.enableVector ?? false,
       vector_dimensions: options.vectorDimensions ?? 128,
@@ -263,8 +526,22 @@ export class LatticeFFI {
       lock,
     };
 
+    const v5Opts = {
+      ...v4Opts,
+      struct_size: koffi.sizeof('lattice_open_options_v5'),
+      sync_mode: syncMode,
+      full_fsync: fullFsync,
+      vector_metric: vectorMetric,
+      vector_m: vectorM,
+      vector_ef_construction: vectorEfConstruction,
+      changefeed_retention: changefeedRetention,
+      changefeed_retention_value: changefeedRetentionValue,
+    };
+
     const dbOut: unknown[] = [null];
-    const err = this.bindings.lattice_open_v4
+    const err = this.bindings.lattice_open_v5
+      ? this.bindings.lattice_open_v5(path, v5Opts, dbOut)
+      : this.bindings.lattice_open_v4
       ? this.bindings.lattice_open_v4(path, v4Opts, dbOut)
       : this.bindings.lattice_open_v3
       ? this.bindings.lattice_open_v3(path, v3Opts, dbOut)
@@ -299,8 +576,7 @@ export class LatticeFFI {
     try {
       // Copied out before the native buffer is released, so what the caller
       // holds does not depend on memory this function is about to free.
-      const decoded = koffi.decode(ptr, 'uint8_t', len) as number[];
-      return Uint8Array.from(decoded);
+      return copyNativeBytes(ptr, len);
     } finally {
       this.bindings.lattice_free_bytes(ptr, len);
     }
@@ -308,23 +584,39 @@ export class LatticeFFI {
 
   /**
    * Open a database from bytes produced by `serialize`.
+   *
+   * Uses the v5 entry point when the library has it, so the sync and vector
+   * index options reach the database as they do for `open`; otherwise the v4
+   * one, which cannot carry them.
    */
   deserialize(bytes: Uint8Array, options: OpenOptions = {}, copy = true): DatabaseHandle {
     const entry = copy
       ? this.bindings.lattice_deserialize
       : this.bindings.lattice_deserialize_borrowed;
-    if (!entry) {
+    const entryV5 = copy
+      ? this.bindings.lattice_deserialize_v5
+      : this.bindings.lattice_deserialize_borrowed_v5;
+    if (!entry && !entryV5) {
       throw new LatticeError(
         'the native library is too old to support deserialize',
         LatticeErrorCode.Unsupported
       );
     }
 
-    const opts = {
+    const syncMode = syncModeCode(options.syncMode);
+    const fullFsync = fullFsyncCode(options.fullFsync);
+    const vectorMetric = vectorMetricCode(options.vectorMetric);
+    const vectorM = options.vectorM ?? 0;
+    const vectorEfConstruction = options.vectorEfConstruction ?? 0;
+    const [changefeedRetention, changefeedRetentionValue] = changefeedRetentionCode(
+      options.changefeedRetention
+    );
+
+    const v4Opts = {
       struct_size: koffi.sizeof('lattice_open_options_v4'),
       create: false,
       read_only: false,
-      cache_size_mb: options.cacheSizeMb ?? 100,
+      cache_size_mb: options.cacheSizeMb ?? 0,
       page_size: options.pageSize ?? 4096,
       enable_vector: options.enableVectors ?? options.enableVector ?? false,
       vector_dimensions: options.vectorDimensions ?? 128,
@@ -334,7 +626,38 @@ export class LatticeFFI {
     };
 
     const dbOut: unknown[] = [null];
-    this.checkError(entry(bytes, bytes.length, opts, dbOut));
+    if (entryV5) {
+      const v5Opts = {
+        ...v4Opts,
+        struct_size: koffi.sizeof('lattice_open_options_v5'),
+        sync_mode: syncMode,
+        full_fsync: fullFsync,
+        vector_metric: vectorMetric,
+        vector_m: vectorM,
+        vector_ef_construction: vectorEfConstruction,
+        changefeed_retention: changefeedRetention,
+        changefeed_retention_value: changefeedRetentionValue,
+      };
+      this.checkError(entryV5(bytes, bytes.length, v5Opts, dbOut));
+      return dbOut[0];
+    }
+
+    if (
+      syncMode ||
+      fullFsync ||
+      vectorMetric ||
+      vectorM ||
+      vectorEfConstruction ||
+      changefeedRetention
+    ) {
+      throw new LatticeError(
+        'lattice_deserialize_v5 is required for syncMode, fullFsync, vectorMetric, ' +
+          'vectorM, vectorEfConstruction and changefeedRetention',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    // entryV5 is absent here, so the check above guarantees entry.
+    this.checkError(entry!(bytes, bytes.length, v4Opts, dbOut));
     return dbOut[0];
   }
 
@@ -344,6 +667,43 @@ export class LatticeFFI {
   close(db: DatabaseHandle): void {
     const err = this.bindings.lattice_close(db);
     this.checkError(err);
+  }
+
+  /**
+   * Checkpoint now. The mode is checked before the library is called.
+   */
+  checkpoint(db: DatabaseHandle, mode: CheckpointMode): CheckpointStats {
+    const modeCode = checkpointModeCode(mode);
+    if (!this.bindings.lattice_checkpoint) {
+      throw new LatticeError(
+        'the native library is too old to support checkpoint',
+        LatticeErrorCode.Unsupported
+      );
+    }
+
+    const statsOut = Buffer.alloc(LatticeFFI.CHECKPOINT_STATS_SIZE);
+    this.checkError(this.bindings.lattice_checkpoint(db, modeCode, statsOut));
+    return {
+      pagesFlushed: statsOut.readUInt32LE(LatticeFFI.CHECKPOINT_PAGES_OFFSET),
+      durationNs: statsOut.readBigUInt64LE(LatticeFFI.CHECKPOINT_DURATION_OFFSET),
+      checkpointLsn: statsOut.readBigUInt64LE(LatticeFFI.CHECKPOINT_LSN_OFFSET),
+      walTruncated: statsOut.readUInt8(LatticeFFI.CHECKPOINT_TRUNCATED_OFFSET) !== 0,
+    };
+  }
+
+  /**
+   * Set when commits checkpoint from now on; 0 frames switches them off.
+   */
+  setAutoCheckpoint(db: DatabaseHandle, maxWalFrames: number, minIntervalMs: number): void {
+    const frames = checkpointSetting('maxWalFrames', maxWalFrames);
+    const interval = checkpointSetting('minIntervalMs', minIntervalMs);
+    if (!this.bindings.lattice_set_auto_checkpoint) {
+      throw new LatticeError(
+        'the native library is too old to support setAutoCheckpoint',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    this.checkError(this.bindings.lattice_set_auto_checkpoint(db, frames, interval));
   }
 
   // ============================================================
@@ -408,10 +768,24 @@ export class LatticeFFI {
   }
 
   /**
-   * Delete a node.
+   * Delete a node. Fails with HasRelationships while the node has any.
    */
   deleteNode(txn: TransactionHandle, nodeId: bigint): void {
     const err = this.bindings.lattice_node_delete(txn, nodeId);
+    this.checkError(err);
+  }
+
+  /**
+   * Delete a node and every relationship it has.
+   */
+  detachDeleteNode(txn: TransactionHandle, nodeId: bigint): void {
+    if (!this.bindings.lattice_node_detach_delete) {
+      throw new LatticeError(
+        'lattice_node_detach_delete is required to delete a node with its relationships',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    const err = this.bindings.lattice_node_detach_delete(txn, nodeId);
     this.checkError(err);
   }
 
@@ -591,6 +965,48 @@ export class LatticeFFI {
       vector,
       vector.length
     );
+    // Another key is refused as unsupported before the index is looked at.
+    if (key === 'embedding' || key === '') this.checkVectorError(err, 'set a vector');
+    else this.checkError(err);
+  }
+
+  /**
+   * Get a node's vector, or null when it has none.
+   */
+  getVector(txn: TransactionHandle, nodeId: bigint, key: string): Float32Array | null {
+    if (!this.bindings.lattice_node_get_vector || !this.bindings.lattice_free_vector) {
+      throw new LatticeError(
+        'lattice_node_get_vector is required to read a node\'s vector',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    const vectorOut: unknown[] = [null];
+    const dimsOut = Buffer.alloc(4);
+    const err = this.bindings.lattice_node_get_vector(txn, nodeId, key, vectorOut, dimsOut);
+    this.checkError(err);
+
+    const ptr = vectorOut[0];
+    const dims = dimsOut.readUInt32LE();
+    if (!ptr || dims === 0) return null;
+    try {
+      const floats = koffi.decode(ptr, 'float', dims) as number[];
+      return new Float32Array(floats);
+    } finally {
+      this.bindings.lattice_free_vector(ptr, dims);
+    }
+  }
+
+  /**
+   * Remove a node's vector. Removing a vector the node does not have does nothing.
+   */
+  removeVector(txn: TransactionHandle, nodeId: bigint, key: string): void {
+    if (!this.bindings.lattice_node_remove_vector) {
+      throw new LatticeError(
+        'lattice_node_remove_vector is required to remove a node\'s vector',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    const err = this.bindings.lattice_node_remove_vector(txn, nodeId, key);
     this.checkError(err);
   }
 
@@ -624,7 +1040,7 @@ export class LatticeFFI {
       nodeIdsOut,
       countOut
     );
-    this.checkError(err);
+    this.checkVectorError(err, 'insert nodes with vectors');
 
     const created = countOut.readUInt32LE();
     if (created < count) {
@@ -671,6 +1087,9 @@ export class LatticeFFI {
     let ownsNativeValue = false;
     try {
       const err = this.bindings.lattice_node_get_property(txn, nodeId, key, valueOut);
+      if (err === LatticeErrorCode.NotFound) {
+        return null;
+      }
       this.checkError(err);
       ownsNativeValue = true;
       return this.nativeValueToJs(valueOut);
@@ -725,6 +1144,46 @@ export class LatticeFFI {
     return sequenceOut.readBigUInt64LE();
   }
 
+  /**
+   * The changefeed's retention policy, the oldest event it holds and the
+   * last sequence it handed out.
+   */
+  changefeedStatus(db: DatabaseHandle): ChangefeedStatus {
+    if (!this.bindings.lattice_changefeed_status) {
+      throw new LatticeError(
+        "the native library is too old to report the changefeed's status",
+        LatticeErrorCode.Unsupported
+      );
+    }
+    const mode = Buffer.alloc(1);
+    const value = Buffer.alloc(8);
+    const oldest = Buffer.alloc(8);
+    const last = Buffer.alloc(8);
+    this.checkError(this.bindings.lattice_changefeed_status(db, mode, value, oldest, last));
+    const oldestSequence = oldest.readBigUInt64LE();
+    return {
+      retention: changefeedRetentionText(mode.readUInt8(0), value.readBigUInt64LE()),
+      oldestSequence: oldestSequence === BigInt(0) ? null : oldestSequence,
+      lastSequence: last.readBigUInt64LE(),
+    };
+  }
+
+  /**
+   * Apply the changefeed's retention policy in full now. Returns the number
+   * of events dropped.
+   */
+  trimChangefeed(db: DatabaseHandle): bigint {
+    if (!this.bindings.lattice_changefeed_trim) {
+      throw new LatticeError(
+        'the native library is too old to trim the changefeed',
+        LatticeErrorCode.Unsupported
+      );
+    }
+    const removed = Buffer.alloc(8);
+    this.checkError(this.bindings.lattice_changefeed_trim(db, removed));
+    return removed.readBigUInt64LE();
+  }
+
   readStream(
     db: DatabaseHandle,
     stream: string,
@@ -744,8 +1203,50 @@ export class LatticeFFI {
       batchOut
     );
     this.checkError(err);
+    return this.takeStreamBatch(batchOut[0]);
+  }
 
-    const batch = batchOut[0];
+  /**
+   * Read a stream on a koffi worker thread, so a wait of `timeoutMs` does not
+   * block the event loop. Blocking it would also block the commit the reader
+   * is waiting for whenever that commit comes from this same thread.
+   */
+  readStreamAsync(
+    db: DatabaseHandle,
+    stream: string,
+    afterSequence = BigInt(0),
+    limit = 100,
+    timeoutMs = 0
+  ): Promise<StreamRecord[]> {
+    const streamBuf = Buffer.from(stream, 'utf8');
+    const batchOut: unknown[] = [null];
+    return new Promise((resolve, reject) => {
+      this.bindings.lattice_stream_read.async(
+        db,
+        streamBuf,
+        streamBuf.length,
+        afterSequence,
+        limit,
+        timeoutMs,
+        batchOut,
+        (callErr: unknown, err: number) => {
+          if (callErr) {
+            reject(callErr);
+            return;
+          }
+          try {
+            this.checkError(err);
+            resolve(this.takeStreamBatch(batchOut[0]));
+          } catch (decodeErr) {
+            reject(decodeErr);
+          }
+        }
+      );
+    });
+  }
+
+  /** Decode a stream batch into records and free it. */
+  private takeStreamBatch(batch: unknown): StreamRecord[] {
     if (!batch) {
       return [];
     }
@@ -1017,8 +1518,7 @@ export class LatticeFFI {
         const ptr = this.decodePointer(value, dataOffset);
         const len = this.decodeSize(value, dataOffset + 8);
         if (!ptr || len === 0) return new Uint8Array(0);
-        const bytes = koffi.decode(ptr as never, 'uint8_t', len) as number[];
-        return Uint8Array.from(bytes);
+        return copyNativeBytes(ptr, len);
       }
       case LatticeValueType.Vector: {
         const ptr = this.decodePointer(value, dataOffset);
@@ -1100,8 +1600,7 @@ export class LatticeFFI {
         const bv = data.bytes_val as { ptr: unknown; len: number | bigint };
         const len = Number(bv.len);
         if (!bv.ptr || len === 0) return new Uint8Array(0);
-        const bytes = koffi.decode(bv.ptr, 'uint8_t', len) as number[];
-        return Uint8Array.from(bytes);
+        return copyNativeBytes(bv.ptr, len);
       }
       case LatticeValueType.Vector: {
         const vv = data.vector_val as { ptr: unknown; dimensions: number | bigint };
@@ -1161,7 +1660,7 @@ export class LatticeFFI {
       efSearch,
       resultOut
     );
-    this.checkError(err);
+    this.checkVectorError(err, 'search vectors');
     return resultOut[0];
   }
 
@@ -1183,7 +1682,7 @@ export class LatticeFFI {
       efSearch,
       resultOut
     );
-    this.checkError(err);
+    this.checkVectorError(err, 'search vectors');
     return resultOut[0];
   }
 
@@ -1610,10 +2109,17 @@ export class LatticeFFI {
     );
     this.checkError(err);
 
+    // The type is a (pointer, length) pair. Libraries before 0.17.0 did not
+    // NUL-terminate it, so it is read by its length rather than as a C string.
+    const edgeTypeLen = edgeTypeLenOut.readUInt32LE();
+    const edgeType = edgeTypeOut[0] && edgeTypeLen > 0
+      ? Buffer.from(koffi.decode(edgeTypeOut[0], 'uint8_t', edgeTypeLen) as number[]).toString('utf8')
+      : '';
+
     return {
       source: sourceOut.readBigUInt64LE(),
       target: targetOut.readBigUInt64LE(),
-      edgeType: edgeTypeOut[0] as string,
+      edgeType,
     };
   }
 

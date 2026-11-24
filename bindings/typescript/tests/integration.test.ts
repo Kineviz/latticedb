@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { Database, deserialize } from '../src/database';
 import { Transaction } from '../src/transaction';
+import type { Edge, Node } from '../src/types';
 import { isLibraryAvailable, LatticeErrorCode, LatticeQueryError, QueryErrorStage } from '../src/ffi';
 
 // Skip all tests if native library is not available
@@ -267,6 +268,12 @@ describeIfNative('Database Integration', () => {
       });
     });
 
+    test('a missing property reads as null', async () => {
+      await db.read(async (txn) => {
+        expect(await txn.getProperty(nodeId, 'never_set')).toBeNull();
+      });
+    });
+
     test('set and get integer property', async () => {
       await db.write(async (txn) => {
         await txn.setProperty(nodeId, 'count', 42);
@@ -447,6 +454,28 @@ describeIfNative('Database Integration', () => {
         expect(edges[0]!.sourceId).toBe(aliceId);
         expect(edges[0]!.targetId).toBe(bobId);
         expect(edges[0]!.type).toBe('KNOWS');
+      });
+    });
+
+    test('edge types are read by length, not to the next NUL', async () => {
+      // Types whose length fills their allocation exactly: nothing guarantees
+      // a zero byte after them, so a reader that stops at NUL picks up
+      // whatever follows. The multibyte one checks the length is in bytes.
+      const types = ['KNOWS_AB', 'LIKES_CD', 'FOLLOWS_EFGHIJKL', 'MÖGEN'];
+      await db.write(async (txn) => {
+        for (const type of types) {
+          for (let i = 0; i < 4; i++) {
+            await txn.createEdge(aliceId, bobId, type);
+          }
+        }
+      });
+
+      await db.read(async (txn) => {
+        const edges = await txn.getOutgoingEdges(aliceId);
+        expect(edges.length).toBe(types.length * 4);
+        for (const edge of edges) {
+          expect(types).toContain(edge.type);
+        }
       });
     });
 
@@ -679,7 +708,7 @@ describeIfNative('Database Integration', () => {
 
     test('query semantic errors include stage and diagnostic code', async () => {
       try {
-        await db.query('MATCH (a)-[r:REL*1..2]->(b) RETURN r');
+        await db.query('MATCH (a)-[:REL*3..1]->(b) RETURN b');
         throw new Error('expected query to fail');
       } catch (err) {
         expect(err).toBeInstanceOf(LatticeQueryError);
@@ -1046,6 +1075,146 @@ describeIfNative('Database Integration', () => {
       const resultNodeIds = results.map((r) => r.nodeId);
       expect(resultNodeIds).toContain(nodeId!);
     });
+
+    test('getVector reads a vector back and removeVector takes it out of search', async () => {
+      let nodeId: bigint;
+      let otherId: bigint;
+      const vector = new Float32Array([3, 4, 0, 0]);
+
+      await db.write(async (txn) => {
+        const node = await txn.createNode({ labels: ['VectorNode'] });
+        const other = await txn.createNode({ labels: ['VectorNode'] });
+        nodeId = node.id;
+        otherId = other.id;
+        expect(await txn.getVector(node.id)).toBeNull();
+        await txn.setVector(node.id, 'embedding', vector);
+        await txn.setVector(other.id, 'embedding', new Float32Array([0, 0, 1, 0]));
+        // Uncommitted: as written.
+        expect(Array.from((await txn.getVector(node.id))!)).toEqual([3, 4, 0, 0]);
+      });
+
+      await db.read(async (txn) => {
+        // Committed, under the default cosine metric: normalised.
+        const stored = await txn.getVector(nodeId!, 'embedding');
+        expect(stored).toBeInstanceOf(Float32Array);
+        expect(stored![0]).toBeCloseTo(0.6, 6);
+        expect(stored![1]).toBeCloseTo(0.8, 6);
+        await expect(txn.getVector(nodeId! + 1000n)).rejects.toMatchObject({ code: LatticeErrorCode.NotFound });
+        await expect(txn.getVector(nodeId!, 'title_vec')).rejects.toMatchObject({ code: LatticeErrorCode.Unsupported });
+        await expect(txn.removeVector(nodeId!)).rejects.toThrow(/read-only/i);
+      });
+
+      await db.write(async (txn) => {
+        await txn.removeVector(nodeId!);
+        expect(await txn.getVector(nodeId!)).toBeNull();
+        // Removing a vector the node does not have does nothing.
+        await txn.removeVector(nodeId!, 'embedding');
+        await expect(txn.removeVector(nodeId! + 1000n)).rejects.toMatchObject({ code: LatticeErrorCode.NotFound });
+      });
+
+      const results = await db.vectorSearch(vector, { k: 5 });
+      expect(results.map((r) => r.nodeId)).toEqual([otherId!]);
+      await db.read(async (txn) => {
+        expect(await txn.nodeExists(nodeId!)).toBe(true);
+        expect(await txn.getVector(nodeId!)).toBeNull();
+      });
+
+      // The node can take a vector again.
+      await db.write(async (txn) => {
+        await txn.setVector(nodeId!, 'embedding', new Float32Array([1, 0, 0, 0]));
+      });
+      await db.read(async (txn) => {
+        expect(Array.from((await txn.getVector(nodeId!))!)).toEqual([1, 0, 0, 0]);
+      });
+    });
+  });
+
+  describe('Null property values', () => {
+    test('null removes a property and creates none, as in Cypher', async () => {
+      db = new Database(dbPath, { create: true });
+      await db.open();
+      let a: Node;
+      let edge: Edge;
+
+      await db.write(async (txn) => {
+        a = await txn.createNode({ labels: ['P'], properties: { name: 'a', x: null, y: 1 } });
+        const b = await txn.createNode({ labels: ['P'], properties: { name: 'b' } });
+        edge = await txn.createEdge(a.id, b.id, 'R', { properties: { w: null, v: 1 } });
+      });
+      // Up to 0.18.0 these held, and stored, x and w as null.
+      expect(a!.properties).toEqual({ name: 'a', y: 1 });
+      expect(edge!.properties).toEqual({ v: 1 });
+      const before = await db.changes({ limit: 1000 });
+      const after = before[before.length - 1]!.sequence;
+
+      await db.write(async (txn) => {
+        await txn.setProperty(a!.id, 'y', null);
+        await txn.setProperty(a!.id, 'absent', null);
+        await txn.setEdgeProperty(edge!.id, 'v', null);
+        await txn.setEdgeProperty(edge!.id, 'absent', null);
+      });
+
+      const result = await db.query(
+        "MATCH (n:P {name: 'a'})-[r:R]->() RETURN properties(n) AS n, properties(r) AS r"
+      );
+      expect(result.rows).toEqual([{ n: { name: 'a' }, r: {} }]);
+      const events = (await db.changes({ afterSequence: after }))
+        .filter((record) => record.kind.includes('property'))
+        .map((record) => [record.kind, (record.payload as Record<string, unknown>).key]);
+      expect(events).toEqual([
+        ['node.property_remove', 'y'],
+        ['edge.property_remove', 'v'],
+      ]);
+
+      await expect(
+        db.write(async (txn) => {
+          await txn.setProperty(999999n, 'x', null);
+        })
+      ).rejects.toMatchObject({ code: LatticeErrorCode.NotFound });
+    });
+  });
+
+  describe('Vector operations without a vector index', () => {
+    test('writing or searching a vector is Unsupported, not an I/O error', async () => {
+      db = new Database(dbPath, { create: true });
+      await db.open();
+      const vector = new Float32Array([1, 0]);
+      const noIndex = {
+        code: LatticeErrorCode.Unsupported,
+        message: expect.stringContaining('created without a vector index'),
+      };
+      let nodeId: bigint;
+
+      await db.write(async (txn) => {
+        nodeId = (await txn.createNode({ labels: ['Doc'] })).id;
+        await expect(txn.setVector(nodeId, 'embedding', vector)).rejects.toMatchObject(noIndex);
+        await expect(txn.setVector(nodeId, '', vector)).rejects.toMatchObject(noIndex);
+        await expect(txn.batchInsertVectors('Doc', [vector])).rejects.toMatchObject(noIndex);
+        // Another key is still refused for being another key.
+        const otherKey = txn.setVector(nodeId, 'title_vec', vector);
+        await expect(otherKey).rejects.toMatchObject({ code: LatticeErrorCode.Unsupported });
+        await expect(otherKey).rejects.not.toThrow(/vector index/);
+        // Reading finds no vector and removing has nothing to remove.
+        expect(await txn.getVector(nodeId)).toBeNull();
+        await txn.removeVector(nodeId);
+        await expect(txn.vectorSearch(vector, { k: 1 })).rejects.toMatchObject(noIndex);
+      });
+      await expect(db.vectorSearch(vector, { k: 1 })).rejects.toMatchObject(noIndex);
+      await db.read(async (txn) => {
+        // The refused batch insert created nothing.
+        expect(await txn.nodeExists(nodeId! + 1n)).toBe(false);
+      });
+      await db.close();
+
+      // Opening it with vectors on adds the index.
+      db = new Database(dbPath, { enableVectors: true, vectorDimensions: 2 });
+      await db.open();
+      await db.write(async (txn) => {
+        await txn.setVector(nodeId!, 'embedding', vector);
+      });
+      const results = await db.vectorSearch(vector, { k: 1 });
+      expect(results.map((r) => r.nodeId)).toEqual([nodeId!]);
+    });
   });
 
   describe('Full-text search', () => {
@@ -1333,16 +1502,115 @@ describeIfNative('Database Integration', () => {
       ]);
     });
 
-    test('enableWal false rejects stream writes', async () => {
+    test('a waiting stream read does not block a commit from the same thread', async () => {
+      const started = Date.now();
+      const reading = db.readStream('events', { timeoutMs: 5000 });
+      // Runs only if the read left the event loop free.
+      setTimeout(() => {
+        void db.write(async (txn) => {
+          txn.publishStream('events', 'wake');
+        });
+      }, 50);
+      const records = await reading;
+      expect(records.map((record) => record.payload)).toEqual(['wake']);
+      expect(Date.now() - started).toBeLessThan(4000);
+    });
+
+    test('enableWal false still has write transactions', async () => {
       await db.close();
       cleanupDb(dbPath);
 
       db = new Database(dbPath, { create: true, enableWal: false });
       await db.open();
 
-      await expect(db.write(async (txn) => {
-        txn.publishStream('events', 'hidden');
-      })).rejects.toMatchObject({ code: LatticeErrorCode.Unsupported });
+      await db.write(async (txn) => {
+        txn.publishStream('events', 'visible');
+      });
+      await expect(db.readStream('events')).resolves.toMatchObject([
+        { sequence: BigInt(1), payload: 'visible' },
+      ]);
+
+      // A query that fails part-way is rolled back, log or no log.
+      await db.query('CREATE (:D {i: 1})-[:R]->(:D {i: 2}), (:D {i: 3})');
+      await expect(db.query('MATCH (a:D {i: 3}), (b:D {i: 2}) DELETE a CREATE (b)-[:R]->(a)')).rejects.toBeDefined();
+      const result = await db.query('MATCH (n:D) RETURN count(n) AS c');
+      expect(Number(result.rows[0]?.c)).toBe(3);
+    });
+  });
+
+  describe('Serialize and deserialize', () => {
+    let dbPath: string;
+    let db: Database;
+
+    beforeEach(async () => {
+      dbPath = tempDbPath();
+      db = new Database(dbPath, { create: true });
+      await db.open();
+    });
+
+    afterEach(async () => {
+      if (db.isOpen()) {
+        await db.close();
+      }
+      cleanupDb(dbPath);
+    });
+
+    test('round-trips a graph through bytes', async () => {
+      await db.write(async (txn) => {
+        const alice = await txn.createNode({
+          labels: ['Person'],
+          properties: { name: 'Alice', age: 30 },
+        });
+        const bob = await txn.createNode({
+          labels: ['Person'],
+          properties: { name: 'Bob', age: 25 },
+        });
+        await txn.createEdge(alice.id, bob.id, 'KNOWS');
+      });
+
+      // Serializing reads the live database file. Doing that through a second
+      // handle fails outright on Windows, where file locks are mandatory.
+      const bytes = db.serialize();
+      expect(bytes.byteLength).toBeGreaterThan(0);
+
+      const restored = deserialize(bytes);
+      try {
+        const result = await restored.query(
+          'MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age'
+        );
+        expect(result.rows).toEqual([
+          { 'n.name': 'Bob', 'n.age': BigInt(25) },
+          { 'n.name': 'Alice', 'n.age': BigInt(30) },
+        ]);
+      } finally {
+        await restored.close();
+      }
+    });
+
+    test('deserialized database is independent of the original', async () => {
+      await db.write(async (txn) => {
+        await txn.createNode({ labels: ['Note'], properties: { text: 'original' } });
+      });
+
+      const restored = deserialize(db.serialize());
+      try {
+        await restored.write(async (txn) => {
+          await txn.createNode({ labels: ['Note'], properties: { text: 'added' } });
+        });
+
+        const restoredCount = await restored.query('MATCH (n:Note) RETURN n.text');
+        expect(restoredCount.rows).toHaveLength(2);
+
+        const originalCount = await db.query('MATCH (n:Note) RETURN n.text');
+        expect(originalCount.rows).toHaveLength(1);
+      } finally {
+        await restored.close();
+      }
+    });
+
+    test('serialize rejects a closed database', async () => {
+      await db.close();
+      expect(() => db.serialize()).toThrow(/not open/i);
     });
   });
 

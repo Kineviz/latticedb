@@ -32,6 +32,120 @@ class SearchTest {
     }
 
     @Test
+    void getVectorAndRemoveVector() {
+        String path = dir.resolve("crud.db").toString();
+        long[] ids = new long[2];
+        try (Database db = Database.open(path,
+                OpenOptions.defaults().create(true).enableVectors(true).vectorDimensions(2))) {
+            db.write(tx -> {
+                Node node = tx.createNode(List.of("Doc"));
+                Node other = tx.createNode(List.of("Doc"));
+                ids[0] = node.id();
+                ids[1] = other.id();
+                assertTrue(tx.getVector(node.id(), "embedding").isEmpty());
+                tx.setVector(node.id(), "embedding", new float[]{3, 4});
+                tx.setVector(other.id(), "embedding", new float[]{0, 1});
+                // Uncommitted: as written.
+                assertArrayEquals(new float[]{3, 4}, tx.getVector(node.id(), "").orElseThrow());
+                return null;
+            });
+            db.read(tx -> {
+                // Committed, under the default cosine metric: normalised.
+                assertArrayEquals(new float[]{0.6f, 0.8f},
+                        tx.getVector(ids[0], "embedding").orElseThrow(), 1e-6f);
+                LatticeException missing = assertThrows(LatticeException.class,
+                        () -> tx.getVector(ids[0] + 1000, "embedding"));
+                assertEquals(ErrorCode.NOT_FOUND, missing.getErrorCode());
+                LatticeException otherKey = assertThrows(LatticeException.class,
+                        () -> tx.getVector(ids[0], "title_vec"));
+                assertEquals(ErrorCode.UNSUPPORTED, otherKey.getErrorCode());
+                LatticeException readOnly = assertThrows(LatticeException.class,
+                        () -> tx.removeVector(ids[0], "embedding"));
+                assertEquals(ErrorCode.READ_ONLY, readOnly.getErrorCode());
+                return null;
+            });
+            db.write(tx -> {
+                tx.removeVector(ids[0], "embedding");
+                assertTrue(tx.getVector(ids[0], "embedding").isEmpty());
+                // Removing a vector the node does not have does nothing.
+                tx.removeVector(ids[0], "");
+                LatticeException missing = assertThrows(LatticeException.class,
+                        () -> tx.removeVector(ids[0] + 1000, "embedding"));
+                assertEquals(ErrorCode.NOT_FOUND, missing.getErrorCode());
+                return null;
+            });
+            List<VectorSearchResult> results = db.vectorSearch(
+                    new float[]{3, 4}, VectorSearchOptions.defaults().k(5));
+            assertEquals(1, results.size());
+            assertEquals(ids[1], results.get(0).nodeId());
+        }
+
+        // After reopening, the removal holds and the node can take a vector again.
+        try (Database db = Database.open(path, OpenOptions.defaults())) {
+            db.write(tx -> {
+                assertTrue(tx.getVector(ids[0], "embedding").isEmpty());
+                assertTrue(tx.nodeExists(ids[0]));
+                tx.setVector(ids[0], "embedding", new float[]{1, 0});
+                return null;
+            });
+            db.read(tx -> {
+                assertArrayEquals(new float[]{1, 0}, tx.getVector(ids[0], "embedding").orElseThrow());
+                return null;
+            });
+        }
+    }
+
+    @Test
+    void vectorCallsWithoutAVectorIndex() {
+        String path = dir.resolve("novec.db").toString();
+        float[] vector = {1, 0};
+        long[] ids = new long[1];
+        try (Database db = Database.open(path, OpenOptions.defaults().create(true))) {
+            db.write(tx -> {
+                ids[0] = tx.createNode(List.of("Doc")).id();
+                // These failed with ErrorCode.IO, which reads like a disk fault.
+                assertNoVectorIndex(() -> tx.setVector(ids[0], "embedding", vector));
+                assertNoVectorIndex(() -> tx.setVector(ids[0], "", vector));
+                assertNoVectorIndex(() -> tx.batchInsertVectors("Doc", new float[][]{vector}));
+                assertNoVectorIndex(() -> tx.queryVector(vector, 1, 0));
+                // Another key is still refused for being another key.
+                LatticeException otherKey = assertThrows(LatticeException.class,
+                        () -> tx.setVector(ids[0], "title_vec", vector));
+                assertEquals(ErrorCode.UNSUPPORTED, otherKey.getErrorCode());
+                assertFalse(otherKey.getMessage().contains("vector index"));
+                // Reading finds no vector and removing has nothing to remove.
+                assertTrue(tx.getVector(ids[0], "embedding").isEmpty());
+                tx.removeVector(ids[0], "embedding");
+                return null;
+            });
+            assertNoVectorIndex(() -> db.vectorSearch(vector, VectorSearchOptions.defaults().k(1)));
+            db.read(tx -> {
+                // The refused batch insert created nothing.
+                assertFalse(tx.nodeExists(ids[0] + 1));
+                return null;
+            });
+        }
+
+        // Opening it with vectors on adds the index.
+        try (Database db = Database.open(path,
+                OpenOptions.defaults().enableVectors(true).vectorDimensions(2))) {
+            db.write(tx -> {
+                tx.setVector(ids[0], "embedding", vector);
+                return null;
+            });
+            List<VectorSearchResult> results = db.vectorSearch(vector, VectorSearchOptions.defaults().k(1));
+            assertEquals(1, results.size());
+            assertEquals(ids[0], results.get(0).nodeId());
+        }
+    }
+
+    private static void assertNoVectorIndex(org.junit.jupiter.api.function.Executable call) {
+        LatticeException e = assertThrows(LatticeException.class, call);
+        assertEquals(ErrorCode.UNSUPPORTED, e.getErrorCode());
+        assertTrue(e.getMessage().contains("created without a vector index"), e.getMessage());
+    }
+
+    @Test
     void vectorSearchInTransaction() {
         try (Database db = Database.open(dir.resolve("vt.db").toString(),
                 OpenOptions.defaults().create(true).enableVectors(true).vectorDimensions(2))) {

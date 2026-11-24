@@ -122,6 +122,7 @@ fn mapEvalError(err: EvalError) OperatorError {
         EvalError.TypeError => OperatorError.TypeError,
         EvalError.UnboundVariable => OperatorError.UnboundVariable,
         EvalError.PropertyNotFound => OperatorError.PropertyNotFound,
+        EvalError.StorageError => OperatorError.StorageError,
         else => OperatorError.EvaluationError,
     };
 }
@@ -208,18 +209,12 @@ pub const LabelFilter = struct {
             const slot_value = row.getSlot(self.node_slot) orelse continue;
             const node_id = slot_value.asNodeId() orelse continue;
 
-            // Look up the node to check its labels
-            var node = database.getNodeInTxn(ctx.txn, node_id) catch {
-                continue; // Node not found, skip
-            } orelse continue;
-            defer node.deinit(ctx.allocator);
-
-            // Check if the node has the required label
-            for (node.labels) |label| {
-                if (label == self.label_id) {
-                    return row; // Label matches, pass through
-                }
-            }
+            // The label index answers this without reading the node; a node
+            // that no longer exists has no labels. A storage error is an
+            // error: skipping the row hid it as a missing match.
+            const has_label = database.nodeHasLabelInTxn(ctx.txn, node_id, self.label_id) catch |err|
+                return ctx.storageFailure(err, "reading the labels of node {d}", .{node_id});
+            if (has_label) return row;
             // Label doesn't match, continue to next row
         }
     }

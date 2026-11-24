@@ -4,24 +4,31 @@ pub const io = std.Options.debug_io;
 
 const has_io_fs = @hasDecl(std.Io, "Dir");
 const has_thread_condition = @hasDecl(std.Thread, "Condition");
-const MutexState = if (@hasDecl(std.atomic, "Mutex")) std.atomic.Mutex else std.Thread.Mutex;
+const has_io_mutex = @hasDecl(std.Io, "Mutex");
+const MutexState = if (has_io_mutex) std.Io.Mutex else std.Thread.Mutex;
 const ConditionState = if (has_thread_condition) std.Thread.Condition else void;
 
+/// A blocking mutex. Uncontended, lock and unlock are one atomic operation
+/// each; a waiter sleeps on a futex instead of spinning, so a thread that
+/// calls into a database another thread is using does not burn a core for
+/// the length of the other thread's query.
 pub const Mutex = struct {
-    state: MutexState = if (@hasDecl(std.atomic, "Mutex")) .unlocked else .{},
+    state: MutexState = if (has_io_mutex) .init else .{},
 
     pub fn lock(self: *Mutex) void {
-        if (@hasDecl(std.atomic, "Mutex")) {
-            while (!self.state.tryLock()) {
-                std.atomic.spinLoopHint();
-            }
+        if (has_io_mutex) {
+            self.state.lockUncancelable(io);
         } else {
             self.state.lock();
         }
     }
 
     pub fn unlock(self: *Mutex) void {
-        self.state.unlock();
+        if (has_io_mutex) {
+            self.state.unlock(io);
+        } else {
+            self.state.unlock();
+        }
     }
 };
 
@@ -89,6 +96,31 @@ pub fn randomInt(comptime T: type) T {
     var prng = std.Random.DefaultPrng.init(@intCast(nanoTimestamp()));
     return prng.random().int(T);
 }
+
+/// Sets and clears variables in the C runtime's environment, the one
+/// `std.c.getenv` reads and so the one the `LATTICE_*` settings come from.
+/// POSIX has `setenv` and `unsetenv`; the Windows runtime has neither, and
+/// `_putenv_s` with an empty value removes a variable there.
+pub const env = struct {
+    const is_windows = @import("builtin").os.tag == .windows;
+    const posix = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const windows = struct {
+        extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
+    };
+
+    pub fn set(name: [*:0]const u8, value: [*:0]const u8) void {
+        const rc = if (is_windows) windows._putenv_s(name, value) else posix.setenv(name, value, 1);
+        std.debug.assert(rc == 0);
+    }
+
+    /// Clearing a variable that is not set is not an error.
+    pub fn unset(name: [*:0]const u8) void {
+        _ = if (is_windows) windows._putenv_s(name, "") else posix.unsetenv(name);
+    }
+};
 
 pub fn httpClient(allocator: std.mem.Allocator) std.http.Client {
     if (@hasField(std.http.Client, "io")) {

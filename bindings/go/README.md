@@ -20,6 +20,8 @@ This is a cgo-backed client built on the stable C ABI. The current API supports:
 - built-in hash embeddings
 - HTTP embedding client
 
+CI builds and tests the Go binding on Linux and macOS; it has not been tested on Windows.
+
 The Go client now supports two native-library workflows:
 
 - installed development: default, resolves `lattice` through `pkg-config`
@@ -158,7 +160,8 @@ For a larger end-to-end example, see [examples/go](../../examples/go).
 ## API Notes
 
 - Prefer `BeginRead()` and `BeginWrite()` for manual transaction control. `Begin(readOnly bool)` remains as a deprecated compatibility alias.
-- Property getters return `(value, ok, error)` so stored `NULL` is distinguishable from a missing property.
+- A `nil` value stores no property, as null does in Cypher: `CreateNode` and `CreateEdge` leave it out, and `SetProperty` and `SetEdgeProperty` remove the property. Before 0.18.1 these stored the `nil` as a null property.
+- Property getters return `(value, ok, error)`, so a null property a 0.18.0 file still holds is distinguishable from a missing one.
 - Nested values use ordinary Go shapes:
   - `nil`
   - `bool`
@@ -170,12 +173,35 @@ For a larger end-to-end example, see [examples/go](../../examples/go).
   - `[]any`
   - `map[string]any`
 - Query results are materialized into `[]map[string]Value`.
-- Create explicit equality indexes with `DB.CreateNodePropertyIndex` or
-  `DB.CreateEdgePropertyIndex`, then query them from an active transaction with
-  `Tx.FindNodesByLabelProperty` or `Tx.FindEdgesByTypeProperty`. Lookup limits
-  must be positive, and a missing index returns `ErrorUnsupported` rather than
-  falling back to a scan.
+- A node has one vector, which Cypher reads as `n.embedding`. `Tx.SetVector` takes a key that must be `"embedding"` (or `""`); any other key returns `ErrorUnsupported`, and a vector with NaN or infinite components returns `ErrorInvalidArg`. On a database created without a vector index, `SetVector`, `BatchInsertVectors` (before it creates any node) and `VectorSearch` return `ErrorUnsupported` with a message that says so; before 0.18.1 they returned `ErrorIO`. Opening the database with `EnableVectors` and `VectorDimensions` adds an index.
+- `Tx.GetVector(nodeID, key)` returns the node's vector, with `ok` false when it has none; under the cosine metric, the default, a committed vector reads back normalised to unit length. `Tx.RemoveVector(nodeID, key)` removes it, and removing a vector the node does not have does nothing. Both return `ErrorNotFound` for a missing node.
+- `DB.Update` (and `DB.Query` for a query that writes) rolls the transaction back when its commit fails, so a failed commit does not keep the single writer slot.
+- `Tx.Commit` that fails with `ErrorTxnAborted` ends the transaction: the native handle is gone, so `IsActive` is false and `Rollback` is a no-op. Any other commit failure leaves it open for `Rollback`.
+- `Tx.DeleteNode` refuses a node that still has relationships with `ErrorHasRelationships` and deletes nothing, as Cypher's `DELETE` does; `Tx.DetachDeleteNode` deletes the node and all its relationships, as `DETACH DELETE` does. Deleting a node that does not exist succeeds. `Tx.CreateEdge` returns `ErrorNotFound` if either end does not exist as the transaction sees it.
+- A database file records its vector index (dimensions, metric, `VectorM`, `VectorEfConstruction`), and a database that has one opens with it whether or not `EnableVectors` is set, so reopening needs no vector options. Any of `VectorMetric`, `VectorM` and `VectorEfConstruction` that is set, and `VectorDimensions` when `EnableVectors` is set, must match the file or `Open` returns `ErrorConfigMismatch`. `VectorDimensions` 0 with `EnableVectors` means the file's: it opens a database that has an index whatever its size, and returns `ErrorInvalidArg` where an index would have to be created, so creating one needs `VectorDimensions` set. `VectorMetricCosine` stores vectors at unit length and returns cosine distance; `VectorMetricEuclidean` returns the L2 distance and `VectorMetricDotProduct` the negative dot product, both over vectors stored as given. Results come smallest first.
+- `OpenOptions.SyncMode` chooses when a commit waits for the disk: `SyncModeFull` syncs the log on every commit; `SyncModeNormal` returns once the operating system has the commit, which survives the process being killed but not necessarily a power cut or OS crash. `FullFsync: FullFsyncOn` asks macOS drives to flush their cache. The zero values defer to the `LATTICE_SYNC_MODE` and `LATTICE_FULL_FSYNC` environment variables, else full sync without `F_FULLFSYNC`. These options need a native library with `lattice_open_v5`, which `Open` always calls.
+- `OpenOptions.DisableWAL` opens without the log. Transactions, rollback, streams and the changefeed work as with it, but a commit reaches the file at the next flush (`Close`, or when half the page cache holds changes) rather than when it returns. `CacheSizeMB` 0 leaves the cache size to the `LATTICE_BUFFER_POOL_MB` environment variable if it is set, else 100 MB; a size set here wins. `EnableAdjacencyCache` is accepted for compatibility and changes neither the speed nor the results of queries and edge calls.
+- `Deserialize` takes the same `OpenOptions` as `Open`, through `lattice_deserialize_v5`, and they mean the same, apart from `Create` and `ReadOnly`, which it ignores. Bytes that hold a vector index open with the configuration they record, and any vector option you set must match it (`ErrorConfigMismatch`); `EnableVectors` with the vector options creates and configures an index in bytes that have none.
+- Create explicit property indexes with `DB.CreateNodePropertyIndex` or
+  `DB.CreateEdgePropertyIndex`, then look up equal values from an active
+  transaction with `Tx.FindNodesByLabelProperty` or `Tx.FindEdgesByTypeProperty`;
+  Cypher also reads them for ranges, `STARTS WITH` and `ORDER BY ... LIMIT`.
+  Lookup limits must be positive, and a missing index returns `ErrorUnsupported`
+  rather than falling back to a scan.
+- A file that a newer release has marked as not writable by this one opens with `ReadOnly: true`; a writable `Open` returns `ErrorNeedsNewerWriter` and writes nothing. A file in a format too new for this release to read at all returns `ErrorVersionMismatch`, read-only or not.
+- `ReadOnly: true` on a database that was not closed cleanly recovers it in memory: the handle sees every committed transaction and nothing is written to the files. A recovery that needs more than 64 MB plus four times the size of the log and journal fails with `ErrorFull`; open the database read-write once to recover it on disk.
+- A failed query returns a `*QueryError` with `Code`, `Stage`, `Message`, `DiagnosticCode` and `Location` (nil when the failure does not belong to one place in the query); `RETURN 1/0` gives `Division by zero: 1 / 0 (DivisionByZero)` at line 1, column 9. Parse and semantic failures have `ErrorInvalidArg` and execution failures `ErrorGeneric`, except that a `DELETE` of a node with relationships has `ErrorHasRelationships` and a relationship created to a node deleted earlier in the query `ErrorNotFound`; a storage failure under a query has `ErrorIO` and an allocation failure `ErrorOutOfMemory`.
 - Durable streams use explicit cursors: `DB.ReadStream`, `DB.GetStreamOffset`, `DB.Changes`, `Tx.PublishStream`, `Tx.SetStreamOffset`, and `Tx.TrimStream`.
+- `OpenOptions.ChangefeedRetention` sets how much of the changefeed the file keeps: `"all"` (the default), `"off"`, `"last:N"` or `"age:7d"`; empty keeps the file's policy. `DB.ChangefeedStatus` reports the policy and the range of events held, and `DB.TrimChangefeed` applies the policy in full now. `DB.Changes` returns an error matching `ErrChangesTrimmed` (code `ErrorNotFound`) when retention has dropped the events after the sequence it is given, and `ErrorUnsupported` when the policy is `"off"`.
+- `DB.Changes` returns a transaction's net effect in a replayable order: the edges it deletes, the nodes that exist after it, the edges that exist after it, then the nodes it deletes, each group by ascending id, so an edge is created after both its nodes and deleted before either (see the [changefeed guide](https://docs.latticedb.org/guides/changefeed)).
+- A commit is durable once it is in the log (the `-wal` file beside the database); a checkpoint writes the pages the log's commits changed into the database file. By default a commit runs one once the log reaches an eighth of the page cache, never less than 1000 frames (one frame per page, 4096 bytes) and never more than 64 MB: 3,200 frames with the default 100 MB cache, 16,384 with 512 MB or more. The `LATTICE_AUTO_CHECKPOINT_FRAMES` environment variable sets a fixed frame count instead (`0` for none), and `DB.SetAutoCheckpoint(maxWALFrames, minInterval)` wins over it from then on: a commit checkpoints once the log holds `maxWALFrames` frames and no sooner than `minInterval` (rounded up to whole milliseconds) after the last automatic one; `maxWALFrames` 0 switches automatic checkpoints off, and `Close` still folds the log into the file. It has no effect on a read-only database. A larger interval means fewer checkpoints, each a longer pause for the commit that runs it, a longer `-wal` file and more to replay after a crash; a smaller one means shorter pauses, more often.
+- `DB.Checkpoint(mode)` checkpoints now and returns `CheckpointStats` (`PagesFlushed`, `Duration`, `CheckpointLSN`, `WALTruncated`). `CheckpointPassive` writes the changed pages unless one is in use (then nothing, 0 pages) and leaves the log in place; `CheckpointFull` writes every changed page and leaves the log in place; `CheckpointTruncate` does what `CheckpointFull` does and then empties the log, the only mode that bounds its size. Any other mode, or a negative `minInterval`, returns `ErrorInvalidArg` without calling the library; a read-only database returns `ErrorReadOnly`, and a transaction that already has records in the log `ErrorLockTimeout`.
+
+  ```go
+  _ = db.SetAutoCheckpoint(0, 0) // commits never checkpoint; the log grows
+  // ... a burst of commits ...
+  stats, err := db.Checkpoint(latticedb.CheckpointTruncate)
+  ```
 
 ## Embeddings
 

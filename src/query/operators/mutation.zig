@@ -21,12 +21,14 @@ const EvalResult = expression_mod.EvalResult;
 const EvalError = expression_mod.EvalError;
 
 const ast = @import("../ast.zig");
+const scan_ops = @import("scan.zig");
 
 const types = lattice.core.types;
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
 const PropertyValue = types.PropertyValue;
 const SymbolError = lattice.graph.symbols.SymbolError;
+const SymbolId = lattice.graph.symbols.SymbolId;
 const Transaction = lattice.transaction.manager.Transaction;
 
 const database_mod = lattice.storage.database;
@@ -171,12 +173,13 @@ pub const CreateNode = struct {
             &evaluated,
         );
 
-        // Create node with labels
-        const node_id = self.database.createNode(ctx.txn, self.labels) catch {
-            return OperatorError.StorageError;
-        };
+        try checkVectorItems(self.database, ctx, evaluated.items);
 
-        try applyEvaluatedNodeProperties(self.database, ctx.txn, node_id, evaluated.items);
+        // Create node with labels
+        const node_id = self.database.createNode(ctx.txn, self.labels) catch |err|
+            return ctx.storageFailure(err, "creating a node", .{});
+
+        try applyEvaluatedNodeProperties(self.database, ctx, node_id, evaluated.items, .skip);
         return node_id;
     }
 
@@ -290,8 +293,8 @@ pub const CreateEdge = struct {
         const source_val = row.getSlot(self.source_slot) orelse return OperatorError.UnboundVariable;
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
 
-        const source_id = source_val.asNodeId() orelse return OperatorError.TypeError;
-        const target_id = target_val.asNodeId() orelse return OperatorError.TypeError;
+        const source_id = source_val.asNodeId() orelse return endpointFailure(ctx, "CREATE", source_val);
+        const target_id = target_val.asNodeId() orelse return endpointFailure(ctx, "CREATE", target_val);
 
         // Evaluate edge properties before mutation to avoid partial writes.
         var evaluated: std.ArrayList(EvaluatedProperty) = .empty;
@@ -305,15 +308,17 @@ pub const CreateEdge = struct {
             &evaluated,
         );
 
-        const edge_id = self.database.createEdgeAndGetId(ctx.txn, source_id, target_id, self.edge_type) catch {
-            return OperatorError.StorageError;
-        };
+        const edge_id = self.database.createEdgeAndGetId(ctx.txn, source_id, target_id, self.edge_type) catch |err|
+            return ctx.storageFailure(err, "creating a relationship from node {d} to node {d}", .{ source_id, target_id });
 
         for (evaluated.items) |item| {
-            self.database.setEdgePropertyById(ctx.txn, edge_id, item.key, item.value) catch {
-                // Best-effort rollback to avoid exposing partially initialized edges.
+            // A new relationship has nothing a null could remove.
+            if (item.value == .null_val) continue;
+            self.database.setEdgePropertyById(ctx.txn, edge_id, item.key, item.value) catch |err| {
+                // Best-effort rollback to avoid exposing partially initialized
+                // edges. The query fails either way, with the first error.
                 self.database.deleteEdgeById(ctx.txn, edge_id) catch {};
-                return OperatorError.StorageError;
+                return ctx.storageFailure(err, "setting property '{s}' of relationship {d}", .{ item.key, edge_id });
             };
         }
 
@@ -344,6 +349,13 @@ pub const CreateEdge = struct {
 // ============================================================================
 
 /// Operator that deletes a node for each input row.
+///
+/// Plain DELETE refuses a node that still has relationships, as Cypher does,
+/// rather than leave edges pointing at a node that no longer exists. The
+/// check sees the whole statement: the operator drains its input first, so
+/// `MATCH (n)-[r]-() DELETE r, n` deletes every `r` (an earlier operator in
+/// the chain) before any node is checked. Only then are nodes deleted and
+/// rows returned. DETACH DELETE removes the node's relationships first.
 pub const DeleteNode = struct {
     /// Input operator
     input: Operator,
@@ -357,6 +369,14 @@ pub const DeleteNode = struct {
     opened: bool,
     /// Allocator for edge info
     allocator: Allocator,
+    /// Input rows, held until every node has been checked and deleted
+    rows: std.ArrayList(Row) = .empty,
+    /// Whether the deletes have run
+    done: bool = false,
+    /// Next row to return
+    output_index: usize = 0,
+    /// Where the query names the node, for the error that refuses it
+    location: ?ast.SourceLocation = null,
 
     const Self = @This();
 
@@ -399,6 +419,9 @@ pub const DeleteNode = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         try self.input.open(ctx);
         self.opened = true;
+        self.rows.clearRetainingCapacity();
+        self.done = false;
+        self.output_index = 0;
     }
 
     fn next(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!?*Row {
@@ -406,43 +429,67 @@ pub const DeleteNode = struct {
 
         if (!self.opened) return OperatorError.NotInitialized;
 
-        const row = try self.input.next(ctx) orelse return null;
-
-        // Get node ID from row
-        const node_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
-        const node_id = node_val.asNodeId() orelse return OperatorError.TypeError;
-
-        // If detach, delete all connected edges first
-        if (self.detach) {
-            self.deleteAllEdges(ctx, node_id) catch {
-                return OperatorError.StorageError;
-            };
+        if (!self.done) {
+            try self.deleteAll(ctx);
+            self.done = true;
         }
-
-        // Delete the node
-        self.database.deleteNode(ctx.txn, node_id) catch {
-            return OperatorError.StorageError;
-        };
-
-        return row;
+        if (self.output_index >= self.rows.items.len) return null;
+        self.output_index += 1;
+        return &self.rows.items[self.output_index - 1];
     }
 
-    fn deleteAllEdges(self: *Self, ctx: *ExecutionContext, node_id: NodeId) !void {
-        // Delete outgoing edges
-        const outgoing = try self.database.getOutgoingEdgesInTxn(ctx.txn, node_id, 0);
-        defer self.database.freeEdgeInfos(outgoing);
-
-        for (outgoing) |edge| {
-            try self.database.deleteEdge(ctx.txn, edge.source, edge.target, edge.edge_type);
+    fn deleteAll(self: *Self, ctx: *ExecutionContext) OperatorError!void {
+        while (try self.input.next(ctx)) |row| {
+            self.rows.append(self.allocator, row.*) catch return OperatorError.OutOfMemory;
         }
 
-        // Delete incoming edges
-        const incoming = try self.database.getIncomingEdgesInTxn(ctx.txn, node_id, 0);
-        defer self.database.freeEdgeInfos(incoming);
-
-        for (incoming) |edge| {
-            try self.database.deleteEdge(ctx.txn, edge.source, edge.target, edge.edge_type);
+        var seen: std.AutoHashMapUnmanaged(NodeId, void) = .{};
+        defer seen.deinit(self.allocator);
+        var targets: std.ArrayList(NodeId) = .empty;
+        defer targets.deinit(self.allocator);
+        for (self.rows.items) |*row| {
+            const node_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+            // Deleting null is a no-op, as in Cypher.
+            if (node_val == .property and node_val.property == .null_val) continue;
+            const node_id = node_val.asNodeId() orelse return OperatorError.TypeError;
+            const entry = seen.getOrPut(self.allocator, node_id) catch return OperatorError.OutOfMemory;
+            if (entry.found_existing) continue;
+            targets.append(self.allocator, node_id) catch return OperatorError.OutOfMemory;
         }
+
+        // The rule is the database's: deleteNode refuses a node that still
+        // has relationships and detachDeleteNode removes them with it.
+        if (self.detach) {
+            for (targets.items) |node_id| {
+                self.database.detachDeleteNode(ctx.txn, node_id) catch |err|
+                    return ctx.storageFailure(err, "deleting node {d} and its relationships", .{node_id});
+            }
+            return;
+        }
+
+        // Check every node before deleting any, so a refusal leaves the
+        // nodes in place.
+        for (targets.items) |node_id| {
+            const has_relationships = self.database.nodeHasRelationshipsInTxn(ctx.txn, node_id) catch |err|
+                return ctx.storageFailure(err, "reading the relationships of node {d}", .{node_id});
+            if (has_relationships) return self.hasRelationshipsFailure(ctx, node_id);
+        }
+
+        for (targets.items) |node_id| {
+            self.database.deleteNode(ctx.txn, node_id) catch |err| return switch (err) {
+                error.NodeHasRelationships => self.hasRelationshipsFailure(ctx, node_id),
+                else => ctx.storageFailure(err, "deleting node {d}", .{node_id}),
+            };
+        }
+    }
+
+    fn hasRelationshipsFailure(self: *const Self, ctx: *ExecutionContext, node_id: NodeId) OperatorError {
+        return ctx.fail(
+            OperatorError.NodeHasRelationships,
+            self.location,
+            "Cannot delete node {d} because it still has relationships; delete them first, or use DETACH DELETE",
+            .{node_id},
+        );
     }
 
     fn close(ptr: *anyopaque, ctx: *ExecutionContext) void {
@@ -456,6 +503,7 @@ pub const DeleteNode = struct {
     fn deinit(ptr: *anyopaque, allocator: Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.input.deinit(allocator);
+        self.rows.deinit(self.allocator);
         allocator.destroy(self);
     }
 };
@@ -464,8 +512,8 @@ pub const DeleteNode = struct {
 // DeleteEdge Operator
 // ============================================================================
 
-/// Operator that deletes an edge for each input row.
-/// Note: Edge deletion requires knowing source, target, and type.
+/// Operator that deletes an edge for each input row. The edge's id is all
+/// it needs; deleting one already deleted by an earlier row is not an error.
 pub const DeleteEdge = struct {
     /// Input operator
     input: Operator,
@@ -525,10 +573,16 @@ pub const DeleteEdge = struct {
 
         // Get edge ID from row
         const edge_val = row.getSlot(self.edge_slot) orelse return OperatorError.UnboundVariable;
+        // Deleting null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (edge_val.isNull()) return row;
         const edge_id = edge_val.asEdgeId() orelse return OperatorError.TypeError;
 
-        self.database.deleteEdgeById(ctx.txn, edge_id) catch {
-            return OperatorError.StorageError;
+        self.database.deleteEdgeById(ctx.txn, edge_id) catch |err| switch (err) {
+            // The edge was matched, so it existed; an earlier row of this
+            // statement deleted it. An undirected pattern lists every edge
+            // twice, and deleting it twice is not an error in Cypher.
+            error.NotFound => {},
+            else => return ctx.storageFailure(err, "deleting relationship {d}", .{edge_id}),
         };
 
         return row;
@@ -624,6 +678,8 @@ pub const SetProperty = struct {
 
         // Get target from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
 
         // Evaluate value expression
         const value = self.evaluator.evaluate(self.value_expr, row, ctx) catch {
@@ -635,26 +691,28 @@ pub const SetProperty = struct {
             .node_ref => |node_id| {
                 if (value == .null_val) {
                     // NULL removes property
-                    self.database.removeNodeProperty(ctx.txn, node_id, self.property_name) catch {
-                        return OperatorError.StorageError;
-                    };
+                    self.database.removeNodeProperty(ctx.txn, node_id, self.property_name) catch |err|
+                        return ctx.storageFailure(err, "removing property '{s}' of node {d}", .{ self.property_name, node_id });
+                    if (isVectorKey(self.database, self.property_name)) try removeVector(self.database, ctx, node_id);
                 } else {
-                    const prop_value = evalResultToPropertyValue(value, self.evaluator.allocator) orelse return OperatorError.TypeError;
-                    self.database.setNodeProperty(ctx.txn, node_id, self.property_name, prop_value) catch {
-                        return OperatorError.StorageError;
-                    };
+                    const prop_value = (evalResultToPropertyValue(value, self.evaluator.allocator) catch return OperatorError.OutOfMemory) orelse return OperatorError.TypeError;
+                    if (isVectorKey(self.database, self.property_name)) {
+                        try checkVectorValue(self.database, ctx, prop_value);
+                        try writeNodeVector(self.database, ctx, node_id, prop_value);
+                    } else {
+                        self.database.setNodeProperty(ctx.txn, node_id, self.property_name, prop_value) catch |err|
+                            return ctx.storageFailure(err, "setting property '{s}' of node {d}", .{ self.property_name, node_id });
+                    }
                 }
             },
             .edge_ref => |edge_id| {
                 if (value == .null_val) {
-                    self.database.removeEdgePropertyById(ctx.txn, edge_id, self.property_name) catch {
-                        return OperatorError.StorageError;
-                    };
+                    self.database.removeEdgePropertyById(ctx.txn, edge_id, self.property_name) catch |err|
+                        return ctx.storageFailure(err, "removing property '{s}' of relationship {d}", .{ self.property_name, edge_id });
                 } else {
-                    const prop_value = evalResultToPropertyValue(value, self.evaluator.allocator) orelse return OperatorError.TypeError;
-                    self.database.setEdgePropertyById(ctx.txn, edge_id, self.property_name, prop_value) catch {
-                        return OperatorError.StorageError;
-                    };
+                    const prop_value = (evalResultToPropertyValue(value, self.evaluator.allocator) catch return OperatorError.OutOfMemory) orelse return OperatorError.TypeError;
+                    self.database.setEdgePropertyById(ctx.txn, edge_id, self.property_name, prop_value) catch |err|
+                        return ctx.storageFailure(err, "setting property '{s}' of relationship {d}", .{ self.property_name, edge_id });
                 }
             },
             else => return OperatorError.TypeError,
@@ -746,13 +804,14 @@ pub const SetLabels = struct {
 
         // Get target node from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
         const node_id = target_val.asNodeId() orelse return OperatorError.TypeError;
 
         // Add each label
         for (self.label_names) |label| {
-            self.database.addNodeLabel(ctx.txn, node_id, label) catch {
-                return OperatorError.StorageError;
-            };
+            self.database.addNodeLabel(ctx.txn, node_id, label) catch |err|
+                return ctx.storageFailure(err, "adding label '{s}' to node {d}", .{ label, node_id });
         }
 
         return row;
@@ -844,6 +903,8 @@ pub const SetPropertiesReplace = struct {
 
         // Get target from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
 
         // Evaluate all updates first so expression/type failures don't clear
         // existing properties or produce partial row-level writes.
@@ -860,15 +921,16 @@ pub const SetPropertiesReplace = struct {
 
         switch (target_val) {
             .node_ref => |node_id| {
+                // A refused vector must not leave the properties cleared.
+                try checkVectorItems(self.database, ctx, evaluated.items);
                 // Clear existing properties and apply new values.
-                self.database.clearNodeProperties(ctx.txn, node_id) catch {
-                    return OperatorError.StorageError;
-                };
-                try applyEvaluatedNodeProperties(self.database, ctx.txn, node_id, evaluated.items);
+                self.database.clearNodeProperties(ctx.txn, node_id) catch |err|
+                    return ctx.storageFailure(err, "clearing the properties of node {d}", .{node_id});
+                try applyEvaluatedNodeProperties(self.database, ctx, node_id, evaluated.items, .skip);
             },
             .edge_ref => |edge_id| {
-                try clearEdgeProperties(self.database, ctx.txn, edge_id);
-                try applyEvaluatedEdgeProperties(self.database, ctx.txn, edge_id, evaluated.items);
+                try clearEdgeProperties(self.database, ctx, edge_id);
+                try applyEvaluatedEdgeProperties(self.database, ctx, edge_id, evaluated.items, .skip);
             },
             else => return OperatorError.TypeError,
         }
@@ -962,6 +1024,8 @@ pub const SetPropertiesMerge = struct {
 
         // Get target from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
 
         // Evaluate all updates first so expression/type failures don't produce
         // partial row-level writes.
@@ -976,8 +1040,8 @@ pub const SetPropertiesMerge = struct {
             &evaluated,
         );
         switch (target_val) {
-            .node_ref => |node_id| try applyEvaluatedNodeProperties(self.database, ctx.txn, node_id, evaluated.items),
-            .edge_ref => |edge_id| try applyEvaluatedEdgeProperties(self.database, ctx.txn, edge_id, evaluated.items),
+            .node_ref => |node_id| try applyEvaluatedNodeProperties(self.database, ctx, node_id, evaluated.items, .remove),
+            .edge_ref => |edge_id| try applyEvaluatedEdgeProperties(self.database, ctx, edge_id, evaluated.items, .remove),
             else => return OperatorError.TypeError,
         }
 
@@ -1067,18 +1131,19 @@ pub const RemoveProperty = struct {
 
         // Get target from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
 
         // Remove property based on target type
         switch (target_val) {
             .node_ref => |node_id| {
-                self.database.removeNodeProperty(ctx.txn, node_id, self.property_name) catch {
-                    return OperatorError.StorageError;
-                };
+                self.database.removeNodeProperty(ctx.txn, node_id, self.property_name) catch |err|
+                    return ctx.storageFailure(err, "removing property '{s}' of node {d}", .{ self.property_name, node_id });
+                if (isVectorKey(self.database, self.property_name)) try removeVector(self.database, ctx, node_id);
             },
             .edge_ref => |edge_id| {
-                self.database.removeEdgePropertyById(ctx.txn, edge_id, self.property_name) catch {
-                    return OperatorError.StorageError;
-                };
+                self.database.removeEdgePropertyById(ctx.txn, edge_id, self.property_name) catch |err|
+                    return ctx.storageFailure(err, "removing property '{s}' of relationship {d}", .{ self.property_name, edge_id });
             },
             else => return OperatorError.TypeError,
         }
@@ -1169,13 +1234,14 @@ pub const RemoveLabels = struct {
 
         // Get target node from row
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
+        // Writing to null, an OPTIONAL MATCH that found nothing, does nothing.
+        if (target_val.isNull()) return row;
         const node_id = target_val.asNodeId() orelse return OperatorError.TypeError;
 
         // Remove each label
         for (self.label_names) |label| {
-            self.database.removeNodeLabel(ctx.txn, node_id, label) catch {
-                return OperatorError.StorageError;
-            };
+            self.database.removeNodeLabel(ctx.txn, node_id, label) catch |err|
+                return ctx.storageFailure(err, "removing label '{s}' from node {d}", .{ label, node_id });
         }
 
         return row;
@@ -1200,8 +1266,132 @@ pub const RemoveLabels = struct {
 // Helpers
 // ============================================================================
 
+/// A relationship CREATE or MERGE cannot write because an end is not a node.
+/// openCypher makes a null end an error rather than skipping the row: the
+/// relationship the query asks for cannot exist.
+fn endpointFailure(ctx: *const ExecutionContext, comptime clause: []const u8, value: SlotValue) OperatorError {
+    @branchHint(.cold);
+    if (value.isNull()) {
+        return ctx.fail(OperatorError.TypeError, null, clause ++ " needs a node at each end of a relationship, but one end is null (an OPTIONAL MATCH that found nothing leaves its variables null)", .{});
+    }
+    return ctx.fail(OperatorError.TypeError, null, clause ++ " needs a node at each end of a relationship, but one end is not a node", .{});
+}
+
+/// Whether `key` names a node's vector rather than a property: `embedding`,
+/// which Cypher reads as the node's vector, on a database with a vector
+/// index. Without an index `embedding` is an ordinary property.
+fn isVectorKey(database: *Database, key: []const u8) bool {
+    return database.vectorConfig() != null and std.mem.eql(u8, key, "embedding");
+}
+
+fn removeVector(database: *Database, ctx: *const ExecutionContext, node_id: NodeId) OperatorError!void {
+    database.removeNodeVectorInTxn(ctx.txn, node_id) catch |err|
+        return ctx.storageFailure(err, "removing the vector of node {d}", .{node_id});
+}
+
+/// Refuse a value for a node's vector as lattice_node_set_vector refuses
+/// one: anything but a list (or vector) of exactly the index's number of
+/// finite numbers. Null, which removes the vector, passes.
+fn checkVectorValue(database: *Database, ctx: *const ExecutionContext, value: PropertyValue) OperatorError!void {
+    const dimensions: usize = (database.vectorConfig() orelse return).dimensions;
+    const len = switch (value) {
+        .null_val => return,
+        .vector_val => |v| v.len,
+        .list_val => |items| items.len,
+        else => return ctx.fail(OperatorError.TypeError, null, "embedding is the node's vector on a database with a vector index, and takes a list of {d} numbers, not a {s}", .{ dimensions, propertyTypeName(value) }),
+    };
+    if (len != dimensions) return ctx.fail(OperatorError.TypeError, null, "embedding is the node's vector, which has {d} dimensions in this database; the value has {d}", .{ dimensions, len });
+    switch (value) {
+        .vector_val => |v| for (v) |component| {
+            if (!std.math.isFinite(component)) return nonFiniteVector(ctx);
+        },
+        .list_val => |items| for (items) |item| {
+            const component: f32 = switch (item) {
+                .int_val => |n| @floatFromInt(n),
+                .float_val => |f| @floatCast(f),
+                else => return ctx.fail(OperatorError.TypeError, null, "embedding is the node's vector, and every element must be a number, not a {s}", .{propertyTypeName(item)}),
+            };
+            if (!std.math.isFinite(component)) return nonFiniteVector(ctx);
+        },
+        else => unreachable,
+    }
+}
+
+fn nonFiniteVector(ctx: *const ExecutionContext) OperatorError {
+    @branchHint(.cold);
+    return ctx.fail(OperatorError.TypeError, null, "embedding is the node's vector, and every element must be a finite number (no NaN or infinity, or a float too large for 32 bits)", .{});
+}
+
+/// Check every vector a property list writes before anything is written.
+fn checkVectorItems(database: *Database, ctx: *const ExecutionContext, items: []const EvaluatedProperty) OperatorError!void {
+    if (database.vectorConfig() == null) return;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.key, "embedding")) try checkVectorValue(database, ctx, item.value);
+    }
+}
+
+/// Write a checked value to a node's vector: null removes it, anything else
+/// replaces it. An ordinary property named `embedding`, hidden by the vector
+/// on read, goes either way, so it cannot come back when the vector does.
+fn writeNodeVector(database: *Database, ctx: *const ExecutionContext, node_id: NodeId, value: PropertyValue) OperatorError!void {
+    database.removeNodeProperty(ctx.txn, node_id, "embedding") catch |err|
+        return ctx.storageFailure(err, "removing property 'embedding' of node {d}", .{node_id});
+    switch (value) {
+        .null_val => return removeVector(database, ctx, node_id),
+        .vector_val => |vector| database.setNodeVectorInTxn(ctx.txn, node_id, vector) catch |err|
+            return ctx.storageFailure(err, "setting the vector of node {d}", .{node_id}),
+        .list_val => |items| {
+            const vector = database.allocator.alloc(f32, items.len) catch return OperatorError.OutOfMemory;
+            defer database.allocator.free(vector);
+            for (items, vector) |item, *component| component.* = switch (item) {
+                .int_val => |n| @floatFromInt(n),
+                .float_val => |f| @floatCast(f),
+                else => return OperatorError.TypeError,
+            };
+            database.setNodeVectorInTxn(ctx.txn, node_id, vector) catch |err|
+                return ctx.storageFailure(err, "setting the vector of node {d}", .{node_id});
+        },
+        else => return OperatorError.TypeError,
+    }
+}
+
+/// The value as a vector, for comparing it with a node's vector. Null when
+/// it is not one; a checked value always is.
+fn vectorOfValue(allocator: Allocator, value: PropertyValue) Allocator.Error!?[]f32 {
+    return switch (value) {
+        .vector_val => |v| try allocator.dupe(f32, v),
+        .list_val => |items| blk: {
+            const vector = try allocator.alloc(f32, items.len);
+            for (items, vector) |item, *component| component.* = switch (item) {
+                .int_val => |n| @floatFromInt(n),
+                .float_val => |f| @floatCast(f),
+                else => {
+                    allocator.free(vector);
+                    break :blk null;
+                },
+            };
+            break :blk vector;
+        },
+        else => null,
+    };
+}
+
+fn propertyTypeName(value: PropertyValue) []const u8 {
+    return switch (value) {
+        .null_val => "null",
+        .bool_val => "boolean",
+        .int_val => "integer",
+        .float_val => "float",
+        .string_val => "string",
+        .bytes_val => "byte string",
+        .vector_val => "vector",
+        .list_val => "list",
+        .map_val => "map",
+    };
+}
+
 /// Convert EvalResult to PropertyValue
-fn evalResultToPropertyValue(result: EvalResult, allocator: Allocator) ?PropertyValue {
+fn evalResultToPropertyValue(result: EvalResult, allocator: Allocator) Allocator.Error!?PropertyValue {
     return switch (result) {
         .null_val => .{ .null_val = {} },
         .bool_val => |b| .{ .bool_val = b },
@@ -1210,8 +1400,8 @@ fn evalResultToPropertyValue(result: EvalResult, allocator: Allocator) ?Property
         .string_val => |s| .{ .string_val = s },
         .bytes_val => |b| .{ .bytes_val = b },
         .vector_val => |v| .{ .vector_val = v },
-        .node_ref, .edge_ref => null, // Can't convert refs to property
-        .list_val, .map_val => result.toPropertyValue(allocator),
+        .node_ref, .edge_ref, .path_val => null, // Can't convert refs to property
+        .list_val, .map_val => try result.toPropertyValue(allocator),
     };
 }
 
@@ -1227,6 +1417,7 @@ fn mapEvalError(err: EvalError) OperatorError {
         EvalError.TypeError => OperatorError.TypeError,
         EvalError.UnboundVariable => OperatorError.UnboundVariable,
         EvalError.PropertyNotFound => OperatorError.PropertyNotFound,
+        EvalError.StorageError => OperatorError.StorageError,
         else => OperatorError.EvaluationError,
     };
 }
@@ -1244,7 +1435,7 @@ fn evaluatePropertyExprList(
         const value = evaluator.evaluate(item.value_expr, row, ctx) catch |err| {
             return mapEvalError(err);
         };
-        const prop_value = evalResultToPropertyValue(value, allocator) orelse return OperatorError.TypeError;
+        const prop_value = (evalResultToPropertyValue(value, allocator) catch return OperatorError.OutOfMemory) orelse return OperatorError.TypeError;
         out.append(allocator, .{
             .key = item.key,
             .value = prop_value,
@@ -1271,7 +1462,7 @@ fn evaluateMapExpression(
     };
 
     for (entries) |entry| {
-        const prop_value = evalResultToPropertyValue(entry.value, allocator) orelse return OperatorError.TypeError;
+        const prop_value = (evalResultToPropertyValue(entry.value, allocator) catch return OperatorError.OutOfMemory) orelse return OperatorError.TypeError;
         out.append(allocator, .{
             .key = entry.key,
             .value = prop_value,
@@ -1279,40 +1470,80 @@ fn evaluateMapExpression(
     }
 }
 
+/// What a null value in a property list does. Cypher never stores a null
+/// property: a null means the property is absent. Where the node or
+/// relationship may already have the property (`SET n += {...}`, `ON CREATE
+/// SET`, `ON MATCH SET`) the null removes it, as `SET n.x = null` does. Where it
+/// cannot (one being created, or one whose properties `SET n = {...}` has just
+/// cleared) there is nothing to remove, and the null is skipped.
+const NullProperty = enum { remove, skip };
+
 fn applyEvaluatedNodeProperties(
     database: *Database,
-    txn: ?*Transaction,
+    ctx: *const ExecutionContext,
     node_id: NodeId,
     items: []const EvaluatedProperty,
+    on_null: NullProperty,
 ) OperatorError!void {
+    try checkVectorItems(database, ctx, items);
     for (items) |item| {
-        database.setNodeProperty(txn, node_id, item.key, item.value) catch {
-            return OperatorError.StorageError;
-        };
+        // A null `embedding` removes the node's vector, whichever the mode.
+        if (isVectorKey(database, item.key)) {
+            try writeNodeVector(database, ctx, node_id, item.value);
+            continue;
+        }
+        if (item.value == .null_val) {
+            if (on_null == .skip) continue;
+            database.removeNodeProperty(ctx.txn, node_id, item.key) catch |err|
+                return ctx.storageFailure(err, "removing property '{s}' of node {d}", .{ item.key, node_id });
+            continue;
+        }
+        database.setNodeProperty(ctx.txn, node_id, item.key, item.value) catch |err|
+            return ctx.storageFailure(err, "setting property '{s}' of node {d}", .{ item.key, node_id });
     }
 }
 
 fn applyEvaluatedEdgeProperties(
     database: *Database,
-    txn: ?*Transaction,
+    ctx: *const ExecutionContext,
     edge_id: EdgeId,
     items: []const EvaluatedProperty,
+    on_null: NullProperty,
 ) OperatorError!void {
     for (items) |item| {
-        database.setEdgePropertyById(txn, edge_id, item.key, item.value) catch {
-            return OperatorError.StorageError;
-        };
+        if (item.value == .null_val) {
+            if (on_null == .skip) continue;
+            database.removeEdgePropertyById(ctx.txn, edge_id, item.key) catch |err|
+                return ctx.storageFailure(err, "removing property '{s}' of relationship {d}", .{ item.key, edge_id });
+            continue;
+        }
+        database.setEdgePropertyById(ctx.txn, edge_id, item.key, item.value) catch |err|
+            return ctx.storageFailure(err, "setting property '{s}' of relationship {d}", .{ item.key, edge_id });
     }
 }
 
-fn clearEdgeProperties(database: *Database, txn: ?*Transaction, edge_id: EdgeId) OperatorError!void {
-    const props = database.getEdgePropertiesInTxn(txn, edge_id) catch return OperatorError.StorageError;
+/// A MERGE pattern property whose value is null fails the query: no node or
+/// relationship could ever match it, since none stores a null, so the MERGE
+/// would create a new one every time it ran.
+fn refuseNullPatternProperties(ctx: *const ExecutionContext, items: []const EvaluatedProperty) OperatorError!void {
+    for (items) |prop| {
+        if (prop.value == .null_val) return ctx.fail(
+            OperatorError.EvaluationError,
+            null,
+            "MERGE cannot match a null property value: '{s}' is null; use MATCH, or give it a value",
+            .{prop.key},
+        );
+    }
+}
+
+fn clearEdgeProperties(database: *Database, ctx: *const ExecutionContext, edge_id: EdgeId) OperatorError!void {
+    const props = database.getEdgePropertiesInTxn(ctx.txn, edge_id) catch |err|
+        return ctx.storageFailure(err, "reading the properties of relationship {d}", .{edge_id});
     defer database.freePropertyEntries(props);
 
     for (props) |prop| {
-        database.removeEdgePropertyById(txn, edge_id, prop.key) catch {
-            return OperatorError.StorageError;
-        };
+        database.removeEdgePropertyById(ctx.txn, edge_id, prop.key) catch |err|
+            return ctx.storageFailure(err, "removing property '{s}' of relationship {d}", .{ prop.key, edge_id });
     }
 }
 
@@ -1321,7 +1552,16 @@ fn clearEdgeProperties(database: *Database, txn: ?*Transaction, edge_id: EdgeId)
 // ============================================================================
 
 /// Operator that implements MERGE for a single node pattern.
-/// Finds an existing node matching labels and properties, or creates one.
+///
+/// Matches every node that carries all of the pattern's labels and has every
+/// pattern property equal to its value, and emits one row per match. A
+/// pattern without labels considers every node. Only when nothing matches is
+/// a node created, with all the labels and properties. A pattern property
+/// whose value is null is an error, as in Cypher: no node could ever match
+/// it, so the merge would create a new node on every run.
+///
+/// Candidates come from a property index on one of the labels when one
+/// exists, otherwise from the label index, otherwise from every node.
 pub const MergeNode = struct {
     /// Optional input operator
     input: ?Operator,
@@ -1345,6 +1585,11 @@ pub const MergeNode = struct {
     merged: bool,
     /// Output row
     current_row: ?*Row,
+    /// The input row the pending matches belong to
+    pending_input: ?*Row,
+    /// Matched nodes not yet emitted for the current input row
+    pending: std.ArrayList(NodeId),
+    pending_index: usize,
     /// Allocator
     allocator: Allocator,
 
@@ -1373,6 +1618,9 @@ pub const MergeNode = struct {
             .opened = false,
             .merged = false,
             .current_row = null,
+            .pending_input = null,
+            .pending = .empty,
+            .pending_index = 0,
             .allocator = allocator,
         };
         return self;
@@ -1408,46 +1656,39 @@ pub const MergeNode = struct {
 
         const output_row = self.current_row orelse return OperatorError.NotInitialized;
 
-        if (self.input) |input| {
-            const input_row = try input.next(ctx) orelse return null;
-            output_row.copyFrom(input_row);
-            const node_id = try self.mergeNode(ctx, input_row);
-            output_row.setSlot(self.output_slot, .{ .node_ref = node_id });
-            return output_row;
+        while (true) {
+            if (self.pending_index < self.pending.items.len) {
+                const node_id = self.pending.items[self.pending_index];
+                self.pending_index += 1;
+                output_row.clear();
+                if (self.pending_input) |input_row| output_row.copyFrom(input_row);
+                output_row.setSlot(self.output_slot, .{ .node_ref = node_id });
+                return output_row;
+            }
+
+            var input_row: ?*Row = null;
+            if (self.input) |input| {
+                input_row = try input.next(ctx) orelse return null;
+            } else {
+                // No input: merge once.
+                if (self.merged) return null;
+                self.merged = true;
+            }
+            self.pending_input = input_row;
+            self.pending.clearRetainingCapacity();
+            self.pending_index = 0;
+            try self.mergeNode(ctx, input_row);
         }
-
-        // No input — single merge
-        if (self.merged) return null;
-        self.merged = true;
-
-        output_row.clear();
-        const node_id = try self.mergeNode(ctx, null);
-        output_row.setSlot(self.output_slot, .{ .node_ref = node_id });
-        return output_row;
     }
 
-    fn mergeNode(self: *Self, ctx: *ExecutionContext, row: ?*const Row) OperatorError!NodeId {
-        // Try to find an existing node matching the pattern
-        if (self.labels.len > 0) {
-            const candidates = self.database.getNodesByLabelInTxn(ctx.txn, self.labels[0]) catch {
-                return OperatorError.StorageError;
-            };
-            defer self.database.allocator.free(candidates);
-
-            for (candidates) |candidate_id| {
-                if (try self.matchesProperties(candidate_id, ctx, row)) {
-                    // ON MATCH: apply on_match properties
-                    try self.applySetItems(candidate_id, self.on_match_props, ctx, row);
-                    return candidate_id;
-                }
-            }
-        }
-
+    /// Find every node the pattern matches, applying ON MATCH to each, or
+    /// create one and apply ON CREATE. Leaves the nodes in `pending`.
+    fn mergeNode(self: *Self, ctx: *ExecutionContext, row: ?*const Row) OperatorError!void {
         var dummy_row = Row.init();
         const eval_row: *const Row = if (row) |r| r else &dummy_row;
 
-        // Evaluate pattern properties before create to avoid silent skips and
-        // accidental creation of partially initialized nodes.
+        // Evaluate the pattern properties once: they drive both the match and
+        // the create.
         var evaluated_pattern: std.ArrayList(EvaluatedProperty) = .empty;
         defer evaluated_pattern.deinit(self.allocator);
         try evaluatePropertyExprList(
@@ -1458,46 +1699,124 @@ pub const MergeNode = struct {
             ctx,
             &evaluated_pattern,
         );
+        try refuseNullPatternProperties(ctx, evaluated_pattern.items);
+        try checkVectorItems(self.database, ctx, evaluated_pattern.items);
+
+        // On a database with a vector index, `embedding` in the pattern is
+        // the node's vector, which is not among its properties: match the
+        // rest, then keep the nodes whose vector is the one given.
+        var wanted_vector: ?[]f32 = null;
+        defer if (wanted_vector) |v| self.allocator.free(v);
+        var match_props = evaluated_pattern.items;
+        var without_vector: std.ArrayList(EvaluatedProperty) = .empty;
+        defer without_vector.deinit(self.allocator);
+        for (evaluated_pattern.items) |prop| {
+            if (!isVectorKey(self.database, prop.key)) continue;
+            wanted_vector = (vectorOfValue(self.allocator, prop.value) catch return OperatorError.OutOfMemory) orelse
+                return OperatorError.TypeError;
+            for (evaluated_pattern.items) |other| {
+                if (isVectorKey(self.database, other.key)) continue;
+                without_vector.append(self.allocator, other) catch return OperatorError.OutOfMemory;
+            }
+            match_props = without_vector.items;
+            break;
+        }
+
+        try self.findMatches(ctx, match_props);
+        if (wanted_vector) |vector| {
+            var kept: usize = 0;
+            for (self.pending.items) |node_id| {
+                if (!self.database.nodeVectorEqualsInTxn(ctx.txn, node_id, vector)) continue;
+                self.pending.items[kept] = node_id;
+                kept += 1;
+            }
+            self.pending.items.len = kept;
+        }
+
+        if (self.pending.items.len > 0) {
+            for (self.pending.items) |node_id| {
+                try self.applySetItems(node_id, self.on_match_props, ctx, row);
+            }
+            return;
+        }
 
         // Not found — create the node
-        const node_id = self.database.createNode(ctx.txn, self.labels) catch {
-            return OperatorError.StorageError;
-        };
-
-        // Set the pattern properties on the new node
-        try applyEvaluatedNodeProperties(self.database, ctx.txn, node_id, evaluated_pattern.items);
-
-        // ON CREATE: apply on_create properties
+        const node_id = self.database.createNode(ctx.txn, self.labels) catch |err|
+            return ctx.storageFailure(err, "creating a node", .{});
+        try applyEvaluatedNodeProperties(self.database, ctx, node_id, evaluated_pattern.items, .skip);
         try self.applySetItems(node_id, self.on_create_props, ctx, row);
-
-        return node_id;
+        self.pending.append(self.allocator, node_id) catch return OperatorError.OutOfMemory;
     }
 
-    fn matchesProperties(self: *Self, node_id: NodeId, ctx: *ExecutionContext, row: ?*const Row) OperatorError!bool {
-        if (self.properties.len == 0) return true;
+    /// Put every visible node with all the labels and properties in `pending`.
+    fn findMatches(self: *Self, ctx: *ExecutionContext, props: []const EvaluatedProperty) OperatorError!void {
+        const symbol_table = &self.database.symbol_table;
 
-        var dummy_row = Row.init();
-        const eval_row: *const Row = if (row) |r| r else &dummy_row;
-
-        for (self.properties) |prop| {
-            // Evaluate the expected value from the pattern
-            const expected = self.evaluator.evaluate(prop.value_expr, eval_row, ctx) catch |err| {
-                return mapEvalError(err);
+        // A label or property key the database has never seen cannot be on
+        // any node, so nothing matches.
+        const label_ids = self.allocator.alloc(SymbolId, self.labels.len) catch return OperatorError.OutOfMemory;
+        defer self.allocator.free(label_ids);
+        for (self.labels, label_ids) |label, *id| {
+            id.* = symbol_table.lookup(label) catch |err| switch (err) {
+                SymbolError.NotFound => return,
+                else => return ctx.storageFailure(err, "looking up a label or property key of the MERGE pattern", .{}),
             };
-            const expected_pv = evalResultToPropertyValue(expected, self.allocator) orelse return OperatorError.TypeError;
-
-            // Get the actual value from the node
-            const actual = self.database.getNodePropertyInTxn(ctx.txn, node_id, prop.key) catch {
-                return OperatorError.StorageError;
+        }
+        const key_ids = self.allocator.alloc(SymbolId, props.len) catch return OperatorError.OutOfMemory;
+        defer self.allocator.free(key_ids);
+        for (props, key_ids) |prop, *id| {
+            id.* = symbol_table.lookup(prop.key) catch |err| switch (err) {
+                SymbolError.NotFound => return,
+                else => return ctx.storageFailure(err, "looking up a label or property key of the MERGE pattern", .{}),
             };
-            if (actual == null) return false;
-            var actual_val = actual.?;
-            defer actual_val.deinit(self.database.allocator);
+        }
 
-            // Compare values
-            if (!propertyValuesEqual(expected_pv, actual_val)) {
+        const candidates = try self.candidateIds(ctx, props);
+        defer self.database.allocator.free(candidates);
+
+        for (candidates) |candidate_id| {
+            var node = (self.database.getNodeInTxn(ctx.txn, candidate_id) catch |err|
+                return ctx.storageFailure(err, "reading node {d}", .{candidate_id})) orelse continue;
+            defer node.deinit(self.database.allocator);
+            if (!nodeMatches(node, label_ids, props, key_ids)) continue;
+            self.pending.append(self.allocator, candidate_id) catch return OperatorError.OutOfMemory;
+        }
+    }
+
+    /// The smallest candidate set available: a property index lookup, the
+    /// first label's nodes, or every node. Owned by the database allocator.
+    fn candidateIds(self: *Self, ctx: *ExecutionContext, props: []const EvaluatedProperty) OperatorError![]NodeId {
+        for (self.labels) |label| {
+            for (props) |prop| {
+                const indexed = self.database.hasNodePropertyIndex(label, prop.key) catch false;
+                if (!indexed) continue;
+                return scan_ops.findNodesByIndexedValue(self.database, ctx, label, prop.key, prop.value);
+            }
+        }
+        if (self.labels.len > 0) {
+            return self.database.getNodesByLabelInTxn(ctx.txn, self.labels[0]) catch |err|
+                return ctx.storageFailure(err, "reading the nodes labelled '{s}'", .{self.labels[0]});
+        }
+        return self.database.getAllNodeIdsInTxn(ctx.txn) catch |err|
+            return ctx.storageFailure(err, "reading every node", .{});
+    }
+
+    fn nodeMatches(
+        node: lattice.graph.node.Node,
+        label_ids: []const SymbolId,
+        props: []const EvaluatedProperty,
+        key_ids: []const SymbolId,
+    ) bool {
+        for (label_ids) |wanted| {
+            if (std.mem.indexOfScalar(SymbolId, node.labels, wanted) == null) return false;
+        }
+        outer: for (props, key_ids) |prop, key_id| {
+            for (node.properties) |actual| {
+                if (actual.key_id != key_id) continue;
+                if (mergeValuesEqual(prop.value, actual.value)) continue :outer;
                 return false;
             }
+            return false;
         }
         return true;
     }
@@ -1515,7 +1834,7 @@ pub const MergeNode = struct {
             ctx,
             &evaluated,
         );
-        try applyEvaluatedNodeProperties(self.database, ctx.txn, node_id, evaluated.items);
+        try applyEvaluatedNodeProperties(self.database, ctx, node_id, evaluated.items, .remove);
     }
 
     fn close(ptr: *anyopaque, ctx: *ExecutionContext) void {
@@ -1529,9 +1848,49 @@ pub const MergeNode = struct {
     fn deinit(ptr: *anyopaque, allocator: Allocator) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         if (self.input) |input| input.deinit(allocator);
+        self.pending.deinit(self.allocator);
         allocator.destroy(self);
     }
 };
+
+/// Equality for MERGE matching, as Cypher's `=` sees it: an integer equals
+/// the float with the same value, and lists and maps compare element by
+/// element.
+fn mergeValuesEqual(a: PropertyValue, b: PropertyValue) bool {
+    switch (a) {
+        .int_val => |av| switch (b) {
+            .int_val => |bv| return av == bv,
+            .float_val => |bv| return expression_mod.compareIntFloat(av, bv) == .eq,
+            else => return false,
+        },
+        .float_val => |av| switch (b) {
+            .float_val => |bv| return av == bv,
+            .int_val => |bv| return expression_mod.compareIntFloat(bv, av) == .eq,
+            else => return false,
+        },
+        .list_val => |list| {
+            if (b != .list_val or b.list_val.len != list.len) return false;
+            for (list, b.list_val) |lhs, rhs| {
+                if (!mergeValuesEqual(lhs, rhs)) return false;
+            }
+            return true;
+        },
+        .map_val => |map| {
+            if (b != .map_val or b.map_val.len != map.len) return false;
+            for (map) |entry| {
+                for (b.map_val) |other| {
+                    if (!std.mem.eql(u8, entry.key, other.key)) continue;
+                    if (!mergeValuesEqual(entry.value, other.value)) return false;
+                    break;
+                } else return false;
+            }
+            return true;
+        },
+        .bytes_val => |v| return b == .bytes_val and std.mem.eql(u8, b.bytes_val, v),
+        .vector_val => |v| return b == .vector_val and std.mem.eql(f32, b.vector_val, v),
+        else => return propertyValuesEqual(a, b),
+    }
+}
 
 // ============================================================================
 // MergeEdge Operator
@@ -1539,6 +1898,7 @@ pub const MergeNode = struct {
 
 /// Operator that implements MERGE for a single relationship pattern.
 /// Finds an existing edge matching source/target/type/(optional properties), or creates one.
+/// A pattern property whose value is null is an error, as in a node MERGE.
 pub const MergeEdge = struct {
     /// Input operator providing source/target node bindings
     input: Operator,
@@ -1626,8 +1986,8 @@ pub const MergeEdge = struct {
         const source_val = row.getSlot(self.source_slot) orelse return OperatorError.UnboundVariable;
         const target_val = row.getSlot(self.target_slot) orelse return OperatorError.UnboundVariable;
 
-        const source_id = source_val.asNodeId() orelse return OperatorError.TypeError;
-        const target_id = target_val.asNodeId() orelse return OperatorError.TypeError;
+        const source_id = source_val.asNodeId() orelse return endpointFailure(ctx, "MERGE", source_val);
+        const target_id = target_val.asNodeId() orelse return endpointFailure(ctx, "MERGE", target_val);
 
         const edge_id = try self.mergeEdge(ctx, row, source_id, target_id);
         if (self.output_slot) |slot| {
@@ -1644,18 +2004,24 @@ pub const MergeEdge = struct {
         source_id: NodeId,
         target_id: NodeId,
     ) OperatorError!EdgeId {
+        if (self.properties.len > 0) {
+            var evaluated_pattern: std.ArrayList(EvaluatedProperty) = .empty;
+            defer evaluated_pattern.deinit(self.allocator);
+            try evaluatePropertyExprList(self.allocator, &self.evaluator, self.properties, row, ctx, &evaluated_pattern);
+            try refuseNullPatternProperties(ctx, evaluated_pattern.items);
+        }
+
         if (try self.findMatchingEdgeId(ctx, row, source_id, target_id)) |edge_id| {
-            try self.applyEdgeSetItems(edge_id, self.on_match_props, ctx, row);
+            try self.applyEdgeSetItems(edge_id, self.on_match_props, ctx, row, .remove);
             return edge_id;
         }
 
-        const edge_id = self.database.createEdgeAndGetId(ctx.txn, source_id, target_id, self.edge_type) catch {
-            return OperatorError.StorageError;
-        };
+        const edge_id = self.database.createEdgeAndGetId(ctx.txn, source_id, target_id, self.edge_type) catch |err|
+            return ctx.storageFailure(err, "creating a relationship from node {d} to node {d}", .{ source_id, target_id });
 
         // MERGE pattern properties initialize newly created relationships.
-        try self.applyEdgeSetItems(edge_id, self.properties, ctx, row);
-        try self.applyEdgeSetItems(edge_id, self.on_create_props, ctx, row);
+        try self.applyEdgeSetItems(edge_id, self.properties, ctx, row, .skip);
+        try self.applyEdgeSetItems(edge_id, self.on_create_props, ctx, row, .remove);
 
         return edge_id;
     }
@@ -1670,13 +2036,12 @@ pub const MergeEdge = struct {
         const type_id = self.database.symbol_table.lookup(self.edge_type) catch |err| {
             return switch (err) {
                 SymbolError.NotFound => null,
-                else => OperatorError.StorageError,
+                else => ctx.storageFailure(err, "looking up relationship type '{s}'", .{self.edge_type}),
             };
         };
 
-        const refs = self.database.getOutgoingEdgeRefsByTypeInTxn(ctx.txn, source_id, type_id) catch {
-            return OperatorError.StorageError;
-        };
+        const refs = self.database.getOutgoingEdgeRefsByTypeInTxn(ctx.txn, source_id, type_id) catch |err|
+            return ctx.storageFailure(err, "reading the relationships of node {d}", .{source_id});
         defer self.database.allocator.free(refs);
 
         for (refs) |edge_ref| {
@@ -1697,26 +2062,28 @@ pub const MergeEdge = struct {
     ) OperatorError!bool {
         if (self.properties.len == 0) return true;
 
-        var edge = (self.database.getEdgeInTxn(ctx.txn, edge_id) catch return OperatorError.StorageError) orelse return OperatorError.StorageError;
+        var edge = (self.database.getEdgeInTxn(ctx.txn, edge_id) catch |err|
+            return ctx.storageFailure(err, "reading relationship {d}", .{edge_id})) orelse
+            return ctx.storageFailure(error.NotFound, "reading relationship {d}", .{edge_id});
         defer edge.deinit(self.database.allocator);
 
         for (self.properties) |prop| {
             const expected = self.evaluator.evaluate(prop.value_expr, row, ctx) catch |err| {
                 return mapEvalError(err);
             };
-            const expected_pv = evalResultToPropertyValue(expected, self.allocator) orelse return OperatorError.TypeError;
+            const expected_pv = (evalResultToPropertyValue(expected, self.allocator) catch return OperatorError.OutOfMemory) orelse return OperatorError.TypeError;
 
             const key_id = self.database.symbol_table.lookup(prop.key) catch |err| {
                 return switch (err) {
                     SymbolError.NotFound => false,
-                    else => OperatorError.StorageError,
+                    else => ctx.storageFailure(err, "looking up property key '{s}'", .{prop.key}),
                 };
             };
 
             var found = false;
             for (edge.properties) |actual_prop| {
                 if (actual_prop.key_id != key_id) continue;
-                if (!propertyValuesEqual(expected_pv, actual_prop.value)) {
+                if (!mergeValuesEqual(expected_pv, actual_prop.value)) {
                     return false;
                 }
                 found = true;
@@ -1733,6 +2100,7 @@ pub const MergeEdge = struct {
         items: []const CreateNode.PropertyKV,
         ctx: *ExecutionContext,
         row: *const Row,
+        on_null: NullProperty,
     ) OperatorError!void {
         if (items.len == 0) return;
 
@@ -1746,12 +2114,7 @@ pub const MergeEdge = struct {
             ctx,
             &evaluated,
         );
-
-        for (evaluated.items) |item| {
-            self.database.setEdgePropertyById(ctx.txn, edge_id, item.key, item.value) catch {
-                return OperatorError.StorageError;
-            };
-        }
+        try applyEvaluatedEdgeProperties(self.database, ctx, edge_id, evaluated.items, on_null);
     }
 
     fn close(ptr: *anyopaque, ctx: *ExecutionContext) void {
@@ -1816,30 +2179,30 @@ test "DeleteNode basic structure" {
 test "evalResultToPropertyValue scalar types" {
     const allocator = std.testing.allocator;
 
-    const null_pv = evalResultToPropertyValue(.{ .null_val = {} }, allocator);
+    const null_pv = try evalResultToPropertyValue(.{ .null_val = {} }, allocator);
     try std.testing.expect(null_pv != null);
     try std.testing.expect(null_pv.? == .null_val);
 
-    const bool_pv = evalResultToPropertyValue(.{ .bool_val = true }, allocator);
+    const bool_pv = try evalResultToPropertyValue(.{ .bool_val = true }, allocator);
     try std.testing.expectEqual(true, bool_pv.?.bool_val);
 
-    const int_pv = evalResultToPropertyValue(.{ .int_val = 99 }, allocator);
+    const int_pv = try evalResultToPropertyValue(.{ .int_val = 99 }, allocator);
     try std.testing.expectEqual(@as(i64, 99), int_pv.?.int_val);
 
-    const float_pv = evalResultToPropertyValue(.{ .float_val = 1.5 }, allocator);
+    const float_pv = try evalResultToPropertyValue(.{ .float_val = 1.5 }, allocator);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), float_pv.?.float_val, 0.001);
 
-    const str_pv = evalResultToPropertyValue(.{ .string_val = "test" }, allocator);
+    const str_pv = try evalResultToPropertyValue(.{ .string_val = "test" }, allocator);
     try std.testing.expectEqualStrings("test", str_pv.?.string_val);
 }
 
 test "evalResultToPropertyValue returns null for node/edge refs" {
     const allocator = std.testing.allocator;
 
-    const node_pv = evalResultToPropertyValue(.{ .node_ref = 42 }, allocator);
+    const node_pv = try evalResultToPropertyValue(.{ .node_ref = 42 }, allocator);
     try std.testing.expect(node_pv == null);
 
-    const edge_pv = evalResultToPropertyValue(.{ .edge_ref = 7 }, allocator);
+    const edge_pv = try evalResultToPropertyValue(.{ .edge_ref = 7 }, allocator);
     try std.testing.expect(edge_pv == null);
 }
 
@@ -1847,7 +2210,7 @@ test "evalResultToPropertyValue converts vector" {
     const allocator = std.testing.allocator;
 
     const vec = [_]f32{ 1.0, 2.0, 3.0 };
-    const pv = evalResultToPropertyValue(.{ .vector_val = &vec }, allocator);
+    const pv = try evalResultToPropertyValue(.{ .vector_val = &vec }, allocator);
 
     try std.testing.expect(pv != null);
     try std.testing.expectEqual(@as(usize, 3), pv.?.vector_val.len);
@@ -1864,7 +2227,7 @@ test "evalResultToPropertyValue converts list" {
         .{ .int_val = 2 },
         .{ .string_val = "three" },
     };
-    const pv = evalResultToPropertyValue(.{ .list_val = &items }, allocator);
+    const pv = try evalResultToPropertyValue(.{ .list_val = &items }, allocator);
     defer allocator.free(pv.?.list_val);
 
     try std.testing.expect(pv != null);
@@ -1881,7 +2244,7 @@ test "evalResultToPropertyValue converts map" {
         .{ .key = "name", .value = .{ .string_val = "Alice" } },
         .{ .key = "score", .value = .{ .int_val = 95 } },
     };
-    const pv = evalResultToPropertyValue(.{ .map_val = &entries }, allocator);
+    const pv = try evalResultToPropertyValue(.{ .map_val = &entries }, allocator);
     defer allocator.free(pv.?.map_val);
 
     try std.testing.expect(pv != null);

@@ -1,6 +1,6 @@
 # Parameters
 
-Parameters allow you to pass values into queries safely using the `$name` syntax. This prevents injection attacks and enables query plan caching.
+Parameters allow you to pass values into queries safely using the `$name` syntax. This prevents injection attacks, and since the query text stays the same, the parsed query can be reused from the cache.
 
 ## Syntax
 
@@ -86,14 +86,19 @@ lattice_query_bind_vector(query, "embedding", vec, 128);
 | Float | `float` | `number` | `LATTICE_VALUE_FLOAT` |
 | Boolean | `bool` | `boolean` | `LATTICE_VALUE_BOOL` |
 | Null | `None` | `null` | `LATTICE_VALUE_NULL` |
+| Bytes | `bytes` | `Uint8Array` | `LATTICE_VALUE_BYTES` |
+| List | `list` | `Array` | `LATTICE_VALUE_LIST` |
+| Map | `dict` (string keys) | plain object | `LATTICE_VALUE_MAP` |
 | Vector | `numpy.ndarray` | `Float32Array` | `float*` (via `lattice_query_bind_vector`) |
 
 ## Query Caching
 
-Parameterized queries are cached by their query text. The same query with different parameter values reuses the cached plan, improving performance for repeated queries.
+Queries are cached by their query text. The cache holds the parsed and analysed query, so the same query with different parameter values skips parsing and analysis. Plans are not cached: each execution is planned again, which takes a microsecond or two.
+
+A prepared query (`lattice_query_prepare` in C, which every binding uses) is parsed once, when it is prepared, and keeps its cache entry for as long as it is open, so executing it does not look the text up again. A query that does not parse still prepares; executing it reports the error.
 
 ```python
-# These share the same cached plan:
+# These share the same cache entry:
 db.query("MATCH (n) WHERE n.name = $name RETURN n", parameters={"name": "Alice"})
 db.query("MATCH (n) WHERE n.name = $name RETURN n", parameters={"name": "Bob"})
 ```

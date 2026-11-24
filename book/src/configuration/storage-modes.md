@@ -18,11 +18,13 @@ changes. That sameness is deliberate and worth relying on.
 
 ```python
 db = latticedb.Database("graph.lattice", create=True)
+db.open()  # or use it as a context manager: with latticedb.Database(...) as db:
 ```
 
 The normal case. One file holds everything: nodes, edges, properties, indexes, and
-vectors. A second file appears beside it with a `-wal` suffix while the database
-is open, which is the write-ahead log.
+vectors. Beside it, while the database is open, are the write-ahead log
+(`-wal`) and, when it is open for writing, the flush journal (`-journal`); see
+[Durability and the Log](./durability.md#files-next-to-the-database).
 
 **Do not copy the file while the database is open.** The log holds committed
 changes that are not in the main file yet, so copying only the main file gives you
@@ -34,6 +36,7 @@ different instants. Use `backup`, or stop the process first. See
 
 ```python
 db = latticedb.Database(":memory:")
+db.open()
 ```
 
 ```typescript
@@ -64,12 +67,13 @@ Three differences from a file-backed database, all deliberate:
   and a miss against memory is a copy from one part of RAM to another. Measured on
   a fourteen megabyte database, a 256 KB cache matched a 32 MB one for speed. So
   peak memory stays close to the size of the database: about 360 KB for a hundred
-  kilobyte database, against the sixteen megabytes a file-backed one would
-  reserve.
+  kilobyte database, against the 100 MB cache a file-backed one opened through a
+  binding reserves by default.
 
-The write-ahead log stays on, as a second file inside the same memory. Turning it
-off would save allocations and cost you transactions entirely, which is a bad
-trade.
+The write-ahead log stays on unless you turn it off, as a second file inside the
+same memory. Turning it off saves its allocations and nothing else changes:
+transactions work without it, and there was nothing durable to lose. See
+[In-Memory Databases](./in-memory.md#the-write-ahead-log).
 
 ## Bytes
 

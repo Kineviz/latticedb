@@ -107,7 +107,7 @@ pub const Unwind = struct {
                     self.output_row = self.current_row.?;
 
                     // Bind the list element to the output slot
-                    self.output_row.setSlot(self.output_slot, evalResultToSlot(list[self.list_index], self.allocator));
+                    self.output_row.setSlot(self.output_slot, evalResultToSlot(list[self.list_index], self.allocator) catch return OperatorError.OutOfMemory);
                     self.list_index += 1;
                     return &self.output_row;
                 }
@@ -121,9 +121,16 @@ pub const Unwind = struct {
             self.current_row = input_row.*;
 
             // Evaluate expression on this row
-            const result = self.evaluator.evaluate(self.expr, input_row, ctx) catch {
-                // Expression evaluation failed — skip this row
-                continue;
+            // An evaluation error fails the query. Skipping the row instead
+            // made `UNWIND $missing AS x` and an oversized range() quietly
+            // return nothing.
+            const result = self.evaluator.evaluate(self.expr, input_row, ctx) catch |err| {
+                return switch (err) {
+                    error.OutOfMemory => OperatorError.OutOfMemory,
+                    error.TypeError => OperatorError.TypeError,
+                    error.UnboundVariable => OperatorError.UnboundVariable,
+                    else => OperatorError.EvaluationError,
+                };
             };
 
             // Get the list from the result
@@ -132,11 +139,15 @@ pub const Unwind = struct {
                     self.current_list = list;
                     self.list_index = 0;
                 },
+                // UNWIND null produces no rows, as UNWIND [] does. One null
+                // row made `UNWIND n.tags AS t MERGE (:Tag {name: t})` run
+                // for nodes with no tags.
+                .null_val => continue,
                 else => {
                     // Not a list — treat as single-element (Cypher behavior)
                     // Produce one row with the value itself
                     self.output_row = self.current_row.?;
-                    self.output_row.setSlot(self.output_slot, evalResultToSlot(result, self.allocator));
+                    self.output_row.setSlot(self.output_slot, evalResultToSlot(result, self.allocator) catch return OperatorError.OutOfMemory);
                     return &self.output_row;
                 },
             }
@@ -159,7 +170,7 @@ pub const Unwind = struct {
 };
 
 /// Convert an EvalResult to a SlotValue
-fn evalResultToSlot(result: EvalResult, allocator: Allocator) SlotValue {
+fn evalResultToSlot(result: EvalResult, allocator: Allocator) Allocator.Error!SlotValue {
     return switch (result) {
         .node_ref => |id| .{ .node_ref = id },
         .edge_ref => |id| .{ .edge_ref = id },
@@ -168,7 +179,9 @@ fn evalResultToSlot(result: EvalResult, allocator: Allocator) SlotValue {
         .string_val => |v| .{ .property = .{ .string_val = v } },
         .bytes_val => |v| .{ .property = .{ .bytes_val = v } },
         .bool_val => |v| .{ .property = .{ .bool_val = v } },
-        .null_val => .empty,
-        .list_val, .vector_val, .map_val => .{ .property = result.toPropertyValue(allocator) },
+        .null_val => .{ .property = .{ .null_val = {} } },
+        .vector_val => .{ .property = try result.toPropertyValue(allocator) },
+        .list_val, .map_val => try result.containerToSlotValue(allocator),
+        .path_val => |p| .{ .path = p },
     };
 }

@@ -69,8 +69,7 @@ fn planScanKind(
 }
 
 fn overwriteEdgePayloadWithInvalidData(db: *Database, edge_id: u64) !void {
-    var id_key: [8]u8 = undefined;
-    std.mem.writeInt(u64, &id_key, edge_id, .little);
+    const id_key = db.id_key_order.encode(edge_id);
     try db.edge_store.edge_id_index.delete(&id_key);
     try db.edge_store.edge_id_index.insert(&id_key, "bad");
 }
@@ -916,11 +915,10 @@ test "database: sum aggregation" {
 
     try std.testing.expectEqual(@as(usize, 1), result.rowCount());
 
+    // A sum of integers is an integer.
     const sum_val = result.rows[0].values[0];
     switch (sum_val) {
-        .float_val => |v| {
-            try std.testing.expectApproxEqAbs(@as(f64, 140.0), v, 0.001);
-        },
+        .int_val => |v| try std.testing.expectEqual(@as(i64, 140), v),
         else => return error.UnexpectedValueType,
     }
 }
@@ -3498,6 +3496,72 @@ test "database: replication starts a new generation after the log is truncated" 
     try std.testing.expect(manifest.generations[0].segments.len > 0);
 }
 
+test "database: a replication pass run from a fresh process is idle when nothing changed" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_replicate_idle_runs.ltdb";
+    const wal_path = "/tmp/lattice_replicate_idle_runs.ltdb-wal";
+    const dest = "/tmp/lattice_replicate_idle_runs_dest";
+
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(wal_path) catch {};
+    @import("compat").fs.cwd().deleteTree(dest) catch {};
+    defer @import("compat").fs.cwd().deleteFile(path) catch {};
+    defer @import("compat").fs.cwd().deleteFile(wal_path) catch {};
+    defer @import("compat").fs.cwd().deleteTree(dest) catch {};
+
+    // Default checkpoint policy, which is what the command-line tool opens
+    // with: open and close each empty a log that holds work.
+    const config = lattice.storage.database.DatabaseConfig{ .enable_fts = false, .enable_vector = false };
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        try writeNodes(db, "P", 50);
+    }
+
+    // Each pass is its own open and close, as `lattice replicate` on a timer
+    // is. The first takes the snapshot, and taking it leaves checkpoint
+    // records in the log. Closing must not count those as work and reset
+    // the log, or the next pass finds the reset counter moved and takes a
+    // snapshot of an unchanged database, and so does every pass after it.
+    for (0..3) |pass| {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        const stats = try db.replicateTo(dest);
+        try std.testing.expectEqual(@as(u64, 1), stats.generation);
+        try std.testing.expectEqual(pass == 0, stats.started_generation);
+        try std.testing.expectEqual(@as(u64, 0), stats.frames_shipped);
+    }
+
+    // A reader in between changes nothing either.
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        var txn = try db.beginTransaction(.read_only);
+        try db.commitTransaction(&txn);
+    }
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        const stats = try db.replicateTo(dest);
+        try std.testing.expect(!stats.started_generation);
+    }
+
+    // A writer that closes folds its work into the file and resets the log,
+    // so the pass after it starts a generation from a fresh snapshot.
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        try writeNodes(db, "Q", 50);
+    }
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        const stats = try db.replicateTo(dest);
+        try std.testing.expect(stats.started_generation);
+        try std.testing.expectEqual(@as(u64, 2), stats.generation);
+    }
+}
+
 test "database: replication refuses a destination holding another database" {
     const allocator = std.testing.allocator;
     const path_a = "/tmp/lattice_replicate_a.ltdb";
@@ -4028,6 +4092,84 @@ test "database: a serialized database round-trips through bytes" {
     }
 }
 
+/// Without a log there are no explicit transactions, so writes arrive as
+/// queries, each committed on its own.
+fn createNodesByQuery(db: *Database, n: usize) !void {
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const cypher = try std.fmt.bufPrint(&buf, "CREATE (p:Person {{i: {d}}})", .{i});
+        var result = try db.query(cypher);
+        result.deinit();
+    }
+}
+
+test "database: serialize without a log includes every committed write" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_serialize_nowal.ltdb";
+
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    defer @import("compat").fs.cwd().deleteFile(path) catch {};
+
+    const db = try Database.open(allocator, path, .{
+        .create = true,
+        .config = .{ .enable_wal = false, .enable_fts = false, .enable_vector = false },
+    });
+    defer db.close();
+
+    // Nothing is synced or closed before the copy. Without a log there is no
+    // checkpoint to fold these in, so they are still dirty in the buffer pool.
+    try createNodesByQuery(db, 50);
+
+    const bytes = try db.serialize(allocator);
+    defer allocator.free(bytes);
+
+    const copy = try Database.deserialize(allocator, bytes, .{
+        .config = .{ .enable_fts = false, .enable_vector = false },
+    });
+    defer copy.close();
+
+    var result = try copy.query("MATCH (p:Person) RETURN p.i AS i");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 50), result.rowCount());
+}
+
+test "database: backup without a log includes every committed write" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_backup_nowal.ltdb";
+    const dest = "/tmp/lattice_backup_nowal_copy.ltdb";
+    const dest_wal = "/tmp/lattice_backup_nowal_copy.ltdb-wal";
+
+    for ([_][]const u8{ path, dest, dest_wal }) |p| {
+        @import("compat").fs.cwd().deleteFile(p) catch {};
+    }
+    defer for ([_][]const u8{ path, dest, dest_wal }) |p| {
+        @import("compat").fs.cwd().deleteFile(p) catch {};
+    };
+
+    {
+        const db = try Database.open(allocator, path, .{
+            .create = true,
+            .config = .{ .enable_wal = false, .enable_fts = false, .enable_vector = false },
+        });
+        defer db.close();
+
+        try createNodesByQuery(db, 50);
+
+        const stats = try db.backup(dest);
+        try std.testing.expect(stats.pages_flushed > 0);
+    }
+
+    const copy = try Database.open(allocator, dest, .{
+        .config = .{ .enable_fts = false, .enable_vector = false },
+    });
+    defer copy.close();
+
+    var result = try copy.query("MATCH (p:Person) RETURN p.i AS i");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 50), result.rowCount());
+}
+
 test "database: a deserialized database is writable and leaves nothing behind" {
     const allocator = std.testing.allocator;
     const path = "/tmp/lattice_serialize_rw.ltdb";
@@ -4338,7 +4480,7 @@ test "database: deserialize can borrow the caller's bytes" {
 
         borrowed_bytes = switch (db.vfs) {
             .memory => |*m| m.byteCount(),
-            .posix => 0,
+            .posix, .external, .overlay => 0,
         };
     }
 
@@ -4354,7 +4496,7 @@ test "database: deserialize can borrow the caller's bytes" {
 
         copied_bytes = switch (db.vfs) {
             .memory => |*m| m.byteCount(),
-            .posix => 0,
+            .posix, .external, .overlay => 0,
         };
     }
 
@@ -4927,7 +5069,6 @@ test "database: scoped full-text views stay out of each other's way" {
     const still_there = (try body.get("bread")).?;
     defer body.freeValue(still_there);
     try std.testing.expectEqualStrings("B1", still_there);
-
 }
 
 test "database: a full-text index whose prefix ends in 0xff iterates completely" {
@@ -4952,7 +5093,6 @@ test "database: a full-text index whose prefix ends in 0xff iterates completely"
     try edge.iterateAll(&it);
     while (try it.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 2), count);
-
 }
 
 /// Free what `ftsSearchIndex` returned.
@@ -5409,6 +5549,330 @@ test "database: an edge search sees the transaction's own uncommitted writes" {
     try db.commitTransaction(&txn);
 
     const committed = try db.ftsSearchIndexInTxn(null, .edge, "REVIEWED", "note", "thorough", 10);
+    defer db.freeFtsSearchResults(committed);
+    try std.testing.expectEqual(@as(usize, 1), committed.len);
+}
+
+test "database: fuzzy search inside a transaction sees pending edges and fills its limit" {
+    const allocator = std.testing.allocator;
+    const db = try Database.open(allocator, ":memory:", .{
+        .create = true,
+        .config = .{ .enable_fts = true, .enable_vector = false },
+    });
+    defer db.close();
+
+    try db.createEdgeFtsIndex("REVIEWED", "note");
+    try db.createNodeFtsIndex("Doc", "body");
+
+    // The short document outranks the long one for "thorough".
+    const short = try db.createNode(null, &[_][]const u8{"Doc"});
+    try db.setNodeProperty(null, short, "body", .{ .string_val = "thorough" });
+    const long = try db.createNode(null, &[_][]const u8{"Doc"});
+    try db.setNodeProperty(null, long, "body", .{ .string_val = "a thorough review of every chapter and appendix" });
+
+    var txn = try db.beginTransaction(.read_write);
+    defer db.abortTransaction(&txn) catch {};
+    const a = try db.createNode(&txn, &[_][]const u8{"Person"});
+    const b = try db.createNode(&txn, &[_][]const u8{"Paper"});
+    const e = try db.createEdgeAndGetId(&txn, a, b, "REVIEWED");
+    try db.setEdgePropertyById(&txn, e, "note", .{ .string_val = "thorough and well argued" });
+
+    // An edge written in this transaction is found, as the exact search finds it.
+    const edges = try db.ftsSearchIndexFuzzy(&txn, .edge, "REVIEWED", "note", "thorough", 10, 1, 4);
+    defer db.freeFtsSearchResults(edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqual(e, edges[0].doc_id);
+
+    // The best indexed match stops matching in this transaction. The one left
+    // still fills a limit of one.
+    try db.setNodeProperty(&txn, short, "body", .{ .string_val = "sloppy" });
+    const nodes = try db.ftsSearchIndexFuzzy(&txn, .node, "Doc", "body", "thorough", 1, 1, 4);
+    defer db.freeFtsSearchResults(nodes);
+    try std.testing.expectEqual(@as(usize, 1), nodes.len);
+    try std.testing.expectEqual(long, nodes[0].doc_id);
+}
+
+test "database: retrying a full-text declaration that failed part way indexes each document once" {
+    // Fail the declaration at every allocation in turn, then retry it. Whatever
+    // the failed attempt wrote must not be added to by the retry.
+    var fail_at: usize = 0;
+    var failures: usize = 0;
+    while (true) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
+        const db = try Database.open(failing.allocator(), ":memory:", .{
+            .create = true,
+            .config = .{ .enable_fts = true, .enable_vector = false },
+        });
+        defer db.close();
+
+        var ids: [12]u64 = undefined;
+        for (&ids, 0..) |*id, i| {
+            id.* = try db.createNode(null, &[_][]const u8{"Doc"});
+            var text_buf: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&text_buf, "shared word{c}", .{@as(u8, @intCast('a' + i))});
+            try db.setNodeProperty(null, id.*, "body", .{ .string_val = text });
+        }
+
+        failing.fail_index = failing.alloc_index + fail_at;
+        const first = db.createNodeFtsIndex("Doc", "body");
+        failing.fail_index = std.math.maxInt(usize);
+        if (first) |_| break else |_| failures += 1;
+
+        // A failure after the declaration was recorded (while syncing it)
+        // leaves the index declared, so the retry finds it there.
+        db.createNodeFtsIndex("Doc", "body") catch |err| switch (err) {
+            error.AlreadyExists => {},
+            else => return err,
+        };
+        const results = try db.ftsSearchIndex(.node, "Doc", "body", "shared", 100);
+        defer db.freeFtsSearchResults(results);
+        try std.testing.expectEqual(ids.len, results.len);
+        for (ids) |id| {
+            var count: usize = 0;
+            for (results) |r| {
+                if (r.doc_id == id) count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), count);
+        }
+    }
+    try std.testing.expect(failures > 0);
+}
+
+test "database: an unreadable symbol table is not opened for writing" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/s3_lattice_unreadable_symbols_test.ltdb";
+    const cwd = @import("compat").fs.cwd();
+    cwd.deleteFile(path) catch {};
+    cwd.deleteFile(path ++ "-wal") catch {};
+    defer cwd.deleteFile(path) catch {};
+    defer cwd.deleteFile(path ++ "-wal") catch {};
+
+    var root: u32 = 0;
+    var page_size: u32 = 0;
+    {
+        const db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_wal = false, .enable_fts = false } });
+        defer db.close();
+        _ = try db.createNode(null, &[_][]const u8{"Person"});
+        try db.sync();
+        root = db.page_manager.getHeader().getTreeRoot(.symbol_reverse);
+        page_size = db.page_manager.getPageSize();
+    }
+
+    // Damage the page the id -> name tree starts at, so its checksum fails.
+    {
+        const file = try cwd.openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        try file.pwriteAll(&([_]u8{0xA5} ** 64), @as(u64, root) * page_size + 128);
+    }
+
+    // The next symbol id is found by scanning that tree. Without it the
+    // counter would restart at the first id and a new label would take an id
+    // "Person" already has.
+    try std.testing.expectError(error.IoError, Database.open(allocator, path, .{ .config = .{ .enable_wal = false, .enable_fts = false } }));
+}
+
+test "database: an unreadable edge id index is not opened for writing" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_unreadable_edge_ids_test.ltdb";
+    const cwd = @import("compat").fs.cwd();
+    cwd.deleteFile(path) catch {};
+    cwd.deleteFile(path ++ "-wal") catch {};
+    defer cwd.deleteFile(path) catch {};
+    defer cwd.deleteFile(path ++ "-wal") catch {};
+
+    var root: u32 = 0;
+    var page_size: u32 = 0;
+    {
+        const db = try Database.open(allocator, path, .{ .create = true, .config = .{ .enable_wal = false, .enable_fts = false } });
+        defer db.close();
+        const a = try db.createNode(null, &[_][]const u8{"Person"});
+        const b = try db.createNode(null, &[_][]const u8{"Person"});
+        try db.createEdge(null, a, b, "KNOWS");
+        try db.sync();
+        root = db.page_manager.getHeader().getTreeRoot(.edge_id_index);
+        page_size = db.page_manager.getPageSize();
+    }
+
+    // Damage the page the edge-id index starts at, so its checksum fails.
+    {
+        const file = try cwd.openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        try file.pwriteAll(&([_]u8{0xA5} ** 64), @as(u64, root) * page_size + 128);
+    }
+
+    // The next edge id is kept in that tree. Without it the counter would
+    // restart at 1 and a new edge would replace the entry of the first.
+    try std.testing.expectError(error.IoError, Database.open(allocator, path, .{ .config = .{ .enable_wal = false, .enable_fts = false } }));
+}
+
+test "database: vectors and full-text search work on pages larger than 4096 bytes" {
+    // Vector, HNSW and posting pages use the first 4096 bytes of a page
+    // whatever the page size: that layout is part of the file format, so a
+    // larger page wastes the rest rather than holding more. This checks that
+    // they still read back what they wrote, after a reopen, for vectors that
+    // fit in a page and vectors that span several.
+    const allocator = std.testing.allocator;
+    const path = "/tmp/s3_lattice_large_page_vectors_test.ltdb";
+    const cwd = @import("compat").fs.cwd();
+
+    for ([_]u16{ 16, 1536 }) |dims| {
+        cwd.deleteFile(path) catch {};
+        cwd.deleteFile(path ++ "-wal") catch {};
+        defer cwd.deleteFile(path) catch {};
+        defer cwd.deleteFile(path ++ "-wal") catch {};
+
+        const count = 60;
+        const vectors = try allocator.alloc(f32, count * @as(usize, dims));
+        defer allocator.free(vectors);
+        var prng = std.Random.DefaultPrng.init(dims);
+        for (vectors) |*x| x.* = prng.random().float(f32);
+        var ids: [count]u64 = undefined;
+
+        const config: lattice.storage.database.DatabaseConfig = .{ .enable_fts = true, .enable_vector = true, .vector_dimensions = dims };
+        {
+            const db = try Database.open(allocator, path, .{ .create = true, .page_size = 8192, .config = config });
+            defer db.close();
+            try db.createNodeFtsIndex("Doc", "body");
+            for (&ids, 0..) |*id, i| {
+                id.* = try db.createNode(null, &[_][]const u8{"Doc"});
+                try db.setNodeVector(id.*, vectors[i * dims ..][0..dims]);
+                try db.setNodeProperty(null, id.*, "body", .{ .string_val = if (i % 2 == 0) "even shared" else "odd shared" });
+            }
+            try db.sync();
+        }
+        {
+            const db = try Database.open(allocator, path, .{ .config = config });
+            defer db.close();
+            try std.testing.expectEqual(@as(u32, 8192), db.page_manager.getPageSize());
+            for (ids, 0..) |id, i| {
+                const results = try db.vectorSearch(vectors[i * dims ..][0..dims], 1, 64);
+                defer db.freeVectorSearchResults(results);
+                try std.testing.expectEqual(id, results[0].node_id);
+            }
+            const even = try db.ftsSearchIndex(.node, "Doc", "body", "even shared", 100);
+            defer db.freeFtsSearchResults(even);
+            try std.testing.expectEqual(@as(usize, count / 2), even.len);
+        }
+    }
+}
+
+test "database: a node and an edge full-text index cannot share a name and property" {
+    const allocator = std.testing.allocator;
+    const db = try Database.open(allocator, ":memory:", .{
+        .create = true,
+        .config = .{ .enable_fts = true, .enable_vector = false },
+    });
+    defer db.close();
+
+    // Labels and relationship types share symbols, and index storage is keyed
+    // by symbol and property, so these two would be one index underneath.
+    try db.createNodeFtsIndex("Review", "text");
+    try std.testing.expectError(error.AlreadyExists, db.createEdgeFtsIndex("Review", "text"));
+    try std.testing.expect(!(try db.hasEdgeFtsIndex("Review", "text")));
+
+    // The other order too, and a different property is still fine.
+    try db.createEdgeFtsIndex("Cites", "note");
+    try std.testing.expectError(error.AlreadyExists, db.createNodeFtsIndex("Cites", "note"));
+    try db.createEdgeFtsIndex("Review", "body");
+
+    const node = try db.createNode(null, &[_][]const u8{"Review"});
+    try db.setNodeProperty(null, node, "text", .{ .string_val = "alpha" });
+    const other = try db.createNode(null, &[_][]const u8{"Review"});
+    const edge = try db.createEdgeAndGetId(null, node, other, "Review");
+    try db.setEdgePropertyById(null, edge, "text", .{ .string_val = "beta" });
+
+    // Edge text is not in the node index, and the node keeps its own length.
+    const beta = try db.ftsSearchIndex(.node, "Review", "text", "beta", 10);
+    defer db.freeFtsSearchResults(beta);
+    try std.testing.expectEqual(@as(usize, 0), beta.len);
+    const alpha = try db.ftsSearchIndex(.node, "Review", "text", "alpha", 10);
+    defer db.freeFtsSearchResults(alpha);
+    try std.testing.expectEqual(@as(usize, 1), alpha.len);
+    try std.testing.expectEqual(node, alpha[0].doc_id);
+}
+
+test "database: uncommitted text matches full-text queries by whole terms" {
+    const allocator = std.testing.allocator;
+    const db = try Database.open(allocator, ":memory:", .{
+        .create = true,
+        .config = .{ .enable_fts = true, .enable_vector = false },
+    });
+    defer db.close();
+
+    try db.createNodeFtsIndex("Doc", "body");
+
+    var txn = try db.beginTransaction(.read_write);
+    const a = try db.createNode(&txn, &[_][]const u8{"Doc"});
+    try db.setNodeProperty(&txn, a, "body", .{ .string_val = "concatenate the strings" });
+    const b = try db.createNode(&txn, &[_][]const u8{"Doc"});
+    try db.setNodeProperty(&txn, b, "body", .{ .string_val = "a cat, asleep" });
+
+    // Pending text answers the same way the index will after commit.
+    for ([_][]const u8{ "cat", "cat," }) |query| {
+        const staged = try db.ftsSearchIndexInTxn(&txn, .node, "Doc", "body", query, 10);
+        defer db.freeFtsSearchResults(staged);
+        try std.testing.expectEqual(@as(usize, 1), staged.len);
+        try std.testing.expectEqual(b, staged[0].doc_id);
+    }
+
+    try db.commitTransaction(&txn);
+    const committed = try db.ftsSearchIndexInTxn(null, .node, "Doc", "body", "cat", 10);
+    defer db.freeFtsSearchResults(committed);
+    try std.testing.expectEqual(@as(usize, 1), committed.len);
+    try std.testing.expectEqual(b, committed[0].doc_id);
+}
+
+test "database: full-text search finds non-ASCII words whole, before and after reopen" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_fts_unicode_words_reopen_test.ltdb";
+    @import("compat").fs.cwd().deleteFile(path) catch {};
+    @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer @import("compat").fs.cwd().deleteFile(path) catch {};
+    defer @import("compat").fs.cwd().deleteFile(path ++ "-wal") catch {};
+
+    var muller: u64 = 0;
+    {
+        const db = try Database.open(allocator, path, .{
+            .create = true,
+            .config = .{ .enable_fts = true, .enable_vector = false },
+        });
+        defer db.close();
+        try db.createNodeFtsIndex("Person", "name");
+
+        var txn = try db.beginTransaction(.read_write);
+        muller = try db.createNode(&txn, &[_][]const u8{"Person"});
+        try db.setNodeProperty(&txn, muller, "name", .{ .string_val = "Herr Müller" });
+        const zoller = try db.createNode(&txn, &[_][]const u8{"Person"});
+        try db.setNodeProperty(&txn, zoller, "name", .{ .string_val = "Frau Zöller" });
+        try db.commitTransaction(&txn);
+
+        // Pending text is analysed the way the index analyses it.
+        var pending = try db.beginTransaction(.read_write);
+        const angstrom = try db.createNode(&pending, &[_][]const u8{"Person"});
+        try db.setNodeProperty(&pending, angstrom, "name", .{ .string_val = "Anders Ångström" });
+        const staged = try db.ftsSearchIndexInTxn(&pending, .node, "Person", "name", "angstrom", 10);
+        defer db.freeFtsSearchResults(staged);
+        try std.testing.expectEqual(@as(usize, 1), staged.len);
+        try std.testing.expectEqual(angstrom, staged[0].doc_id);
+        try db.commitTransaction(&pending);
+    }
+
+    const db = try Database.open(allocator, path, .{
+        .create = false,
+        .config = .{ .enable_fts = true, .enable_vector = false },
+    });
+    defer db.close();
+    for ([_][]const u8{ "Müller", "MULLER", "müller" }) |query| {
+        const found = try db.ftsSearchIndexInTxn(null, .node, "Person", "name", query, 10);
+        defer db.freeFtsSearchResults(found);
+        try std.testing.expectEqual(@as(usize, 1), found.len);
+        try std.testing.expectEqual(muller, found[0].doc_id);
+    }
+    // 0.16.0 indexed both names as "ller", so each found the other.
+    const fragment = try db.ftsSearchIndexInTxn(null, .node, "Person", "name", "ller", 10);
+    defer db.freeFtsSearchResults(fragment);
+    try std.testing.expectEqual(@as(usize, 0), fragment.len);
+    const committed = try db.ftsSearchIndexInTxn(null, .node, "Person", "name", "ÅNGSTRÖM", 10);
     defer db.freeFtsSearchResults(committed);
     try std.testing.expectEqual(@as(usize, 1), committed.len);
 }

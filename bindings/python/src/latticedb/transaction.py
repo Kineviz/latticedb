@@ -9,14 +9,18 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from latticedb._bindings import (
     LATTICE_ERROR_NOT_FOUND,
+    LATTICE_ERROR_TXN_ABORTED,
+    LATTICE_ERROR_UNSUPPORTED,
     LATTICE_TXN_READ_ONLY,
     LATTICE_TXN_READ_WRITE,
     LATTICE_VALUE_NULL,
     LatticeNodeId,
+    LatticeUnsupportedError,
     LatticeValue,
     NodeWithVector,
     check_error,
     check_query_error,
+    check_vector_error,
     get_lib,
     python_to_value,
     value_to_python,
@@ -85,7 +89,13 @@ class Transaction:
         self._handle = txn_ptr
 
     def commit(self) -> None:
-        """Commit the transaction."""
+        """Commit the transaction.
+
+        If the commit fails with :class:`LatticeTxnAbortedError`, the native
+        transaction is already gone and this one is over: rolling it back
+        afterwards does nothing. After any other failure it stays open, and
+        leaving the ``with`` block (or calling :meth:`rollback`) rolls it back.
+        """
         if self._committed:
             raise RuntimeError("Transaction already committed")
         if self._rolled_back:
@@ -95,6 +105,11 @@ class Transaction:
 
         lib = get_lib()
         code = lib._lib.lattice_commit(self._handle)
+        if code == LATTICE_ERROR_TXN_ABORTED:
+            # The native side has retired the handle; it cannot be committed
+            # or rolled back again, so the transaction ended without committing.
+            self._handle = None
+            self._rolled_back = True
         check_error(code)
         self._handle = None
         self._committed = True
@@ -224,7 +239,8 @@ class Transaction:
 
         Args:
             labels: Node labels.
-            properties: Node properties.
+            properties: Node properties. A key whose value is None is left
+                out, as in Cypher's ``CREATE``.
         """
         if self._read_only:
             raise RuntimeError("Cannot create node in read-only transaction")
@@ -257,20 +273,35 @@ class Transaction:
             properties={},
         )
 
-        # Set properties if provided
+        # Set properties if provided. A None value stores nothing, as in
+        # Cypher, so the returned node leaves it out too.
         if properties:
             for key, value in properties.items():
                 self.set_property(node.id, key, value)
-                node.properties[key] = value
+                if value is not None:
+                    node.properties[key] = value
 
         return node
 
-    def delete_node(self, node_id: int) -> None:
+    def delete_node(self, node_id: int, *, detach: bool = False) -> None:
         """
         Delete a node.
 
+        A node that still has relationships is not deleted unless ``detach`` is
+        set, since deleting it alone would leave edges pointing at nothing; this
+        matches Cypher's ``DELETE`` and ``DETACH DELETE``. Deleting a node that
+        does not exist does nothing.
+
         Args:
             node_id: ID of the node to delete.
+            detach: Also delete every relationship the node has, as part of
+                this transaction.
+
+        Raises:
+            LatticeHasRelationshipsError: ``detach`` is false and the node has
+                relationships this transaction can see. Nothing was deleted.
+            LatticeUnsupportedError: ``detach`` is set and the native library
+                has no ``lattice_node_detach_delete``.
         """
         if self._read_only:
             raise RuntimeError("Cannot delete node in read-only transaction")
@@ -278,7 +309,16 @@ class Transaction:
             raise RuntimeError("Transaction not started")
 
         lib = get_lib()
-        code = lib._lib.lattice_node_delete(self._handle, node_id)
+        if detach:
+            if not getattr(lib, "_has_node_detach_delete", False):
+                raise LatticeUnsupportedError(
+                    "lattice_node_detach_delete is required to delete a node with "
+                    "its relationships",
+                    LATTICE_ERROR_UNSUPPORTED,
+                )
+            code = lib._lib.lattice_node_detach_delete(self._handle, node_id)
+        else:
+            code = lib._lib.lattice_node_delete(self._handle, node_id)
         check_error(code)
 
     def get_node(self, node_id: int) -> Optional[Node]:
@@ -316,14 +356,17 @@ class Transaction:
             return None
         check_error(code)
 
-        # Parse comma-separated labels
+        # Parse comma-separated labels. A node without labels comes back as an
+        # allocated empty string, which still has to be freed.
         labels: List[str] = []
-        if labels_ptr.value:
-            labels_str = labels_ptr.value.decode("utf-8")
-            if labels_str:
-                labels = labels_str.split(",")
-            # Free the allocated string
-            lib._lib.lattice_free_string(labels_ptr)
+        raw = labels_ptr.value
+        if raw is not None:
+            try:
+                labels_str = raw.decode("utf-8")
+                if labels_str:
+                    labels = labels_str.split(",")
+            finally:
+                lib._lib.lattice_free_string(labels_ptr)
 
         return Node(
             id=node_id,
@@ -339,6 +382,10 @@ class Transaction:
     ) -> None:
         """
         Set a property on a node.
+
+        A value of None removes the property, as Cypher's ``SET n.x = null``
+        does; removing one the node does not have does nothing. (Up to
+        0.18.0 it stored the None.)
 
         Args:
             node_id: The node ID.
@@ -601,8 +648,14 @@ class Transaction:
 
         Args:
             node_id: The node ID.
-            key: Vector property key.
+            key: Vector key; must be ``"embedding"`` or ``""``.
             vector: Vector data as float32 array.
+
+        Raises:
+            LatticeUnsupportedError: If the database was created without a
+                vector index, or the key is another name.
+            LatticeInvalidArgError: If the vector does not have the
+                index's dimensions, or has a NaN or infinite element.
         """
         if self._read_only:
             raise RuntimeError("Cannot set vector in read-only transaction")
@@ -622,6 +675,89 @@ class Transaction:
             vec_ptr,
             len(vec),
         )
+        # Another key is refused as unsupported before the index is looked at.
+        if key in ("embedding", ""):
+            check_vector_error(code, "set a vector")
+        else:
+            check_error(code)
+
+    def get_vector(
+        self,
+        node_id: int,
+        key: str = "embedding",
+    ) -> Optional["NDArray[np.float32]"]:
+        """
+        Get a node's vector as this transaction sees it.
+
+        Under the cosine metric, the default, a committed vector reads back
+        scaled to unit length: ``[3, 4]`` reads back as ``[0.6, 0.8]``. The
+        direction, and so every cosine distance, is unchanged. Under the
+        euclidean and dot-product metrics it reads back as stored. A vector
+        set earlier in this transaction reads back as written.
+
+        Args:
+            node_id: The node ID.
+            key: Vector key; must be ``"embedding"`` or ``""``.
+
+        Returns:
+            The vector as a float32 array, or None if the node has no vector.
+
+        Raises:
+            LatticeNotFoundError: If the node does not exist.
+        """
+        if self._handle is None:
+            raise RuntimeError("Transaction not started")
+
+        import numpy as np
+
+        lib = get_lib()
+        vector_ptr = ctypes.POINTER(ctypes.c_float)()
+        dims = ctypes.c_uint32()
+        code = lib._lib.lattice_node_get_vector(
+            self._handle,
+            node_id,
+            key.encode("utf-8"),
+            byref(vector_ptr),
+            byref(dims),
+        )
+        check_error(code)
+        if not vector_ptr:
+            return None
+        try:
+            result = np.ctypeslib.as_array(vector_ptr, shape=(dims.value,)).copy()
+            return cast("NDArray[np.float32]", result)
+        finally:
+            lib._lib.lattice_free_vector(vector_ptr, dims)
+
+    def remove_vector(
+        self,
+        node_id: int,
+        key: str = "embedding",
+    ) -> None:
+        """
+        Remove a node's vector.
+
+        The node keeps its labels and properties; vector search no longer
+        returns it. Removing a vector the node does not have does nothing.
+
+        Args:
+            node_id: The node ID.
+            key: Vector key; must be ``"embedding"`` or ``""``.
+
+        Raises:
+            LatticeNotFoundError: If the node does not exist.
+        """
+        if self._read_only:
+            raise RuntimeError("Cannot remove vector in read-only transaction")
+        if self._handle is None:
+            raise RuntimeError("Transaction not started")
+
+        lib = get_lib()
+        code = lib._lib.lattice_node_remove_vector(
+            self._handle,
+            node_id,
+            key.encode("utf-8"),
+        )
         check_error(code)
 
     def batch_insert_vectors(
@@ -637,6 +773,10 @@ class Transaction:
 
         Returns:
             List of N node IDs.
+
+        Raises:
+            LatticeUnsupportedError: If the database was created without a
+                vector index. No node is created.
         """
         if self._read_only:
             raise RuntimeError("Cannot insert in read-only transaction")
@@ -674,7 +814,7 @@ class Transaction:
             node_ids,
             ctypes.byref(count_out),
         )
-        check_error(code)
+        check_vector_error(code, "insert nodes with vectors")
 
         created = count_out.value
         if created < n:
@@ -692,7 +832,7 @@ class Transaction:
     ) -> List[int]:
         """Deprecated compatibility alias for :meth:`batch_insert_vectors`."""
         warnings.warn(
-            "Transaction.batch_insert(...) is deprecated; use batch_insert_vectors(...). Earliest removal is v0.6.0.",
+            "Transaction.batch_insert(...) is deprecated; use batch_insert_vectors(...).",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -707,6 +847,10 @@ class Transaction:
     ) -> List[VectorSearchResult]:
         """
         Search for similar vectors within this transaction.
+
+        Raises:
+            LatticeUnsupportedError: If the database was created without a
+                vector index.
         """
         if self._handle is None:
             raise RuntimeError("Transaction not started")
@@ -730,7 +874,7 @@ class Transaction:
             ef_search,
             byref(result_ptr),
         )
-        check_error(code)
+        check_vector_error(code, "search vectors")
 
         try:
             count = lib._lib.lattice_vector_result_count(result_ptr)
@@ -859,10 +1003,14 @@ class Transaction:
             source_id: Source node ID.
             target_id: Target node ID.
             edge_type: Edge type/label.
-            properties: Edge properties.
+            properties: Edge properties. A key whose value is None is left out.
 
         Returns:
             The created edge.
+
+        Raises:
+            LatticeNotFoundError: Either node does not exist as this transaction
+                sees it.
         """
         if self._read_only:
             raise RuntimeError("Cannot create edge in read-only transaction")
@@ -888,10 +1036,13 @@ class Transaction:
             properties={},
         )
 
+        # A None value stores nothing, as in Cypher, so the returned edge
+        # leaves it out too.
         if properties:
             for key, value in properties.items():
                 self.set_edge_property(edge.id, key, value)
-                edge.properties[key] = value
+                if value is not None:
+                    edge.properties[key] = value
 
         return edge
 
@@ -923,6 +1074,8 @@ class Transaction:
     ) -> None:
         """
         Set a property on an edge.
+
+        A value of None removes the property, as :meth:`set_property` does.
 
         Args:
             edge_id: The stable edge ID.
@@ -1131,7 +1284,7 @@ class Transaction:
 
                 source = c_uint64()
                 target = c_uint64()
-                edge_type_ptr = ctypes.c_char_p()
+                edge_type_ptr = c_void_p()
                 edge_type_len = ctypes.c_uint32()
                 code = lib._lib.lattice_edge_result_get(
                     result_ptr,
@@ -1142,7 +1295,14 @@ class Transaction:
                     byref(edge_type_len),
                 )
                 check_error(code)
-                edge_type = edge_type_ptr.value[:edge_type_len.value].decode("utf-8") if edge_type_ptr.value else ""
+                # Read exactly the reported length. Libraries before 0.17.0
+                # did not NUL-terminate the type, so reading it as a C string
+                # ran past the end of the allocation.
+                edge_type = (
+                    ctypes.string_at(edge_type_ptr.value, edge_type_len.value).decode("utf-8")
+                    if edge_type_ptr.value and edge_type_len.value
+                    else ""
+                )
                 edges.append(Edge(
                     id=edge_id.value,
                     source_id=source.value,

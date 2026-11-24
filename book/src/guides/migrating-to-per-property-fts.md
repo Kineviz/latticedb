@@ -127,9 +127,8 @@ pattern was `MATCH (d)` with no label. Two labels can each declare an index on
 `title`, so the property alone does not say which you mean. Write `MATCH
 (d:Document)`.
 
-Note that a `WITH` starts a new scope: what comes through it is an alias rather
-than a node written with a label, so `@@` after a `WITH` needs the label written
-again in a later pattern.
+A node passed through `WITH` keeps its label, even under a new name, so
+`MATCH (d:Document) WITH d AS x WHERE x.title @@ 'graph' RETURN x.title` works.
 
 ## API changes by language
 
@@ -162,9 +161,8 @@ inside an `OR` returned all of them, so the answer depended on where you wrote i
 
 **Fuzzy search inside a transaction is now actually fuzzy.** It accepted
 `max_distance` and `min_term_length`, discarded both, and ran an exact search.
-One caveat remains and is deliberate: text your transaction has written but not
-committed is matched by term presence rather than edit distance, so a typo will
-not find a document you have only just written.
+Since 0.17.0 that includes text your transaction has written but not committed:
+it is matched with the same edit distances.
 
 ## Only string properties are indexed
 

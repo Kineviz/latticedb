@@ -11,6 +11,38 @@ RETURN n
 
 If a `Person` node with `name: "Alice"` exists, it is returned. Otherwise, one is created.
 
+A node matches when it carries every label in the pattern and has every property
+in it equal to the pattern's value, comparing as `=` does (an integer equals the
+float of the same value, and lists and maps compare element by element). Other
+labels and properties on the node do not matter. A pattern without a label
+considers every node. Only when nothing matches is a node created, with all the
+pattern's labels and properties.
+
+A relationship in `MERGE` compares its properties the same way, so
+`MERGE (a)-[:R {w: 1}]->(b)` finds an existing relationship whose `w` is `1.0`
+instead of creating a second one.
+
+When several nodes match, `MERGE` returns one row for each of them:
+
+```cypher
+MERGE (n:Person {field: "ML"})
+RETURN n.name
+```
+
+A pattern property whose value is null fails the query: no node could ever match
+it, so the `MERGE` would create a new node every time it ran. The same goes for a
+relationship's pattern properties. Before 0.18.1 a relationship `MERGE` with a
+null property stored the null and matched it on later runs; it now fails, as a
+node `MERGE` always has.
+
+When an explicit property index covers one of the pattern's labels and properties,
+`MERGE` looks candidates up there instead of reading every node with the label.
+
+On a database with a vector index, `embedding` in the pattern is the node's
+vector, not an ordinary property: it matches against the stored vector and, when
+a node is created, sets it. See
+[Set a Node's Vector](mutations.md#set-a-nodes-vector).
+
 ## MERGE with Properties
 
 ```cypher
@@ -21,6 +53,29 @@ RETURN n
 
 The `SET` clause runs whether the node was matched or created.
 
+## ON CREATE and ON MATCH
+
+To set properties only when the node is created, or only when it already existed:
+
+```cypher
+MERGE (n:Person {name: "Alice"})
+ON CREATE SET n.created = "2024-01-15"
+ON MATCH SET n.last_seen = "2024-01-15"
+RETURN n
+```
+
+`ON MATCH` applies to every node that matched. Setting a property to null in
+either removes it, as `SET` does.
+
+On a node `MERGE` both take property assignments to the merged node, named by
+its variable. Anything else is refused before the statement runs, and nothing is
+written: an item on another variable ("ON CREATE SET currently supports only
+assignments to 'n.*'"), a label or a property map (`SET n:Label`,
+`SET n += {...}`, "currently supports only property assignments"), and any item
+at all when the `MERGE` node has no variable, as in `MERGE (:Person {name:
+"Alice"}) ON CREATE SET ...` ("ON CREATE SET requires a variable on the MERGE
+target pattern").
+
 ## MERGE Edges
 
 ```cypher
@@ -28,7 +83,11 @@ MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
 MERGE (a)-[:KNOWS]->(b)
 ```
 
-This creates the `KNOWS` edge only if it doesn't already exist.
+This creates the `KNOWS` edge only if it doesn't already exist. The relationship
+needs exactly one type.
+
+`MERGE` accepts a single node pattern or a single relationship, as above; longer
+patterns are rejected.
 
 ## Use Cases
 

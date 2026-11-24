@@ -2,6 +2,9 @@ package latticedb
 
 import (
 	"errors"
+	"fmt"
+	"math"
+	"time"
 
 	cgobridge "github.com/jeffhajewski/latticedb/bindings/go/internal/cgo"
 )
@@ -18,17 +21,28 @@ func Version() string {
 
 func Open(path string, opts OpenOptions) (*DB, error) {
 	opts = opts.withDefaults()
+	retention, retentionValue, err := changefeedRetentionCode(opts.ChangefeedRetention)
+	if err != nil {
+		return nil, err
+	}
 
 	raw, err := cgobridge.Open(path, cgobridge.OpenOptions{
-		Create:               opts.Create,
-		ReadOnly:             opts.ReadOnly,
-		CacheSizeMB:          opts.CacheSizeMB,
-		PageSize:             opts.PageSize,
-		EnableWAL:            opts.EnableWAL,
-		EnableAdjacencyCache: opts.EnableAdjacencyCache,
-		EnableVector:         opts.vectorsEnabled(),
-		VectorDimensions:     opts.VectorDimensions,
-		Lock:                 !opts.DisableLock,
+		Create:                   opts.Create,
+		ReadOnly:                 opts.ReadOnly,
+		CacheSizeMB:              opts.CacheSizeMB,
+		PageSize:                 opts.PageSize,
+		EnableWAL:                opts.EnableWAL,
+		EnableAdjacencyCache:     opts.EnableAdjacencyCache,
+		EnableVector:             opts.vectorsEnabled(),
+		VectorDimensions:         opts.VectorDimensions,
+		Lock:                     !opts.DisableLock,
+		SyncMode:                 uint8(opts.SyncMode),
+		FullFsync:                uint8(opts.FullFsync),
+		VectorMetric:             uint8(opts.VectorMetric),
+		VectorM:                  opts.VectorM,
+		VectorEfConstruction:     opts.VectorEfConstruction,
+		ChangefeedRetention:      retention,
+		ChangefeedRetentionValue: retentionValue,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -74,6 +88,12 @@ func (db *DB) Serialize() ([]byte, error) {
 //	next, _ := db.Serialize()
 //	s3c.PutObject(ctx, &s3.PutObjectInput{Bucket: b, Key: k, Body: bytes.NewReader(next), IfMatch: obj.ETag})
 //
+// The options mean what they mean to Open, apart from Create and ReadOnly,
+// which are ignored. Bytes that hold a vector index open with the configuration
+// they record, and any vector option that is set must match it, or Deserialize
+// returns ErrorConfigMismatch; EnableVectors creates an index, configured by the
+// vector options, in bytes that have none.
+//
 // The bytes are copied, so the caller may reuse the slice as soon as this
 // returns. Changes made afterwards do not travel back to it.
 //
@@ -82,15 +102,26 @@ func (db *DB) Serialize() ([]byte, error) {
 // other, and nothing reports an error when they do.
 func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 	opts = opts.withDefaults()
+	retention, retentionValue, err := changefeedRetentionCode(opts.ChangefeedRetention)
+	if err != nil {
+		return nil, err
+	}
 
 	raw, err := cgobridge.Deserialize(data, cgobridge.OpenOptions{
-		CacheSizeMB:          opts.CacheSizeMB,
-		PageSize:             opts.PageSize,
-		EnableWAL:            opts.EnableWAL,
-		EnableAdjacencyCache: opts.EnableAdjacencyCache,
-		EnableVector:         opts.vectorsEnabled(),
-		VectorDimensions:     opts.VectorDimensions,
-		Lock:                 !opts.DisableLock,
+		CacheSizeMB:              opts.CacheSizeMB,
+		PageSize:                 opts.PageSize,
+		EnableWAL:                opts.EnableWAL,
+		EnableAdjacencyCache:     opts.EnableAdjacencyCache,
+		EnableVector:             opts.vectorsEnabled(),
+		VectorDimensions:         opts.VectorDimensions,
+		Lock:                     !opts.DisableLock,
+		SyncMode:                 uint8(opts.SyncMode),
+		FullFsync:                uint8(opts.FullFsync),
+		VectorMetric:             uint8(opts.VectorMetric),
+		VectorM:                  opts.VectorM,
+		VectorEfConstruction:     opts.VectorEfConstruction,
+		ChangefeedRetention:      retention,
+		ChangefeedRetentionValue: retentionValue,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -154,7 +185,7 @@ func (db *DB) BeginWrite() (*Tx, error) {
 	return db.begin(false)
 }
 
-// Deprecated: use BeginRead or BeginWrite. Earliest removal is v0.6.0.
+// Deprecated: use BeginRead or BeginWrite.
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	if readOnly {
 		return db.BeginRead()
@@ -179,6 +210,10 @@ func (db *DB) View(fn func(*Tx) error) error {
 	return rollbackErr
 }
 
+// commitTx commits the transaction Update opened. It is a variable so tests
+// can make a commit fail.
+var commitTx = (*Tx).Commit
+
 func (db *DB) Update(fn func(*Tx) error) error {
 	tx, err := db.BeginWrite()
 	if err != nil {
@@ -194,7 +229,15 @@ func (db *DB) Update(fn func(*Tx) error) error {
 		return runErr
 	}
 
-	return tx.Commit()
+	commitErr := commitTx(tx)
+	if commitErr != nil && tx.IsActive() {
+		// A failed commit leaves the transaction open, and an open writer
+		// blocks every later write. Nobody else holds tx, so end it here.
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			return errors.Join(commitErr, rollbackErr)
+		}
+	}
+	return commitErr
 }
 
 func (db *DB) Query(cypher string, params map[string]Value) (QueryResult, error) {
@@ -218,6 +261,89 @@ func (db *DB) Query(cypher string, params map[string]Value) (QueryResult, error)
 		return result, db.View(run)
 	}
 	return result, db.Update(run)
+}
+
+// Checkpoint folds the log (the -wal file) into the database file now.
+//
+// A commit is durable once it is in the log; a checkpoint writes the pages the
+// log's commits changed into the database file and, with CheckpointTruncate,
+// empties the log. See CheckpointMode for what each mode does.
+//
+// It returns ErrorInvalidArg for a mode other than the three constants, without
+// calling the library; ErrorReadOnly on a read-only database; ErrorLockTimeout
+// if a transaction already has records in the log, because a checkpoint would
+// cut its commit off from them; and ErrorIO if writing failed, in which case the
+// log still holds every commit.
+func (db *DB) Checkpoint(mode CheckpointMode) (CheckpointStats, error) {
+	switch mode {
+	case CheckpointPassive, CheckpointFull, CheckpointTruncate:
+	default:
+		return CheckpointStats{}, &Error{
+			Code:    ErrorInvalidArg,
+			Message: fmt.Sprintf("latticedb: unknown checkpoint mode %d", int(mode)),
+		}
+	}
+	if db == nil || db.raw == nil {
+		return CheckpointStats{}, ErrDatabaseClosed
+	}
+
+	stats, err := db.raw.Checkpoint(int(mode))
+	if err != nil {
+		return CheckpointStats{}, wrapError(err)
+	}
+	duration := time.Duration(math.MaxInt64)
+	if stats.DurationNS <= math.MaxInt64 {
+		duration = time.Duration(stats.DurationNS)
+	}
+	return CheckpointStats{
+		PagesFlushed:  stats.PagesFlushed,
+		Duration:      duration,
+		CheckpointLSN: stats.CheckpointLSN,
+		WALTruncated:  stats.WALTruncated,
+	}, nil
+}
+
+// SetAutoCheckpoint sets when commits checkpoint from now on.
+//
+// A commit runs a CheckpointTruncate checkpoint once the log holds
+// maxWALFrames frames (one frame is one page, usually 4096 bytes), and no
+// sooner than minInterval after the last automatic one. minInterval is passed
+// in whole milliseconds, rounded up so it is never shorter than asked (a
+// nonzero interval under a millisecond becomes 1ms); 0 means no minimum. maxWALFrames 0 switches automatic checkpoints off: the log
+// grows until Checkpoint runs, though Close still folds it into the file.
+//
+// Without this call the LATTICE_AUTO_CHECKPOINT_FRAMES environment variable
+// sets the frame count (0 for none), and without that the log may grow to an
+// eighth of the page cache, from 1000 frames up to 64 MB. This call wins over
+// the variable, and its count is used as given, not scaled to the cache. It has no effect on a read-only database.
+//
+// A larger interval means fewer checkpoints, each a longer pause for the
+// commit that runs it, a longer log on disk and more to replay after a crash. A
+// smaller one means shorter pauses, more often.
+//
+// A negative minInterval returns ErrorInvalidArg without calling the library.
+func (db *DB) SetAutoCheckpoint(maxWALFrames uint64, minInterval time.Duration) error {
+	if minInterval < 0 {
+		return &Error{
+			Code:    ErrorInvalidArg,
+			Message: fmt.Sprintf("latticedb: negative checkpoint interval %v", minInterval),
+		}
+	}
+	if db == nil || db.raw == nil {
+		return ErrDatabaseClosed
+	}
+
+	return wrapError(db.raw.SetAutoCheckpoint(maxWALFrames, checkpointIntervalMS(minInterval)))
+}
+
+// checkpointIntervalMS converts a non-negative interval to whole milliseconds,
+// rounding up so the interval is never shorter than asked.
+func checkpointIntervalMS(d time.Duration) uint64 {
+	ms := uint64(d / time.Millisecond)
+	if d%time.Millisecond != 0 {
+		ms++
+	}
+	return ms
 }
 
 func (db *DB) CacheClear() error {
@@ -357,6 +483,8 @@ func (db *DB) GetNodesByLabel(label string) ([]NodeID, error) {
 	return out, nil
 }
 
+// VectorSearch returns the nearest nodes to vector. It returns
+// ErrorUnsupported when the database was created without a vector index.
 func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]VectorSearchResult, error) {
 	if db == nil || db.raw == nil {
 		return nil, ErrDatabaseClosed
@@ -365,7 +493,7 @@ func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]Vector
 
 	results, err := db.raw.VectorSearch(vector, opts.K, opts.EfSearch)
 	if err != nil {
-		return nil, wrapError(err)
+		return nil, wrapVectorError(err, "search vectors")
 	}
 
 	out := make([]VectorSearchResult, 0, len(results))
@@ -434,8 +562,60 @@ func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
 	return offset, ok, nil
 }
 
+// Changes reads graph changefeed records from __lattice_changes: up to limit
+// records with a sequence greater than afterSequence, oldest first.
+// afterSequence 0 reads from the oldest event held.
+//
+// When retention or a trim has dropped the events after afterSequence, the
+// reader has missed changes and the error matches ErrChangesTrimmed (code
+// ErrorNotFound). When the policy is "off" the error has code
+// ErrorUnsupported.
 func (db *DB) Changes(afterSequence uint64, limit uint, timeoutMs uint32) ([]StreamRecord, error) {
-	return db.ReadStream("__lattice_changes", afterSequence, limit, timeoutMs)
+	records, err := db.ReadStream("__lattice_changes", afterSequence, limit, timeoutMs)
+	var latticeErr *Error
+	if errors.As(err, &latticeErr) {
+		switch latticeErr.Code {
+		case ErrorNotFound:
+			return nil, &Error{Code: ErrorNotFound, Message: fmt.Sprintf(
+				"the changefeed no longer holds the events after sequence %d: "+
+					"its retention policy or a trim dropped them", afterSequence)}
+		case ErrorUnsupported:
+			return nil, &Error{Code: ErrorUnsupported, Message: `the changefeed is off (ChangefeedRetention "off")`}
+		}
+	}
+	return records, err
+}
+
+// ChangefeedStatus returns the changefeed's retention policy and the events
+// it holds.
+func (db *DB) ChangefeedStatus() (ChangefeedStatus, error) {
+	if db == nil || db.raw == nil {
+		return ChangefeedStatus{}, ErrDatabaseClosed
+	}
+	mode, value, oldest, last, err := db.raw.ChangefeedStatus()
+	if err != nil {
+		return ChangefeedStatus{}, wrapError(err)
+	}
+	return ChangefeedStatus{
+		Retention:      changefeedRetentionText(mode, value),
+		OldestSequence: oldest,
+		LastSequence:   last,
+	}, nil
+}
+
+// TrimChangefeed applies the changefeed's retention policy in full now
+// (checkpoints apply it a bounded number of events at a time) and makes that
+// durable. It returns the number of events dropped, and an error with code
+// ErrorLockTimeout while a write transaction is open.
+func (db *DB) TrimChangefeed() (uint64, error) {
+	if db == nil || db.raw == nil {
+		return 0, ErrDatabaseClosed
+	}
+	removed, err := db.raw.ChangefeedTrim()
+	if err != nil {
+		return 0, wrapError(err)
+	}
+	return removed, nil
 }
 
 func convertFTSResults(results []cgobridge.FTSSearchResult) []FTSSearchResult {

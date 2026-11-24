@@ -6,7 +6,7 @@ LatticeDB supports storing and searching vector embeddings on nodes. This guide 
 
 To use embeddings:
 
-1. Enable vector storage when opening the database
+1. Enable vector storage when creating the database
 2. Generate embeddings (built-in hash or external service)
 3. Attach embeddings to nodes
 4. Search by similarity
@@ -14,21 +14,76 @@ To use embeddings:
 ## Enabling Vector Storage
 
 ```python
+from latticedb import Database
+
 db = Database(
     "mydb.db",
     create=True,
-    enable_vector=True,
-    vector_dimensions=128,  # Must match your embedding dimensions
+    enable_vectors=True,
+    vector_dimensions=128,   # Must match your embedding dimensions
+    vector_metric="cosine",  # or "euclidean" or "dot_product"; fixed once created
 )
+db.open()
 ```
 
 ```typescript
 const db = new Database("mydb.db", {
   create: true,
-  enableVector: true,
+  enableVectors: true,
   vectorDimensions: 128,
 });
+await db.open();
 ```
+
+The vector index is created with the database, and its configuration (dimensions,
+metric, `vector_m`, `vector_ef_construction`) is stored in the file. Later opens
+need no vector options: `Database("mydb.db")` opens the index as it was created,
+also after a crash. An option you do pass must match the file, or the open fails
+with a configuration-mismatch error (`LatticeConfigMismatchError` in Python). The
+TypeScript options are `vectorMetric`, `vectorM` and `vectorEfConstruction`; the
+CLI's are `lattice create --vector-metric=cosine|euclidean|dot_product --vector-m=<n>
+--vector-ef-construction=<n>`.
+
+The metric decides what a distance means, and smaller is always nearer: cosine
+distance (1 minus cosine similarity, the default and the usual choice for text
+embeddings), Euclidean (L2) distance, or the negated dot product. It cannot be
+changed once the index exists; to change it, export the database and import it into
+one created with the new metric. See
+[Distance Metric](../cypher/vector-search.md#distance-metric).
+
+A node holds one vector, and Cypher reads it as `n.embedding`. `set_vector` takes
+a key argument, which must be `"embedding"` (an empty key also works); any other
+key is rejected with an unsupported-operation error rather than stored under that
+name. Setting a vector on a node that already has one replaces it. On a database
+created without a vector index, setting a vector, inserting nodes with vectors and
+searching them fail with an unsupported-operation error that says so (before
+0.18.1, an I/O error); opening the database with vectors enabled adds an index.
+
+`get_vector` reads a node's vector back, and `remove_vector` takes it away: the
+node stays, with its labels and properties, and vector search no longer returns
+it. Removing a vector the node does not have does nothing. In Cypher,
+`REMOVE n.embedding` and `SET n.embedding = null` do the same, and
+`SET n.embedding = $vector` (or `embedding` in a `CREATE` or `MERGE` map) sets
+the vector, on a database with a vector index. Removing a node's
+labels leaves its vector alone, and deleting the node removes it.
+
+```python
+with db.write() as txn:
+    vector = txn.get_vector(node.id)   # None if the node has no vector
+    txn.remove_vector(node.id)
+    txn.commit()
+```
+
+The other bindings have the same calls: `getVector`/`removeVector` in
+TypeScript and Java, `GetVector`/`RemoveVector` in Go, and
+`lattice_node_get_vector`/`lattice_node_remove_vector` in C. Before 0.18.0 there
+was no way to remove a vector short of deleting the node.
+
+Every component must be a finite number: a vector containing NaN or infinity is
+rejected with an invalid-argument error, both when stored and when used as a
+search query. Under the cosine metric the database keeps only the normalised
+(unit-length) copy of a vector, so a committed vector reads back normalised. Under
+the Euclidean and dot-product metrics vectors are kept as given.
 
 ## Hash Embeddings (Built-in)
 
@@ -38,7 +93,7 @@ const db = new Database("mydb.db", {
 
 **Python:**
 ```python
-from latticedb import hash_embed
+from latticedb.embedding import hash_embed
 
 vec = hash_embed("hello world", dimensions=128)
 # Returns a numpy array of shape (128,)
@@ -46,7 +101,7 @@ vec = hash_embed("hello world", dimensions=128)
 
 **TypeScript:**
 ```typescript
-import { hashEmbed } from "@hajewski/latticedb";
+import { hashEmbed } from "@hajewski/latticedb/embedding";
 
 const vec = hashEmbed("hello world", 128);
 // Returns a Float32Array of length 128
@@ -56,20 +111,32 @@ const vec = hashEmbed("hello world", 128);
 
 For production-quality semantic embeddings, use the HTTP client to connect to an embedding service.
 
+The endpoint is the full URL the client POSTs to; nothing is appended to it. Give
+Ollama's `/api/embeddings` path or OpenAI's `/v1/embeddings` path, not the
+server's base URL: given `http://localhost:11434` alone, the client POSTs to `/`
+on that server, which does not serve embeddings, and `embed` fails. The client
+copies the endpoint, model and API key when it is created.
+
+The timeout setting (`timeout_ms` in Python and C, `timeoutMs` in TypeScript and
+Java, `TimeoutMS` in Go; 30 seconds by default, or when set to 0) is how long the
+client waits for the server to start answering. A request that gets no response in that time fails with an I/O
+error. Connecting, and reading the rest of a response that has begun, are not
+bounded by it, and it is not applied on Windows.
+
 ### Ollama
 
 ```python
-from latticedb import EmbeddingClient
+from latticedb.embedding import EmbeddingClient
 
-with EmbeddingClient("http://localhost:11434") as client:
+with EmbeddingClient("http://localhost:11434/api/embeddings") as client:
     vec = client.embed("hello world")
 ```
 
 ```typescript
-import { EmbeddingClient } from "@hajewski/latticedb";
+import { EmbeddingClient } from "@hajewski/latticedb/embedding";
 
 const client = new EmbeddingClient({
-  endpoint: "http://localhost:11434",
+  endpoint: "http://localhost:11434/api/embeddings",
 });
 const vec = client.embed("hello world");
 client.close();
@@ -78,10 +145,10 @@ client.close();
 ### OpenAI
 
 ```python
-from latticedb import EmbeddingClient, EmbeddingApiFormat
+from latticedb.embedding import EmbeddingClient, EmbeddingApiFormat
 
 with EmbeddingClient(
-    "https://api.openai.com/v1",
+    "https://api.openai.com/v1/embeddings",
     model="text-embedding-3-small",
     api_format=EmbeddingApiFormat.OPENAI,
     api_key="sk-...",
@@ -90,10 +157,10 @@ with EmbeddingClient(
 ```
 
 ```typescript
-import { EmbeddingClient, EmbeddingApiFormat } from "@hajewski/latticedb";
+import { EmbeddingClient, EmbeddingApiFormat } from "@hajewski/latticedb/embedding";
 
 const client = new EmbeddingClient({
-  endpoint: "https://api.openai.com/v1",
+  endpoint: "https://api.openai.com/v1/embeddings",
   model: "text-embedding-3-small",
   apiFormat: EmbeddingApiFormat.OpenAI,
   apiKey: "sk-...",
@@ -107,6 +174,8 @@ client.close();
 Attach a vector to a node within a write transaction:
 
 ```python
+from latticedb.embedding import hash_embed
+
 with db.write() as txn:
     node = txn.create_node(labels=["Chunk"], properties={"text": "some text"})
     embedding = hash_embed("some text", dimensions=128)
@@ -135,22 +204,31 @@ ORDER BY n.embedding <=> $query
 LIMIT 10
 ```
 
+In Cypher, `<=>` in `WHERE` searches among the nodes your pattern matches: a
+threshold query returns every `Chunk` within the distance, however many there are
+and whatever other nodes are nearer, and a `LIMIT` stops the search once it has
+enough, also when an `ORDER BY` on the same distance comes between them. For the
+nearest `k` over the whole database, use `vector_search`. See
+[Vector Search in Cypher](../cypher/vector-search.md).
+
 ## Batch Insert
 
-For bulk loading, use `batch_insert` which is significantly faster than inserting one at a time:
+For bulk loading, `batch_insert_vectors` creates a node and stores its vector for
+every row in one call. It saves one binding call per node; each vector still goes
+into the HNSW index individually:
 
 ```python
 import numpy as np
 
 with db.write() as txn:
     vectors = np.random.rand(10000, 128).astype(np.float32)
-    node_ids = txn.batch_insert("Document", vectors)
+    node_ids = txn.batch_insert_vectors("Document", vectors)
     txn.commit()
 ```
 
 ## Choosing Dimensions
 
-The `vector_dimensions` parameter must be set when opening the database and must match the embedding model output:
+The `vector_dimensions` parameter is set when the database is created, is stored in the file, and must match the embedding model output:
 
 | Model | Dimensions |
 |-------|-----------|

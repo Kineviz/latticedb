@@ -1,10 +1,17 @@
 //! Posting List Storage for Full-Text Search.
 //!
-//! Stores document IDs with term frequencies using delta encoding.
+//! Stores document IDs with term frequencies.
 //! Features:
-//! - Delta-varint encoding for 3-5x compression
-//! - Skip pointers every 128 entries for fast intersection
+//! - Each entry is varints: the document id itself (not a delta from the one
+//!   before), the term frequency, and, when the list has positions, a count
+//!   followed by each position, again as itself
+//! - Entries are not kept in doc id order: an update removes a document's
+//!   entries and appends its new ones
 //! - Optional position lists for phrase queries
+//! - A skip-pointer area between the header and the entries, which releases
+//!   up to 0.16 filled every 128 entries. Nothing reads it: skip pointers
+//!   assume doc id order, which these lists do not have. Pages written now
+//!   leave it empty, and a page rewritten by a removal has it cleared.
 
 const std = @import("std");
 const lattice = @import("lattice");
@@ -29,8 +36,10 @@ const TokenId = dictionary.TokenId;
 /// Document ID (alias for NodeId)
 pub const DocId = NodeId;
 
-/// Skip pointer interval (create skip pointer every N entries)
-pub const SKIP_INTERVAL: u32 = 128;
+/// Bytes of one skip pointer (max doc id, byte offset, entry count) in the
+/// area earlier releases filled. Kept only to size that area, which fixes
+/// where entries start.
+const SKIP_POINTER_SIZE: usize = 16;
 
 /// Posting page flag in the shared PageHeader indicating the v2 on-disk layout.
 const POSTING_PAGE_FLAG_V2_LAYOUT: u8 = 0x01;
@@ -41,7 +50,12 @@ const POSTING_ENTRY_FLAG_HAS_POSITIONS: u16 = 0x01;
 /// File format version required for v2 posting pages.
 const POSTING_PAGE_FORMAT_VERSION_V2: u16 = 2;
 
-/// Page size
+/// The part of a page this code lays out, which is not the database's page
+/// size. Databases can use pages of 4096 to 65535 bytes; these pages use
+/// their first 4096 bytes whatever the page size and leave the rest unused.
+/// That is the layout files are written with, so it is a format constant:
+/// sizing the layout from the real page size would misread every page an
+/// existing large-page database already holds.
 const PAGE_SIZE: usize = 4096;
 
 /// Posting list errors
@@ -65,28 +79,6 @@ pub const PostingEntry = struct {
     doc_id: DocId,
     term_freq: u32,
     positions: ?[]const u32, // Optional position list for phrase queries
-};
-
-/// Skip pointer for fast intersection
-pub const SkipPointer = extern struct {
-    /// Max doc_id in this block
-    doc_id: DocId,
-    /// Offset in posting data
-    byte_offset: u32,
-    /// Number of entries before this pointer
-    entry_count: u32,
-
-    comptime {
-        std.debug.assert(@sizeOf(SkipPointer) == 16);
-    }
-
-    pub fn serialize(self: *const SkipPointer, buf: *[@sizeOf(SkipPointer)]u8) void {
-        @memcpy(buf, std.mem.asBytes(self));
-    }
-
-    pub fn deserialize(buf: []const u8) SkipPointer {
-        return std.mem.bytesAsValue(SkipPointer, buf[0..@sizeOf(SkipPointer)]).*;
-    }
 };
 
 /// Legacy posting page header (follows base PageHeader).
@@ -188,17 +180,6 @@ const PostingPageMeta = struct {
         };
     }
 
-    fn maxSkipPointers(self: PostingPageMeta) usize {
-        return switch (self.layout) {
-            .v1 => MAX_SKIP_POINTERS_V1,
-            .v2 => MAX_SKIP_POINTERS_V2,
-        };
-    }
-
-    fn skipPointerOffset(self: PostingPageMeta, index: usize) usize {
-        return self.headerEnd() + index * @sizeOf(SkipPointer);
-    }
-
     fn write(self: PostingPageMeta, data: []u8) void {
         setPostingPageLayout(data, self.layout);
         switch (self.layout) {
@@ -255,7 +236,7 @@ const HEADER_END_V2: usize = @sizeOf(PageHeader) + @sizeOf(PostingPageHeaderV2);
 const MAX_SKIP_POINTERS_V1: usize = 16;
 
 /// Reserved space for skip pointers in the v1 layout.
-const SKIP_POINTER_AREA_SIZE_V1: usize = MAX_SKIP_POINTERS_V1 * @sizeOf(SkipPointer);
+const SKIP_POINTER_AREA_SIZE_V1: usize = MAX_SKIP_POINTERS_V1 * SKIP_POINTER_SIZE;
 
 /// Data offset after headers and skip pointer area. This remains stable across
 /// v1 and v2 so lazy page upgrades do not need to move posting payload bytes.
@@ -265,7 +246,6 @@ const DATA_OFFSET: usize = HEADER_END_V1 + SKIP_POINTER_AREA_SIZE_V1;
 /// larger, so the skip reserve shrinks by 4 bytes while keeping DATA_OFFSET
 /// unchanged.
 const SKIP_POINTER_AREA_SIZE_V2: usize = DATA_OFFSET - HEADER_END_V2;
-const MAX_SKIP_POINTERS_V2: usize = SKIP_POINTER_AREA_SIZE_V2 / @sizeOf(SkipPointer);
 
 comptime {
     std.debug.assert(DATA_OFFSET == HEADER_END_V2 + SKIP_POINTER_AREA_SIZE_V2);
@@ -369,53 +349,6 @@ pub const PostingStore = struct {
         @memset(data[meta.headerEnd()..@as(usize, meta.data_start)], 0);
     }
 
-    fn rebuildSkipPointersFromEncoded(self: *Self, data: []u8, meta: *PostingPageMeta) void {
-        self.clearSkipPointers(data, meta.*);
-        meta.num_skip_pointers = 0;
-
-        if (meta.num_entries < SKIP_INTERVAL) return;
-
-        var offset: usize = meta.data_start;
-        var entries_read: u32 = 0;
-        var skip_count: usize = 0;
-
-        while (entries_read < meta.num_entries and offset < meta.data_end) {
-            const entry_offset = offset;
-            const doc_result = decodeVarint(data[offset..]);
-            offset += doc_result.bytes;
-
-            if (entries_read > 0 and entries_read % SKIP_INTERVAL == 0 and skip_count < meta.maxSkipPointers()) {
-                const skip_ptr = SkipPointer{
-                    .doc_id = doc_result.value,
-                    .byte_offset = @intCast(entry_offset - meta.data_start),
-                    .entry_count = entries_read,
-                };
-                const skip_offset = meta.skipPointerOffset(skip_count);
-                var skip_buf: [@sizeOf(SkipPointer)]u8 = undefined;
-                skip_ptr.serialize(&skip_buf);
-                @memcpy(data[skip_offset..][0..@sizeOf(SkipPointer)], &skip_buf);
-                skip_count += 1;
-            }
-
-            const freq_result = decodeVarint(data[offset..]);
-            offset += freq_result.bytes;
-
-            if (meta.hasPositions()) {
-                const pos_count_result = decodeVarint(data[offset..]);
-                offset += pos_count_result.bytes;
-                var pos_idx: usize = 0;
-                while (pos_idx < pos_count_result.value) : (pos_idx += 1) {
-                    const pos_result = decodeVarint(data[offset..]);
-                    offset += pos_result.bytes;
-                }
-            }
-
-            entries_read += 1;
-        }
-
-        meta.num_skip_pointers = @intCast(skip_count);
-    }
-
     fn upgradePageToV2(self: *Self, data: []u8, meta: *PostingPageMeta) PostingError!void {
         if (meta.layout == .v2) return;
 
@@ -428,7 +361,8 @@ pub const PostingStore = struct {
             upgraded.data_end = upgraded.data_start;
         }
 
-        self.rebuildSkipPointersFromEncoded(data, &upgraded);
+        self.clearSkipPointers(data, upgraded);
+        upgraded.num_skip_pointers = 0;
         upgraded.write(data);
         meta.* = upgraded;
     }
@@ -470,115 +404,148 @@ pub const PostingStore = struct {
         return page_id;
     }
 
+    /// Create the first page of a new list, carrying its own page id as the
+    /// list's identity (see `appendAt`).
+    pub fn createList(self: *Self) PostingError!PageId {
+        const page_id = try self.create(0);
+        const frame = self.bp.fetchPage(page_id, .exclusive) catch {
+            return PostingError.BufferPoolError;
+        };
+        var meta = self.readPageMeta(frame.data, false);
+        meta.token_id = page_id;
+        meta.write(frame.data);
+        self.bp.unpinPage(frame, true);
+        return page_id;
+    }
+
     /// Append a posting entry to a list
     /// Returns the page ID where the entry was stored (may be different if overflow)
     pub fn append(self: *Self, page_id: PageId, entry: PostingEntry) PostingError!PageId {
         return self.appendWithPositions(page_id, entry, false);
     }
 
-    /// Append a posting entry with optional position storage
+    /// Append from the head of the list, with no remembered tail.
     pub fn appendWithPositions(self: *Self, page_id: PageId, entry: PostingEntry, store_positions: bool) PostingError!PageId {
-        const frame = self.bp.fetchPage(page_id, .exclusive) catch {
-            return PostingError.BufferPoolError;
-        };
-        var frame_pinned = true;
-        var frame_dirty = false;
-        errdefer if (frame_pinned) self.bp.unpinPage(frame, frame_dirty);
+        return self.appendAt(page_id, 0, 0, entry, store_positions);
+    }
 
-        const data = frame.data;
-        var posting_header = self.readPageMeta(data, true);
+    /// Append a posting entry, optionally storing its positions, to the first
+    /// page with room at or after where the walk starts, and return that page.
+    ///
+    /// The walk starts at `tail_hint` when the caller has one (0 for none),
+    /// which should be the page the previous append returned: the list's last
+    /// page, or one near it. Starting there makes an append cost a page or two
+    /// however long the list is; starting at the head reads every page, which
+    /// made indexing a document with a common term cost time in proportion to
+    /// that term's list. The hint is trusted only if it is a posting page
+    /// carrying `stamp`, the identity this list's pages carry in their
+    /// header's token id field (the head page id, for lists `createList`
+    /// made); otherwise the walk starts from the head. The page the entry goes
+    /// on, and any page added to the list, is given `stamp`, so a list written
+    /// by an earlier release, whose pages carry a counter value instead, takes
+    /// it on from its first append. A `stamp` of 0 means none: no hint is
+    /// trusted and nothing is stamped.
+    ///
+    /// Whether a page's entries carry positions is a property of the page, set by
+    /// its first entry. An entry whose positions disagree with the page is written
+    /// the page's way — with an empty position list, or without its positions —
+    /// because one entry encoded differently would make every later entry on the
+    /// page decode as garbage. That can happen when `store_positions` changes
+    /// between opens of the same database.
+    ///
+    /// An entry always fits in an empty page: positions beyond what one page can
+    /// hold are not stored (see `encodeEntry`).
+    pub fn appendAt(
+        self: *Self,
+        head: PageId,
+        stamp: TokenId,
+        tail_hint: PageId,
+        entry: PostingEntry,
+        store_positions: bool,
+    ) PostingError!PageId {
+        const wants_positions = store_positions and entry.positions != null;
+        var encode_buf: [PAGE_DATA_CAPACITY]u8 = undefined;
 
-        if (posting_header.layout == .v1) {
-            try self.upgradePageToV2(data, &posting_header);
-            frame_dirty = true;
+        var current_page = head;
+        var checking_hint = false;
+        if (stamp != 0 and tail_hint != 0 and tail_hint != head and self.bp.pm.isValidPage(tail_hint)) {
+            current_page = tail_hint;
+            checking_hint = true;
         }
-
-        // Encode the entry - use larger buffer for positions
-        var encode_buf: [512]u8 = undefined;
-        var encode_len: usize = 0;
-
-        // Encode doc_id and term_freq
-        encode_len += encodeVarint(entry.doc_id, encode_buf[encode_len..]);
-        encode_len += encodeVarint(entry.term_freq, encode_buf[encode_len..]);
-
-        // Encode positions if requested and available
-        const has_positions = store_positions and entry.positions != null;
-        if (has_positions) {
-            const positions = entry.positions.?;
-            // Encode position count
-            encode_len += encodeVarint(positions.len, encode_buf[encode_len..]);
-            // Encode each position (absolute for now, could delta-encode later)
-            for (positions) |pos| {
-                encode_len += encodeVarint(pos, encode_buf[encode_len..]);
-            }
-            // Set has_positions flag
-            posting_header.flags |= POSTING_ENTRY_FLAG_HAS_POSITIONS;
-        }
-
-        // Check if there's space
-        const current_end: usize = posting_header.data_end;
-        if (current_end + encode_len > PAGE_SIZE) {
-            if (posting_header.next_page != 0) {
-                const next_page = posting_header.next_page;
-                self.bp.unpinPage(frame, frame_dirty);
-                frame_pinned = false;
-                return self.appendWithPositions(next_page, entry, store_positions);
-            }
-
-            // Need to allocate overflow page
-            const new_page_id = try self.create(posting_header.token_id);
-
-            // Link pages and preserve flags
-            const new_flags = posting_header.flags;
-            posting_header.next_page = new_page_id;
-            posting_header.write(data);
-            frame_dirty = true;
-            self.bp.unpinPage(frame, true);
-            frame_pinned = false;
-
-            // Create new page with same flags
-            const new_frame = self.bp.fetchPage(new_page_id, .exclusive) catch {
+        while (true) {
+            const frame = self.bp.fetchPage(current_page, .exclusive) catch {
+                if (checking_hint) {
+                    checking_hint = false;
+                    current_page = head;
+                    continue;
+                }
                 return PostingError.BufferPoolError;
             };
-            var new_header = self.readPageMeta(new_frame.data, false);
-            new_header.flags = new_flags;
-            new_header.write(new_frame.data);
-            self.bp.unpinPage(new_frame, true);
+            var frame_dirty = false;
+            errdefer self.bp.unpinPage(frame, frame_dirty);
 
-            // Recursively append to new page
-            return self.appendWithPositions(new_page_id, entry, store_positions);
-        }
-
-        // Write skip pointer if at SKIP_INTERVAL boundary
-        // Skip pointers point to entries at positions: SKIP_INTERVAL, 2*SKIP_INTERVAL, etc.
-        const entry_index = posting_header.num_entries;
-        if (entry_index > 0 and entry_index % SKIP_INTERVAL == 0) {
-            const skip_index = entry_index / SKIP_INTERVAL - 1;
-            if (skip_index < posting_header.maxSkipPointers()) {
-                const skip_ptr = SkipPointer{
-                    .doc_id = entry.doc_id,
-                    .byte_offset = @intCast(current_end - posting_header.data_start),
-                    .entry_count = entry_index,
-                };
-                const skip_offset = posting_header.skipPointerOffset(skip_index);
-                var skip_buf: [@sizeOf(SkipPointer)]u8 = undefined;
-                skip_ptr.serialize(&skip_buf);
-                @memcpy(data[skip_offset..][0..@sizeOf(SkipPointer)], &skip_buf);
-                posting_header.num_skip_pointers = @intCast(skip_index + 1);
+            const data = frame.data;
+            if (checking_hint) {
+                checking_hint = false;
+                if (pageHeaderConst(data).page_type != .fts_posting or
+                    self.readPageMeta(data, false).token_id != stamp)
+                {
+                    self.bp.unpinPage(frame, false);
+                    current_page = head;
+                    continue;
+                }
             }
+            var posting_header = self.readPageMeta(data, true);
+
+            if (posting_header.layout == .v1) {
+                try self.upgradePageToV2(data, &posting_header);
+                frame_dirty = true;
+            }
+
+            const page_positions = if (posting_header.num_entries == 0)
+                wants_positions
+            else
+                posting_header.hasPositions();
+            const encode_len = encodeEntry(entry, page_positions, &encode_buf);
+
+            // Check if there's space
+            const current_end: usize = posting_header.data_end;
+            if (current_end + encode_len > PAGE_SIZE) {
+                if (posting_header.next_page != 0) {
+                    const next_page = posting_header.next_page;
+                    self.bp.unpinPage(frame, frame_dirty);
+                    current_page = next_page;
+                    continue;
+                }
+
+                // Need to allocate overflow page
+                if (stamp != 0) posting_header.token_id = stamp;
+                const new_page_id = try self.create(posting_header.token_id);
+                posting_header.next_page = new_page_id;
+                posting_header.write(data);
+                self.bp.unpinPage(frame, true);
+                current_page = new_page_id;
+                continue;
+            }
+
+            if (page_positions) {
+                posting_header.flags |= POSTING_ENTRY_FLAG_HAS_POSITIONS;
+            } else {
+                posting_header.flags &= ~POSTING_ENTRY_FLAG_HAS_POSITIONS;
+            }
+            if (stamp != 0) posting_header.token_id = stamp;
+
+            // Write entry
+            @memcpy(data[current_end..][0..encode_len], encode_buf[0..encode_len]);
+
+            // Update header
+            posting_header.num_entries += 1;
+            posting_header.data_end = @intCast(current_end + encode_len);
+            posting_header.write(data);
+
+            self.bp.unpinPage(frame, true);
+            return current_page;
         }
-
-        // Write entry
-        @memcpy(data[current_end..][0..encode_len], encode_buf[0..encode_len]);
-
-        // Update header
-        posting_header.num_entries += 1;
-        posting_header.data_end = @intCast(current_end + encode_len);
-        posting_header.write(data);
-
-        self.bp.unpinPage(frame, true);
-        frame_pinned = false;
-        return page_id;
     }
 
     /// Get iterator for reading posting list
@@ -590,12 +557,24 @@ pub const PostingStore = struct {
     pub const RemovalResult = struct {
         found: bool,
         term_freq: u32,
+        /// The list's last page, when the removal changed which page that
+        /// is; 0 when it did not.
+        tail: PageId = 0,
+        /// The list holds no entries now and is down to its head page,
+        /// which the caller should free along with the list's entry.
+        list_empty: bool = false,
     };
 
     /// Remove an entry from a posting list by doc_id
     /// Returns the term frequency of the removed entry if found
+    ///
+    /// The page the entry leaves takes in the next page's entries when they
+    /// fit, and the next page is freed; a last page left empty is unlinked
+    /// and freed. So pages that removals empty go back to the file, and two
+    /// neighbouring pages never stay together less than a page's worth.
     pub fn removeEntry(self: *Self, posting_page: PageId, target_doc_id: DocId) PostingError!RemovalResult {
         var current_page = posting_page;
+        var prev_page: PageId = 0;
 
         while (current_page != 0) {
             const frame = self.bp.fetchPage(current_page, .exclusive) catch {
@@ -603,189 +582,159 @@ pub const PostingStore = struct {
             };
 
             const data = frame.data;
-            var header = self.readPageMeta(data, false);
+            var header = self.readPageMeta(data, true);
             const has_positions = header.hasPositions();
 
-            // Collect all entries except the target
-            var kept_entries: std.ArrayList(StoredEntry) = .empty;
-            defer {
-                for (kept_entries.items) |entry| {
-                    if (entry.positions) |pos| {
-                        self.allocator.free(pos);
-                    }
-                }
-                kept_entries.deinit(self.allocator);
-            }
-
-            var found_entry: ?StoredEntry = null;
+            // Find the entry's bytes; the page's other entries stay as they
+            // are encoded, so nothing is decoded into memory or re-encoded.
+            var found: ?struct { start: usize, end: usize, term_freq: u32 } = null;
             var offset: usize = header.data_start;
-
             for (0..header.num_entries) |_| {
+                const entry_start = offset;
                 const doc_result = decodeVarint(data[offset..]);
                 offset += doc_result.bytes;
-
                 const freq_result = decodeVarint(data[offset..]);
                 offset += freq_result.bytes;
-
-                var positions: ?[]u32 = null;
                 if (has_positions) {
                     const pos_count_result = decodeVarint(data[offset..]);
                     offset += pos_count_result.bytes;
-                    const pos_count: usize = @intCast(pos_count_result.value);
-
-                    if (pos_count > 0) {
-                        positions = self.allocator.alloc(u32, pos_count) catch {
-                            self.bp.unpinPage(frame, false);
-                            return PostingError.OutOfMemory;
-                        };
-                        for (0..pos_count) |i| {
-                            const pos_result = decodeVarint(data[offset..]);
-                            offset += pos_result.bytes;
-                            positions.?[i] = @intCast(pos_result.value);
-                        }
+                    for (0..@intCast(pos_count_result.value)) |_| {
+                        offset += decodeVarint(data[offset..]).bytes;
                     }
                 }
-
-                const entry = StoredEntry{
-                    .doc_id = doc_result.value,
-                    .term_freq = @intCast(freq_result.value),
-                    .positions = positions,
-                };
-
                 if (doc_result.value == target_doc_id) {
-                    found_entry = entry;
-                } else {
-                    kept_entries.append(self.allocator, entry) catch {
-                        if (positions) |pos| self.allocator.free(pos);
-                        self.bp.unpinPage(frame, false);
-                        return PostingError.OutOfMemory;
-                    };
+                    found = .{ .start = entry_start, .end = offset, .term_freq = @intCast(freq_result.value) };
+                    break;
                 }
             }
 
-            if (found_entry) |removed| {
+            if (found) |removed| {
                 if (header.layout == .v1) {
-                    try self.ensureFormatV2();
+                    self.ensureFormatV2() catch |err| {
+                        self.bp.unpinPage(frame, false);
+                        return err;
+                    };
                     header.layout = .v2;
                 }
 
-                // Rebuild page with remaining entries
-                header.data_end = self.rebuildPage(data, &header, kept_entries.items, has_positions);
+                // Close the gap the entry leaves.
+                const old_end: usize = header.data_end;
+                if (removed.end > old_end or old_end > PAGE_SIZE) {
+                    self.bp.unpinPage(frame, false);
+                    return PostingError.InvalidData;
+                }
+                const width = removed.end - removed.start;
+                std.mem.copyForwards(u8, data[removed.start .. old_end - width], data[removed.end..old_end]);
+                @memset(data[old_end - width .. old_end], 0);
+                header.data_end = @intCast(old_end - width);
+                header.num_entries -= 1;
 
-                // Update header
-                header.num_entries = @intCast(kept_entries.items.len);
-
-                // Rebuild skip pointers
-                self.rebuildSkipPointers(data, &header, kept_entries.items, has_positions);
+                // Skip pointers, on a page an earlier release filled them
+                // on, name byte offsets the rewrite has moved.
+                self.clearSkipPointers(data, header);
+                header.num_skip_pointers = 0;
 
                 header.write(data);
+
+                var result: RemovalResult = .{ .found = true, .term_freq = removed.term_freq };
+                self.mergeNextPage(current_page, data, &header, &result) catch |err| {
+                    self.bp.unpinPage(frame, true);
+                    return err;
+                };
                 self.bp.unpinPage(frame, true);
 
-                // Free removed entry's positions
-                if (removed.positions) |pos| {
-                    self.allocator.free(pos);
+                if (header.num_entries == 0 and header.next_page == 0) {
+                    if (prev_page == 0) {
+                        result.list_empty = true;
+                    } else {
+                        try self.unlinkLastPage(prev_page, current_page);
+                        result.tail = prev_page;
+                    }
                 }
-
-                return .{ .found = true, .term_freq = removed.term_freq };
+                return result;
             }
 
             // Entry not found in this page, try next
             const next_page = header.next_page;
             self.bp.unpinPage(frame, false);
+            prev_page = current_page;
             current_page = next_page;
         }
 
         return .{ .found = false, .term_freq = 0 };
     }
 
-    /// Temporary storage for entry during rebuild
-    const StoredEntry = struct {
-        doc_id: DocId,
-        term_freq: u32,
-        positions: ?[]u32,
-    };
-
-    /// Rebuild page data from entries
-    fn rebuildPage(self: *Self, data: []u8, header: *PostingPageMeta, entries: []const StoredEntry, has_positions: bool) u32 {
-        _ = self;
-        var offset: usize = header.data_start;
-
-        for (entries) |entry| {
-            // Encode doc_id
-            offset += encodeVarint(entry.doc_id, data[offset..]);
-
-            // Encode term_freq
-            offset += encodeVarint(entry.term_freq, data[offset..]);
-
-            // Encode positions if present
-            if (has_positions) {
-                if (entry.positions) |positions| {
-                    offset += encodeVarint(positions.len, data[offset..]);
-                    for (positions) |pos| {
-                        offset += encodeVarint(pos, data[offset..]);
-                    }
-                } else {
-                    offset += encodeVarint(0, data[offset..]);
-                }
-            }
+    /// Move the entries of the page after `page_id` onto it, when they fit
+    /// and are encoded the same way, and free that page. `data` and `header`
+    /// are `page_id`'s, pinned exclusively by the caller.
+    fn mergeNextPage(self: *Self, page_id: PageId, data: []u8, header: *PostingPageMeta, result: *RemovalResult) PostingError!void {
+        const next_id = header.next_page;
+        if (next_id == 0) return;
+        const next = self.bp.fetchPage(next_id, .shared) catch return PostingError.BufferPoolError;
+        const next_data = next.data;
+        if (pageHeaderConst(next_data).page_type != .fts_posting) {
+            self.bp.unpinPage(next, false);
+            return;
         }
-
-        // Zero out remaining data area (optional, for cleanliness)
-        if (offset < PAGE_SIZE) {
-            @memset(data[offset..PAGE_SIZE], 0);
-        }
-
-        return @intCast(offset);
-    }
-
-    /// Rebuild skip pointers after page modification
-    fn rebuildSkipPointers(self: *Self, data: []u8, header: *PostingPageMeta, entries: []const StoredEntry, has_positions: bool) void {
-        // Clear existing skip pointers
-        self.clearSkipPointers(data, header.*);
-        header.num_skip_pointers = 0;
-
-        if (entries.len < SKIP_INTERVAL) {
+        const next_meta = self.readPageMeta(next_data, true);
+        const used: usize = next_meta.data_end - next_meta.data_start;
+        const same_encoding = header.num_entries == 0 or next_meta.num_entries == 0 or
+            header.hasPositions() == next_meta.hasPositions();
+        if (!same_encoding or @as(usize, header.data_end) + used > PAGE_SIZE) {
+            self.bp.unpinPage(next, false);
             return;
         }
 
-        // Scan through entries to build skip pointers
-        var offset: usize = header.data_start;
-        var skip_count: u16 = 0;
-
-        for (entries, 0..) |entry, idx| {
-            // Create skip pointer at SKIP_INTERVAL boundaries (e.g., at entry 128, 256, etc.)
-            if (idx > 0 and idx % SKIP_INTERVAL == 0 and skip_count < header.maxSkipPointers()) {
-                const skip_ptr = SkipPointer{
-                    .doc_id = entry.doc_id,
-                    .byte_offset = @intCast(offset - header.data_start),
-                    .entry_count = @intCast(idx),
-                };
-                const skip_offset = header.skipPointerOffset(skip_count);
-                var skip_buf: [@sizeOf(SkipPointer)]u8 = undefined;
-                skip_ptr.serialize(&skip_buf);
-                @memcpy(data[skip_offset..][0..@sizeOf(SkipPointer)], &skip_buf);
-                skip_count += 1;
-            }
-
-            // Calculate size of this entry to advance offset
-            var entry_buf: [256]u8 = undefined;
-            var entry_size: usize = 0;
-            entry_size += encodeVarint(entry.doc_id, entry_buf[entry_size..]);
-            entry_size += encodeVarint(entry.term_freq, entry_buf[entry_size..]);
-            if (has_positions) {
-                if (entry.positions) |positions| {
-                    entry_size += encodeVarint(positions.len, entry_buf[entry_size..]);
-                    for (positions) |pos| {
-                        entry_size += encodeVarint(pos, entry_buf[entry_size..]);
-                    }
-                } else {
-                    entry_size += encodeVarint(0, entry_buf[entry_size..]);
-                }
-            }
-            offset += entry_size;
+        @memcpy(data[header.data_end..][0..used], next_data[next_meta.data_start..][0..used]);
+        if (header.num_entries == 0) {
+            header.flags = (header.flags & ~POSTING_ENTRY_FLAG_HAS_POSITIONS) |
+                (next_meta.flags & POSTING_ENTRY_FLAG_HAS_POSITIONS);
         }
+        header.num_entries += next_meta.num_entries;
+        header.data_end += @intCast(used);
+        header.next_page = next_meta.next_page;
+        header.write(data);
+        self.bp.unpinPage(next, false);
 
-        header.num_skip_pointers = skip_count;
+        self.bp.freePage(next_id) catch return PostingError.BufferPoolError;
+        if (header.next_page == 0) result.tail = page_id;
+    }
+
+    /// Unlink `page_id`, the empty last page of a list, from `prev_id`
+    /// before it, and free it.
+    fn unlinkLastPage(self: *Self, prev_id: PageId, page_id: PageId) PostingError!void {
+        const frame = self.bp.fetchPage(prev_id, .exclusive) catch return PostingError.BufferPoolError;
+        var meta = self.readPageMeta(frame.data, false);
+        if (meta.next_page != page_id) {
+            self.bp.unpinPage(frame, false);
+            return;
+        }
+        meta.next_page = 0;
+        meta.write(frame.data);
+        self.bp.unpinPage(frame, true);
+        self.bp.freePage(page_id) catch return PostingError.BufferPoolError;
+    }
+
+    /// Free every page of the list that starts at `head`.
+    ///
+    /// Stops at a page that is not a posting page, rather than freeing what
+    /// a damaged link points at, and after as many pages as the file holds,
+    /// so a chain that loops ends.
+    pub fn freeList(self: *Self, head: PageId) PostingError!void {
+        var current = head;
+        var budget = self.bp.pm.pageCount();
+        while (current != 0 and budget > 0) : (budget -= 1) {
+            if (!self.bp.pm.isValidPage(current)) return;
+            const frame = self.bp.fetchPage(current, .shared) catch return PostingError.BufferPoolError;
+            if (pageHeaderConst(frame.data).page_type != .fts_posting) {
+                self.bp.unpinPage(frame, false);
+                return;
+            }
+            const next = self.readPageMeta(frame.data, false).next_page;
+            self.bp.unpinPage(frame, false);
+            self.bp.freePage(current) catch return PostingError.BufferPoolError;
+            current = next;
+        }
     }
 };
 
@@ -796,14 +745,20 @@ pub const PostingIterator = struct {
     current_offset: usize,
     entries_read: u32,
     total_entries: u32,
-    data_start: usize, // Start of posting data (after skip pointers)
-    num_skip_pointers: u16,
-    skip_pointer_base: usize,
-    last_doc_id: DocId, // For delta decoding (not used in simplified version)
+    data_start: usize, // Start of posting data (after the skip-pointer area)
+    last_doc_id: DocId, // Never read: entries store whole doc ids, not deltas
     has_positions: bool,
     done: bool,
+    /// Entries decoded ahead by `next`, so a page is pinned once per batch
+    /// rather than once per entry. `entries_read` counts what was decoded,
+    /// so it is ahead of what was returned while the batch is not drained.
+    batch: [BATCH_SIZE]BatchEntry = undefined,
+    batch_len: u16 = 0,
+    batch_pos: u16 = 0,
 
     const Self = @This();
+    const BATCH_SIZE = 128;
+    const BatchEntry = struct { doc_id: DocId, term_freq: u32 };
 
     pub fn init(store: *PostingStore, page_id: PageId) PostingError!Self {
         // Read header to get entry count and flags
@@ -821,117 +776,92 @@ pub const PostingIterator = struct {
             .entries_read = 0,
             .total_entries = header.num_entries,
             .data_start = header.data_start,
-            .num_skip_pointers = header.num_skip_pointers,
-            .skip_pointer_base = header.headerEnd(),
             .last_doc_id = 0,
             .has_positions = header.hasPositions(),
-            .done = header.num_entries == 0,
+            // Not `num_entries == 0`: removals can empty the head page while
+            // later pages still hold entries. Reading follows the chain past
+            // empty pages and decides when the list is finished.
+            .done = false,
         };
     }
 
-    /// Skip to the first entry with doc_id >= target
-    /// Returns the entry if found, null if no more entries >= target
-    pub fn skipTo(self: *Self, target: DocId) PostingError!?PostingEntry {
-        if (self.done) return null;
-
-        // Try to use skip pointers if available
-        if (self.num_skip_pointers > 0) {
-            const frame = self.store.bp.fetchPage(self.current_page, .shared) catch {
-                return PostingError.BufferPoolError;
-            };
-            defer self.store.bp.unpinPage(frame, false);
-
-            // Binary search skip pointers to find largest doc_id < target
-            var best_skip: ?SkipPointer = null;
-            var low: usize = 0;
-            var high: usize = self.num_skip_pointers;
-
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                const skip_offset = self.skip_pointer_base + mid * @sizeOf(SkipPointer);
-                const skip_ptr = SkipPointer.deserialize(frame.data[skip_offset..]);
-
-                if (skip_ptr.doc_id < target) {
-                    // This skip pointer is before target, could be useful
-                    best_skip = skip_ptr;
-                    low = mid + 1;
-                } else {
-                    // This skip pointer is >= target, look earlier
-                    high = mid;
-                }
-            }
-
-            // If we found a useful skip pointer, jump to it
-            if (best_skip) |skip| {
-                // Only use if it advances us past current position
-                const new_offset = self.data_start + skip.byte_offset;
-                if (skip.entry_count > self.entries_read) {
-                    self.current_offset = new_offset;
-                    self.entries_read = skip.entry_count;
-                }
-            }
-        }
-
-        // Linear scan from current position to find target
-        while (true) {
-            const entry = try self.next();
-            if (entry == null) return null;
-            if (entry.?.doc_id >= target) return entry;
-        }
-    }
-
-    /// Skip to target and return entry with positions
-    pub fn skipToWithPositions(self: *Self, target: DocId, allocator: Allocator) PostingError!?PostingEntry {
-        if (self.done) return null;
-
-        // Try to use skip pointers if available
-        if (self.num_skip_pointers > 0) {
-            const frame = self.store.bp.fetchPage(self.current_page, .shared) catch {
-                return PostingError.BufferPoolError;
-            };
-            defer self.store.bp.unpinPage(frame, false);
-
-            var best_skip: ?SkipPointer = null;
-            var low: usize = 0;
-            var high: usize = self.num_skip_pointers;
-
-            while (low < high) {
-                const mid = low + (high - low) / 2;
-                const skip_offset = self.skip_pointer_base + mid * @sizeOf(SkipPointer);
-                const skip_ptr = SkipPointer.deserialize(frame.data[skip_offset..]);
-
-                if (skip_ptr.doc_id < target) {
-                    best_skip = skip_ptr;
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-
-            if (best_skip) |skip| {
-                const new_offset = self.data_start + skip.byte_offset;
-                if (skip.entry_count > self.entries_read) {
-                    self.current_offset = new_offset;
-                    self.entries_read = skip.entry_count;
-                }
-            }
-        }
-
-        // Linear scan from current position to find target
-        while (true) {
-            const entry = try self.nextWithPositions(allocator);
-            if (entry == null) return null;
-            if (entry.?.doc_id >= target) return entry;
-        }
-    }
-
     /// Get the next posting entry (without positions)
+    ///
+    /// Decodes up to BATCH_SIZE entries per page pin. Do not mix with
+    /// `nextWithPositions` on one iterator.
     pub fn next(self: *Self) PostingError!?PostingEntry {
-        return self.nextInternal(null);
+        if (self.batch_pos == self.batch_len) {
+            try self.refill();
+            if (self.batch_len == 0) return null;
+        }
+        const e = self.batch[self.batch_pos];
+        self.batch_pos += 1;
+        return .{ .doc_id = e.doc_id, .term_freq = e.term_freq, .positions = null };
+    }
+
+    /// Decode the next run of entries, following the chain to the next page
+    /// when this one is used up. Leaves an empty batch at the end of the list.
+    fn refill(self: *Self) PostingError!void {
+        self.batch_len = 0;
+        self.batch_pos = 0;
+        while (!self.done) {
+            const frame = self.store.bp.fetchPage(self.current_page, .shared) catch {
+                return PostingError.BufferPoolError;
+            };
+            const data = frame.data;
+            const header = self.store.readPageMeta(data, false);
+
+            if (self.entries_read >= header.num_entries) {
+                const next_page = header.next_page;
+                self.store.bp.unpinPage(frame, false);
+                if (next_page == 0) {
+                    self.done = true;
+                    return;
+                }
+                const next_frame = self.store.bp.fetchPage(next_page, .shared) catch {
+                    return PostingError.BufferPoolError;
+                };
+                const next_header = self.store.readPageMeta(next_frame.data, false);
+                self.store.bp.unpinPage(next_frame, false);
+                self.current_page = next_page;
+                self.entries_read = 0;
+                self.current_offset = next_header.data_start;
+                self.total_entries = next_header.num_entries;
+                self.data_start = next_header.data_start;
+                self.has_positions = next_header.hasPositions();
+                continue;
+            }
+
+            const page_has_positions = header.hasPositions();
+            var offset = self.current_offset;
+            while (self.entries_read < header.num_entries and self.batch_len < BATCH_SIZE) {
+                const doc_result = decodeVarint(data[offset..]);
+                offset += doc_result.bytes;
+                const freq_result = decodeVarint(data[offset..]);
+                offset += freq_result.bytes;
+                if (page_has_positions) {
+                    const pos_count_result = decodeVarint(data[offset..]);
+                    offset += pos_count_result.bytes;
+                    for (0..@intCast(pos_count_result.value)) |_| {
+                        offset += decodeVarint(data[offset..]).bytes;
+                    }
+                }
+                self.batch[self.batch_len] = .{
+                    .doc_id = doc_result.value,
+                    .term_freq = @intCast(freq_result.value),
+                };
+                self.batch_len += 1;
+                self.entries_read += 1;
+            }
+            self.current_offset = offset;
+            self.store.bp.unpinPage(frame, false);
+            return;
+        }
     }
 
     /// Get the next posting entry with positions (caller must free positions)
     pub fn nextWithPositions(self: *Self, allocator: Allocator) PostingError!?PostingEntry {
+        std.debug.assert(self.batch_pos == self.batch_len); // do not mix with next()
         return self.nextInternal(allocator);
     }
 
@@ -962,8 +892,6 @@ pub const PostingIterator = struct {
                 self.current_offset = next_header.data_start;
                 self.total_entries = next_header.num_entries;
                 self.data_start = next_header.data_start;
-                self.num_skip_pointers = next_header.num_skip_pointers;
-                self.skip_pointer_base = next_header.headerEnd();
                 self.has_positions = next_header.hasPositions();
 
                 // Recursively get from next page
@@ -1025,6 +953,51 @@ pub const PostingIterator = struct {
 // ============================================================================
 // Variable-Length Integer Encoding (Varint)
 // ============================================================================
+
+/// Bytes of posting data one page can hold.
+const PAGE_DATA_CAPACITY: usize = PAGE_SIZE - DATA_OFFSET;
+
+/// Number of bytes `encodeVarint` writes for a value.
+pub fn varintLen(value: u64) usize {
+    var v = value;
+    var len: usize = 1;
+    while (v >= 0x80) : (v >>= 7) len += 1;
+    return len;
+}
+
+/// Encode one posting entry into `buf`, returning its length.
+///
+/// With `with_positions`, the position count and positions follow the doc id
+/// and term frequency; an entry that has none records a count of zero. A term
+/// can occur in one document more often than one page can record, and an entry
+/// is never split across pages, so positions that would not fit are dropped from
+/// the end. The term frequency still counts every occurrence, so scoring is
+/// unaffected; only phrase matching past that point is lost. The alternative
+/// was an entry no page could hold, which used to overrun a 512-byte stack
+/// buffer long before reaching that size.
+fn encodeEntry(entry: PostingEntry, with_positions: bool, buf: *[PAGE_DATA_CAPACITY]u8) usize {
+    var len: usize = 0;
+    len += encodeVarint(entry.doc_id, buf[len..]);
+    len += encodeVarint(entry.term_freq, buf[len..]);
+    if (!with_positions) return len;
+
+    const positions = entry.positions orelse &[_]u32{};
+    // The kept count is at most the full count, so its varint is no longer.
+    const budget = PAGE_DATA_CAPACITY - len - varintLen(positions.len);
+    var kept: usize = 0;
+    var kept_bytes: usize = 0;
+    while (kept < positions.len) : (kept += 1) {
+        const size = varintLen(positions[kept]);
+        if (kept_bytes + size > budget) break;
+        kept_bytes += size;
+    }
+
+    len += encodeVarint(kept, buf[len..]);
+    for (positions[0..kept]) |pos| {
+        len += encodeVarint(pos, buf[len..]);
+    }
+    return len;
+}
 
 /// Encode a u64 as a varint
 /// Returns the number of bytes written
@@ -1153,7 +1126,7 @@ test "posting store create and append" {
     try std.testing.expect(entry4 == null);
 }
 
-test "skip pointers and skipTo" {
+test "posting pages keep no skip pointers and read pages that have them" {
     const allocator = std.testing.allocator;
 
     const vfs = lattice.storage.vfs;
@@ -1162,7 +1135,7 @@ test "skip pointers and skipTo" {
     var posix_vfs = vfs.PosixVfs.init(allocator);
     const vfs_impl = posix_vfs.vfs();
 
-    const db_path = "/tmp/lattice_skip_pointer_test.db";
+    const db_path = "/tmp/lse_posting_skip_area_test.db";
     vfs_impl.delete(db_path) catch {};
 
     var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
@@ -1175,54 +1148,67 @@ test "skip pointers and skipTo" {
     defer bp.deinit();
 
     var store = PostingStore.init(allocator, &bp);
-
-    // Create posting list
     const page_id = try store.create(1);
 
-    // Add 200 entries (more than SKIP_INTERVAL = 128 to trigger skip pointer creation)
-    // doc_ids: 10, 20, 30, ..., 2000
-    var i: u64 = 1;
-    while (i <= 200) : (i += 1) {
-        _ = try store.append(page_id, .{
-            .doc_id = i * 10,
-            .term_freq = @intCast(i % 5 + 1),
-            .positions = null,
-        });
+    // 300 entries fit one page; releases up to 0.16 wrote two skip pointers
+    // for them. None are written now.
+    for (1..301) |i| {
+        _ = try store.append(page_id, .{ .doc_id = @intCast(i * 10), .term_freq = 1, .positions = null });
+    }
+    {
+        const frame = try bp.fetchPage(page_id, .exclusive);
+        defer bp.unpinPage(frame, true);
+        var header = PostingPageHeader.read(frame.data);
+        try std.testing.expectEqual(@as(u32, 300), header.num_entries);
+        try std.testing.expectEqual(@as(u16, 0), header.num_skip_pointers);
+        // Make it look like a page 0.16.0 wrote: one skip pointer at entry 128.
+        var offset: usize = header.data_start;
+        for (0..128) |_| {
+            offset += decodeVarint(frame.data[offset..]).bytes;
+            offset += decodeVarint(frame.data[offset..]).bytes;
+        }
+        const area = frame.data[HEADER_END_V2..][0..SKIP_POINTER_SIZE];
+        std.mem.writeInt(u64, area[0..8], 1290, .little);
+        std.mem.writeInt(u32, area[8..12], @intCast(offset - header.data_start), .little);
+        std.mem.writeInt(u32, area[12..16], 128, .little);
+        header.num_skip_pointers = 1;
+        header.write(frame.data);
     }
 
-    // Verify skip pointer was created (at entry 128)
-    const frame = try bp.fetchPage(page_id, .shared);
-    defer bp.unpinPage(frame, false);
-    const header = PostingPageHeader.read(frame.data);
-    try std.testing.expect(header.num_skip_pointers >= 1);
+    // Appending leaves an earlier release's pointers as they are: they name
+    // entries that do not move.
+    _ = try store.append(page_id, .{ .doc_id = 5, .term_freq = 2, .positions = null });
+    {
+        const frame = try bp.fetchPage(page_id, .shared);
+        defer bp.unpinPage(frame, false);
+        try std.testing.expectEqual(@as(u16, 1), PostingPageHeader.read(frame.data).num_skip_pointers);
+    }
 
-    // Test skipTo - skip to doc_id 1500
     var iter = try store.iterate(page_id);
-    defer iter.deinit();
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        count += 1;
+        if (count <= 300) try std.testing.expectEqual(@as(DocId, count * 10), entry.doc_id);
+    }
+    try std.testing.expectEqual(@as(usize, 301), count);
 
-    const entry = try iter.skipTo(1500);
-    try std.testing.expect(entry != null);
-    try std.testing.expectEqual(@as(DocId, 1500), entry.?.doc_id);
-
-    // Continue iteration should give next entry
-    const next = try iter.next();
-    try std.testing.expect(next != null);
-    try std.testing.expectEqual(@as(DocId, 1510), next.?.doc_id);
-
-    // Test skipTo past all entries
-    var iter2 = try store.iterate(page_id);
-    defer iter2.deinit();
-
-    const no_entry = try iter2.skipTo(3000);
-    try std.testing.expect(no_entry == null);
-
-    // Test skipTo to exact entry
-    var iter3 = try store.iterate(page_id);
-    defer iter3.deinit();
-
-    const exact = try iter3.skipTo(500);
-    try std.testing.expect(exact != null);
-    try std.testing.expectEqual(@as(DocId, 500), exact.?.doc_id);
+    // A removal moves entries, so it clears the area.
+    try std.testing.expect((try store.removeEntry(page_id, 10)).found);
+    {
+        const frame = try bp.fetchPage(page_id, .shared);
+        defer bp.unpinPage(frame, false);
+        const header = PostingPageHeader.read(frame.data);
+        try std.testing.expectEqual(@as(u16, 0), header.num_skip_pointers);
+        try std.testing.expectEqual(@as(u32, 300), header.num_entries);
+        for (frame.data[HEADER_END_V2..header.data_start]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+    var after = try store.iterate(page_id);
+    count = 0;
+    while (try after.next()) |entry| {
+        try std.testing.expect(entry.doc_id != 10);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 300), count);
 }
 
 test "posting store lazily upgrades legacy v1 pages on append" {
@@ -1314,6 +1300,81 @@ test "posting store lazily upgrades legacy v1 pages on append" {
     try std.testing.expectEqual(@as(u32, 3), e3.?.term_freq);
 }
 
+test "posting removal closes the entry's gap, on a legacy v1 page too" {
+    const allocator = std.testing.allocator;
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/lattice_posting_v1_removal_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try BufferPool.init(allocator, &pm, 64 * 4096);
+    defer bp.deinit();
+    var store = PostingStore.init(allocator, &bp);
+
+    var file_header = pm.getHeader().*;
+    file_header.format_version = 1;
+    file_header.min_reader_version = 1;
+    try pm.updateHeader(&file_header);
+
+    // A v1 page has no data_end; removal has to find where its entries end.
+    // Entries carry positions, so each is more than two bytes.
+    const page_id = try pm.allocatePage();
+    const frame = try bp.fetchPage(page_id, .exclusive);
+    {
+        const data = frame.data;
+        const header = PageHeader.init(.fts_posting);
+        @memcpy(data[0..@sizeOf(PageHeader)], std.mem.asBytes(&header));
+        var offset: usize = DATA_OFFSET;
+        for ([_]DocId{ 10, 20, 300 }) |doc| {
+            offset += encodeVarint(doc, data[offset..]);
+            offset += encodeVarint(2, data[offset..]);
+            offset += encodeVarint(2, data[offset..]);
+            offset += encodeVarint(doc, data[offset..]);
+            offset += encodeVarint(doc + 1, data[offset..]);
+        }
+        var legacy_header = PostingPageHeaderV1{
+            .token_id = 1,
+            .num_entries = 3,
+            .next_page = 0,
+            .num_skip_pointers = 0,
+            .flags = POSTING_ENTRY_FLAG_HAS_POSITIONS,
+            .data_start = @intCast(DATA_OFFSET),
+        };
+        legacy_header.write(data);
+    }
+    bp.unpinPage(frame, true);
+
+    const removed = try store.removeEntry(page_id, 20);
+    try std.testing.expect(removed.found);
+    try std.testing.expectEqual(@as(u32, 2), removed.term_freq);
+    try std.testing.expect(!(try store.removeEntry(page_id, 20)).found);
+
+    var iter = try store.iterate(page_id);
+    defer iter.deinit();
+    for ([_]DocId{ 10, 300 }) |doc| {
+        const entry = (try iter.nextWithPositions(allocator)).?;
+        defer if (entry.positions) |p| allocator.free(p);
+        try std.testing.expectEqual(doc, entry.doc_id);
+        try std.testing.expectEqualSlices(u32, &[_]u32{ @intCast(doc), @intCast(doc + 1) }, entry.positions.?);
+    }
+    try std.testing.expect((try iter.next()) == null);
+
+    // An append lands after the remaining entries, not over them.
+    _ = try store.appendWithPositions(page_id, .{ .doc_id = 40, .term_freq = 1, .positions = &[_]u32{7} }, true);
+    var again = try store.iterate(page_id);
+    defer again.deinit();
+    var seen: [3]DocId = undefined;
+    for (&seen) |*d| d.* = (try again.next()).?.doc_id;
+    try std.testing.expectEqualSlices(DocId, &[_]DocId{ 10, 300, 40 }, &seen);
+}
+
 test "posting store appends thousands of entries without stalling" {
     const allocator = std.testing.allocator;
 
@@ -1360,6 +1421,75 @@ test "posting store appends thousands of entries without stalling" {
     try std.testing.expectEqual(@as(DocId, 3000), last_doc);
 }
 
+test "posting iterator reads past a head page that removals emptied" {
+    const allocator = std.testing.allocator;
+
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+
+    const db_path = "/tmp/s3_lattice_posting_empty_head_test.db";
+    vfs_impl.delete(db_path) catch {};
+
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+
+    var bp = try BufferPool.init(allocator, &pm, 64 * 4096);
+    defer bp.deinit();
+
+    var store = PostingStore.init(allocator, &bp);
+    const head = try store.create(1);
+
+    // Three pages, so that both the head and a page in the middle of the chain
+    // can be emptied.
+    const total: DocId = 4000;
+    for (1..total + 1) |i| {
+        _ = try store.append(head, .{ .doc_id = @intCast(i), .term_freq = 1, .positions = null });
+    }
+
+    var emptied: u32 = 0;
+    var page_id = head;
+    for (0..2) |_| {
+        const frame = try bp.fetchPage(page_id, .shared);
+        const header = PostingPageHeader.read(frame.data);
+        bp.unpinPage(frame, false);
+        try std.testing.expect(header.next_page != 0);
+        emptied += header.num_entries;
+        page_id = header.next_page;
+    }
+    const head_count = emptied;
+
+    // Remove everything the first two pages hold.
+    for (1..head_count + 1) |i| {
+        const removed = try store.removeEntry(head, @intCast(i));
+        try std.testing.expect(removed.found);
+    }
+
+    var iter = try store.iterate(head);
+    defer iter.deinit();
+    var count: usize = 0;
+    var expected: DocId = head_count + 1;
+    while (try iter.next()) |entry| {
+        try std.testing.expectEqual(expected, entry.doc_id);
+        expected += 1;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, total - head_count), count);
+
+    // The position-reading path walks the chain on its own.
+    var pos_iter = try store.iterate(head);
+    defer pos_iter.deinit();
+    const first = try pos_iter.nextWithPositions(allocator);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(@as(DocId, head_count + 1), first.?.doc_id);
+    if (first.?.positions) |p| allocator.free(p);
+}
+
 test "posting store releases full pages before appending to overflow tail" {
     const allocator = std.testing.allocator;
 
@@ -1398,4 +1528,167 @@ test "posting store releases full pages before appending to overflow tail" {
 
         try std.testing.expectEqual(@as(usize, 0), bp.getStats().pinned_frames);
     }
+}
+
+test "posting append trusts a tail hint only on a page of its own list" {
+    const allocator = std.testing.allocator;
+
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+
+    const db_path = "/tmp/lse_posting_tail_hint_test.db";
+    vfs_impl.delete(db_path) catch {};
+
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+
+    var bp = try BufferPool.init(allocator, &pm, 128 * 4096);
+    defer bp.deinit();
+
+    var store = PostingStore.init(allocator, &bp);
+
+    // A list as 0.16.0 made it: its pages carry a counter value, not the head.
+    const legacy = try store.create(7);
+    for (1..1501) |i| {
+        _ = try store.append(legacy, .{ .doc_id = @intCast(i), .term_freq = 1, .positions = null });
+    }
+    // Another list, made here, several pages long.
+    const other = try store.createList();
+    var other_tail = other;
+    for (1..1501) |i| {
+        other_tail = try store.appendAt(other, other, other_tail, .{ .doc_id = @intCast(i), .term_freq = 1, .positions = null }, false);
+    }
+    try std.testing.expect(other_tail != other);
+
+    // A hint at another list's page is ignored: the entry goes on the
+    // legacy list's own last page, which takes on the list's head as its id.
+    var tail = try store.appendAt(legacy, legacy, other_tail, .{ .doc_id = 5000, .term_freq = 1, .positions = null }, false);
+    try std.testing.expect(tail != legacy and tail != other_tail);
+    // A hint at a page that is not a posting page, or past the file, too.
+    tail = try store.appendAt(legacy, legacy, pm.pageCount() + 10, .{ .doc_id = 5001, .term_freq = 1, .positions = null }, false);
+    const freed = try store.createList();
+    try bp.freePage(freed);
+    try std.testing.expectEqual(tail, try store.appendAt(legacy, legacy, freed, .{ .doc_id = 5002, .term_freq = 1, .positions = null }, false));
+    // The stamped tail is now trusted.
+    try std.testing.expectEqual(tail, try store.appendAt(legacy, legacy, tail, .{ .doc_id = 5003, .term_freq = 1, .positions = null }, false));
+    // And 0.16.0, appending from the head, still reaches the same tail.
+    try std.testing.expectEqual(tail, try store.append(legacy, .{ .doc_id = 5004, .term_freq = 1, .positions = null }));
+
+    for ([_]struct { head: PageId, want: usize, last: DocId }{
+        .{ .head = legacy, .want = 1505, .last = 5004 },
+        .{ .head = other, .want = 1500, .last = 1500 },
+    }) |list| {
+        var iter = try store.iterate(list.head);
+        defer iter.deinit();
+        var count: usize = 0;
+        var last: DocId = 0;
+        while (try iter.next()) |entry| {
+            count += 1;
+            last = entry.doc_id;
+        }
+        try std.testing.expectEqual(list.want, count);
+        try std.testing.expectEqual(list.last, last);
+    }
+}
+
+test "posting removals free emptied pages and merge pages that fit together" {
+    const allocator = std.testing.allocator;
+
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+
+    const db_path = "/tmp/lse_posting_free_pages_test.db";
+    vfs_impl.delete(db_path) catch {};
+
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+
+    var bp = try BufferPool.init(allocator, &pm, 128 * 4096);
+    defer bp.deinit();
+
+    var store = PostingStore.init(allocator, &bp);
+    const head = try store.createList();
+    var tail = head;
+    const n: DocId = 4000;
+    for (1..n + 1) |i| {
+        tail = try store.appendAt(head, head, tail, .{ .doc_id = @intCast(i), .term_freq = 1, .positions = null }, false);
+    }
+
+    const Walk = struct {
+        fn pages(s: *PostingStore, first: PageId, list: *[64]PageId) !usize {
+            var count: usize = 0;
+            var at = first;
+            while (at != 0) : (count += 1) {
+                list[count] = at;
+                const frame = try s.bp.fetchPage(at, .shared);
+                at = s.readPageMeta(frame.data, false).next_page;
+                s.bp.unpinPage(frame, false);
+            }
+            return count;
+        }
+    };
+    var pages: [64]PageId = undefined;
+    const before = try Walk.pages(&store, head, &pages);
+    try std.testing.expect(before >= 4);
+    try std.testing.expectEqual(tail, pages[before - 1]);
+
+    // Removing every other entry leaves each page half full, so each removal
+    // that brings a page and its successor within one page merges them.
+    var doc: DocId = 2;
+    while (doc <= n) : (doc += 2) {
+        const result = try store.removeEntry(head, doc);
+        try std.testing.expect(result.found);
+        try std.testing.expect(!result.list_empty);
+        if (result.tail != 0) tail = result.tail;
+    }
+    const halved = try Walk.pages(&store, head, &pages);
+    try std.testing.expect(halved <= before / 2 + 1);
+    try std.testing.expect(pm.deferredFrees().len >= before - halved);
+    try std.testing.expectEqual(tail, pages[halved - 1]);
+
+    // What is left still reads in order, and a hinted append lands at the end.
+    tail = try store.appendAt(head, head, tail, .{ .doc_id = n + 1, .term_freq = 1, .positions = null }, false);
+    {
+        var iter = try store.iterate(head);
+        defer iter.deinit();
+        var expect: DocId = 1;
+        while (try iter.next()) |entry| : (expect += 2) {
+            try std.testing.expectEqual(expect, entry.doc_id);
+        }
+        try std.testing.expectEqual(n + 3, expect);
+    }
+
+    // Emptying the list from the back frees each last page as it empties
+    // and reports the page before it as the new last page.
+    var remaining = n + 1;
+    while (remaining >= 1) : (remaining -= 2) {
+        const result = try store.removeEntry(head, remaining);
+        try std.testing.expect(result.found);
+        if (result.tail != 0) tail = result.tail;
+        if (remaining == 1) {
+            try std.testing.expect(result.list_empty);
+            break;
+        }
+        try std.testing.expect(!result.list_empty);
+        const count = try Walk.pages(&store, head, &pages);
+        try std.testing.expectEqual(tail, pages[count - 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try Walk.pages(&store, head, &pages));
+
+    try store.freeList(head);
+    try std.testing.expect(pm.isDeferredFree(head));
+    // A list already freed is not freed twice.
+    try store.freeList(head);
 }

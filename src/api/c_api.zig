@@ -5,8 +5,10 @@
 //! as the foundation for Python and TypeScript bindings.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const Mutex = @import("compat").Mutex;
+const compat = @import("compat");
+const Mutex = compat.Mutex;
 
 const lattice = @import("lattice");
 
@@ -23,11 +25,13 @@ const QueryFailureStage = database.QueryFailureStage;
 const OpenOptions = database.OpenOptions;
 const DatabaseConfig = database.DatabaseConfig;
 const VectorSearchResult = database.VectorSearchResult;
+const checkpoint_mod = lattice.storage.checkpoint;
 const FtsSearchResult = database.FtsSearchResult;
 const StreamBatch = database.StreamBatch;
 const hash_embed_mod = lattice.vector.hash_embed;
 const embedding_mod = lattice.vector.embedding;
 const node_mod = lattice.graph.node;
+const changefeed_mod = lattice.stream.changefeed;
 const txn_mod = lattice.transaction.manager;
 const Transaction = txn_mod.Transaction;
 const TxnMode = txn_mod.TxnMode;
@@ -37,9 +41,20 @@ const TxnMode = txn_mod.TxnMode;
 // ============================================================================
 
 /// Global general-purpose allocator for C API.
-/// C callers cannot provide Zig allocators, so we use a global one.
-var gpa = std.heap.DebugAllocator(.{}){};
-const global_allocator = gpa.allocator();
+/// C callers cannot provide Zig allocators, so we use a global one, and it
+/// becomes the allocator for the whole engine behind every binding.
+///
+/// Debug builds use DebugAllocator: it never reuses an address, so a double
+/// free or a use after free in this layer or a binding traps instead of
+/// corrupting memory. That safety costs a global mutex and bookkeeping on
+/// every allocation, about 25x per property read, so every other build uses
+/// smp_allocator. Both are thread-safe, which the bindings need: they call in
+/// from several threads at once.
+var gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+const global_allocator: Allocator = if (builtin.mode == .Debug)
+    gpa.allocator()
+else
+    std.heap.smp_allocator;
 
 // ============================================================================
 // Opaque Handle Types
@@ -68,18 +83,29 @@ const HandleHeader = struct {
     magic: u64,
     kind: HandleKind,
     state: HandleState,
+    /// Calls currently inside the C API holding this handle. Only database
+    /// and transaction handles are pinned. Guarded by `handle_registry_mutex`.
+    pins: u32,
+    /// The handle has left the registry; the last unpin frees its memory.
+    /// Guarded by `handle_registry_mutex`.
+    detached: bool,
+    /// What the caller holds in place of this handle's address; see
+    /// "Handle tokens". Set by `registerHandle`.
+    token: usize,
 
     fn init(kind: HandleKind) HandleHeader {
         return .{
             .magic = HandleMagic,
             .kind = kind,
             .state = .active,
+            .pins = 0,
+            .detached = false,
+            .token = 0,
         };
     }
 };
 
 var handle_registry_mutex: Mutex = .{};
-var handle_registry: std.AutoHashMapUnmanaged(usize, HandleKind) = .{};
 
 /// Internal database handle wrapping the Zig Database
 const DatabaseHandle = struct {
@@ -87,7 +113,11 @@ const DatabaseHandle = struct {
     db: *Database,
     mutex: Mutex,
     active_children: usize,
-    retired_txns: ?*TxnHandle,
+    /// Calls inside `lattice_stream_read`, which wait without holding `mutex`.
+    /// Close wakes them and waits for them to leave. Guarded by `mutex`.
+    stream_readers: usize,
+    /// Set by close so waiting stream readers stop waiting.
+    closing: std.atomic.Value(bool),
 };
 
 /// Internal transaction handle wrapping actual Transaction
@@ -96,7 +126,6 @@ const TxnHandle = struct {
     db_handle: *DatabaseHandle,
     txn: Transaction, // Actual Transaction struct from TxnManager
     counted_child: bool,
-    next_retired: ?*TxnHandle,
 };
 
 /// Internal query handle storing prepared query state
@@ -115,6 +144,10 @@ const QueryHandle = struct {
     last_error_line: u32,
     last_error_column: u32,
     last_error_length: u32,
+    /// The parsed query, pinned in the database's query cache, so prepare
+    /// parses once and lattice_query_writes and every execute reuse it.
+    /// Null when it could not be cached; those calls then parse the text.
+    prepared: ?Database.PreparedQuery = null,
 
     fn init(cypher: []const u8, cypher_owned: bool, db_handle: *DatabaseHandle) QueryHandle {
         return .{
@@ -243,6 +276,12 @@ const FtsResultHandle = struct {
 const EdgeResultHandle = struct {
     header: HandleHeader,
     edges: []Database.EdgeInfo,
+    /// NUL-terminated copies of the edge types, one per edge, sharing a copy
+    /// between neighbouring edges of the same type. The engine's strings carry
+    /// no terminator, and bindings that read a `const char*` would run past
+    /// them. Allocated in `type_arena`.
+    edge_types_z: [][:0]const u8,
+    type_arena: std.heap.ArenaAllocator,
     count: usize,
     db_handle: *DatabaseHandle,
     counted_child: bool,
@@ -259,6 +298,10 @@ const StreamBatchHandle = struct {
 const EmbeddingClientHandle = struct {
     header: HandleHeader,
     client: embedding_mod.EmbeddingClient,
+    /// The client's endpoint, model and API key, copied out of the caller's
+    /// config: the client keeps slices of them, and the caller's buffers need
+    /// not outlive the create call.
+    config_arena: std.heap.ArenaAllocator,
 };
 
 // ============================================================================
@@ -315,6 +358,8 @@ pub const lattice_error = enum(c_int) {
     err_lock_timeout = -8,
     err_read_only = -9,
     err_full = -10,
+    /// The database file, or its log, was written by a newer release in a
+    /// format this one cannot read, read-only or not.
     err_version_mismatch = -11,
     err_checksum = -12,
     err_out_of_memory = -13,
@@ -323,6 +368,15 @@ pub const lattice_error = enum(c_int) {
     /// Another process holds the database. Distinct from err_lock_timeout,
     /// which is about a second writer inside this process.
     err_database_locked = -16,
+    /// lattice_node_delete was asked to delete a node that still has
+    /// relationships; lattice_node_detach_delete removes them with it.
+    err_has_relationships = -17,
+    /// The open options contradict the vector index configuration the file
+    /// records (dimensions, metric or HNSW parameters).
+    err_config_mismatch = -18,
+    /// The file was written by a newer release that does not let this one
+    /// write it. Open it read-only, or with that release.
+    err_needs_newer_writer = -19,
 };
 
 /// Query diagnostic stage for prepared query execution failures.
@@ -355,6 +409,14 @@ fn mapDatabaseError(err: DatabaseError) lattice_error {
         DatabaseError.ValueTooLarge => .err_value_too_large,
         DatabaseError.MissingIndex => .err_unsupported,
         DatabaseError.DatabaseLocked => .err_database_locked,
+        DatabaseError.NodeHasRelationships => .err_has_relationships,
+        DatabaseError.VectorConfigMismatch => .err_config_mismatch,
+        DatabaseError.NeedsNewerWriter => .err_needs_newer_writer,
+        // The changefeed dropped the events after the reader's position.
+        DatabaseError.ChangesTrimmed => .err_not_found,
+        // The changefeed's retention policy is off.
+        DatabaseError.ChangefeedOff => .err_unsupported,
+        DatabaseError.VersionTooNew => .err_version_mismatch,
     };
 }
 
@@ -379,20 +441,41 @@ fn mapQueryFailureStage(stage: QueryFailureStage) lattice_query_error_stage {
 }
 
 fn mapQueryFailureToError(failure: QueryFailure) lattice_error {
+    // A failure of the database underneath a query is not the query's
+    // fault, and a caller deciding whether to retry or fix the query has
+    // to be able to tell the two apart.
+    switch (failure.cause) {
+        .query => {},
+        .storage => return .err_io,
+        .out_of_memory => return .err_out_of_memory,
+    }
+    // One condition, one error code, whichever path reached it: a Cypher
+    // DELETE refused for a node with relationships returns what
+    // lattice_node_delete does, and a write to a node or relationship that
+    // does not exist (CREATE of a relationship whose end was deleted earlier
+    // in the query) what lattice_edge_create does. The diagnostic code and
+    // message stay as they are.
+    if (failure.stage == .execution) {
+        if (failure.code) |code| {
+            if (std.mem.eql(u8, code, "NodeHasRelationships")) return .err_has_relationships;
+            if (std.mem.eql(u8, code, "NotFound")) return .err_not_found;
+        }
+    }
     return switch (failure.stage) {
         .parse, .semantic => .err_invalid_arg,
         .plan, .execution => .err,
     };
 }
 
-/// Map any error to C error code
+/// Map an error from a function whose error set is inferred. An error the
+/// database's own set names gets the code `mapDatabaseError` gives it, so an
+/// I/O failure is err_io and a missing node err_not_found whichever function
+/// reported it; only an error outside that set is the generic err.
 fn mapAnyError(err: anyerror) lattice_error {
-    return switch (err) {
-        error.OutOfMemory => .err_out_of_memory,
-        error.FileNotFound => .err_not_found,
-        error.PermissionDenied => .err_read_only,
-        else => .err,
-    };
+    inline for (@typeInfo(DatabaseError).error_set.?) |e| {
+        if (err == @field(anyerror, e.name)) return mapDatabaseError(@field(DatabaseError, e.name));
+    }
+    return .err;
 }
 
 // ============================================================================
@@ -501,6 +584,8 @@ pub const lattice_open_options_v3 = extern struct {
     enable_vector: bool = false,
     vector_dimensions: u16 = 128,
     enable_wal: bool = true,
+    /// Keep an in-memory adjacency cache. Nothing in this API reads it:
+    /// queries and the edge functions go to the B+Tree either way.
     enable_adjacency_cache: bool = false,
 };
 
@@ -514,6 +599,8 @@ pub const lattice_open_options_v4 = extern struct {
     enable_vector: bool = false,
     vector_dimensions: u16 = 128,
     enable_wal: bool = true,
+    /// Keep an in-memory adjacency cache. Nothing in this API reads it:
+    /// queries and the edge functions go to the B+Tree either way.
     enable_adjacency_cache: bool = false,
     /// Take a lock on the file so two processes cannot tread on each other.
     ///
@@ -521,6 +608,109 @@ pub const lattice_open_options_v4 = extern struct {
     /// some network filesystems; it does not make concurrent access safe.
     lock: bool = true,
 };
+
+/// Values of lattice_open_options_v5.sync_mode.
+pub const lattice_sync_mode = enum(u8) {
+    /// LATTICE_SYNC_MODE from the environment if set, else full.
+    default = 0,
+    full = 1,
+    normal = 2,
+    _,
+};
+
+/// Values of lattice_open_options_v5.full_fsync.
+pub const lattice_full_fsync = enum(u8) {
+    /// LATTICE_FULL_FSYNC from the environment if set, else off.
+    default = 0,
+    off = 1,
+    on = 2,
+    _,
+};
+
+/// Values of lattice_checkpoint's mode.
+pub const lattice_checkpoint_mode = enum(c_int) {
+    passive = 0,
+    full = 1,
+    truncate = 2,
+    _,
+};
+
+/// What lattice_checkpoint reports.
+pub const lattice_checkpoint_stats = extern struct {
+    pages_flushed: u32,
+    duration_ns: u64,
+    checkpoint_lsn: u64,
+    wal_truncated: bool,
+};
+
+/// Values of lattice_open_options_v5.vector_metric.
+pub const lattice_vector_metric = enum(u8) {
+    /// The file's metric, or cosine for a new index.
+    default = 0,
+    cosine = 1,
+    euclidean = 2,
+    dot_product = 3,
+    _,
+};
+
+/// Versioned open options with durability settings and the vector index's
+/// metric and build parameters. Every field of v4 keeps its meaning.
+pub const lattice_open_options_v5 = extern struct {
+    struct_size: usize = @sizeOf(lattice_open_options_v5),
+    create: bool = false,
+    read_only: bool = false,
+    cache_size_mb: u32 = 100,
+    page_size: u32 = 4096,
+    enable_vector: bool = false,
+    vector_dimensions: u16 = 128,
+    enable_wal: bool = true,
+    /// Carried forward from v3 unchanged.
+    enable_adjacency_cache: bool = false,
+    lock: bool = true,
+    /// A lattice_sync_mode. An explicit value wins over LATTICE_SYNC_MODE.
+    sync_mode: u8 = 0,
+    /// A lattice_full_fsync. An explicit value wins over LATTICE_FULL_FSYNC.
+    full_fsync: u8 = 0,
+    /// A lattice_vector_metric, for a new vector index.
+    vector_metric: u8 = 0,
+    /// HNSW connections per node, 2..32, for a new index; 0 for the file's or 16.
+    vector_m: u16 = 0,
+    /// HNSW build candidate list size, 1..4096, for a new index; 0 for the
+    /// file's or 200.
+    vector_ef_construction: u16 = 0,
+    /// A lattice_changefeed_retention; 0 keeps the file's policy.
+    changefeed_retention: u8 = 0,
+    /// The number of events (LAST) or milliseconds (AGE) to keep.
+    changefeed_retention_value: u64 = 0,
+};
+
+/// Values of lattice_open_options_v5.changefeed_retention.
+pub const lattice_changefeed_retention = enum(u8) {
+    /// The policy the file records; keep everything if it records none
+    /// (LATTICE_CHANGEFEED_RETENTION from the environment for a new file).
+    default = 0,
+    all = 1,
+    last = 2,
+    age = 3,
+    off = 4,
+    _,
+};
+
+comptime {
+    // The offsets the bindings mirror. A change here is an ABI break.
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "create") == @sizeOf(usize));
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "cache_size_mb") == @sizeOf(usize) + 4);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "vector_dimensions") == @sizeOf(usize) + 14);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "lock") == @sizeOf(usize) + 18);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "sync_mode") == @sizeOf(usize) + 19);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "full_fsync") == @sizeOf(usize) + 20);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "vector_metric") == @sizeOf(usize) + 21);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "vector_m") == @sizeOf(usize) + 22);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "vector_ef_construction") == @sizeOf(usize) + 24);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "changefeed_retention") == @sizeOf(usize) + 26);
+    std.debug.assert(@offsetOf(lattice_open_options_v5, "changefeed_retention_value") ==
+        std.mem.alignForward(usize, @sizeOf(usize) + 27, @alignOf(u64)));
+}
 
 // ============================================================================
 // Helper Functions
@@ -572,8 +762,20 @@ fn cEmbeddingVectorToSlice(ptr: [*c]const f32, dimensions: u32) ?[]const f32 {
     return ptr[0..dimensions];
 }
 
+/// Read a C enum the caller filled in, without trusting it to hold a declared
+/// value. Zig treats an exhaustive enum holding any other value as illegal
+/// behaviour (a panic in safe builds, undefined in ReleaseFast), so its raw
+/// integer is checked first. Null means the value is not one of `E`'s.
+fn checkedEnum(comptime E: type, field: *const E) ?E {
+    comptime std.debug.assert(@sizeOf(E) == @sizeOf(c_int));
+    const raw: c_int = @as(*const c_int, @ptrCast(field)).*;
+    return std.enums.fromInt(E, raw);
+}
+
 fn freeOwnedCValue(c_val: *lattice_value) void {
-    switch (c_val.value_type) {
+    // An unknown type owns nothing this library allocated.
+    const value_type = checkedEnum(lattice_value_type, &c_val.value_type) orelse return;
+    switch (value_type) {
         .string => {
             if (c_val.data.string_val.ptr != null and c_val.data.string_val.len > 0) {
                 global_allocator.free(c_val.data.string_val.ptr[0..c_val.data.string_val.len]);
@@ -807,7 +1009,8 @@ fn resultValueToBorrowedCValue(result_val: ResultValue, c_val: *lattice_value, a
 }
 
 fn cValueToOwnedZigValue(c_val: *const lattice_value, allocator: Allocator) ValueConversionError!PropertyValue {
-    return switch (c_val.value_type) {
+    const value_type = checkedEnum(lattice_value_type, &c_val.value_type) orelse return error.InvalidValue;
+    return switch (value_type) {
         .null => .{ .null_val = {} },
         .bool => .{ .bool_val = c_val.data.bool_val },
         .int => .{ .int_val = c_val.data.int_val },
@@ -928,13 +1131,75 @@ fn kindForHandle(comptime T: type) HandleKind {
     @compileError("unknown C API handle type");
 }
 
+// ============================================================================
+// Handle tokens
+// ============================================================================
+//
+// Handles reach the caller as tokens, not as the addresses of the structs
+// behind them. The registry maps a live token to its struct.
+//
+// The registry used to be keyed by address, and that is only a check while
+// the allocator never hands a freed address out again. Allocators that do
+// (std.heap.smp_allocator, for one) put the next handle of the same size at
+// the address just freed, so a stale handle (a double free, a use after free,
+// a transaction reused after commit) would pass the check and act on somebody
+// else's handle. Tokens come from a range no allocation can occupy and are not
+// reissued until the sequence wraps, so a token that is not live is always a
+// handle that has gone, whatever the allocator does with the memory.
+//
+// On 64-bit targets a token is 1<<62 | kind<<56 | seq<<3: each kind has its
+// own range, so an ended transaction is told apart from garbage, and the
+// sequence wraps after 2^53 handles. Nothing dereferences a token; bindings
+// only pass it back.
+
+const token_stride: usize = 8;
+const token_seq_count: usize = if (@sizeOf(usize) >= 8) 1 << 53 else 1 << 16;
+
+/// 32-bit targets have no address range to spare, so tokens there are
+/// addresses inside this array, which is never read or written. All kinds
+/// share it, and tokens are reissued after 2^16 further handles.
+var token_space: [if (@sizeOf(usize) >= 8) 0 else token_seq_count * token_stride]u8 align(token_stride) = undefined;
+
+fn tokenBase(kind: HandleKind) usize {
+    if (@sizeOf(usize) >= 8) return (1 << 62) | (@as(usize, @intFromEnum(kind)) << 56);
+    return @intFromPtr(&token_space);
+}
+
+/// Whether `addr` lies in the token range of `kind`, live or not.
+fn isTokenOf(kind: HandleKind, addr: usize) bool {
+    const base = tokenBase(kind);
+    if (addr < base) return false;
+    const offset = addr - base;
+    return offset < token_seq_count * token_stride and offset % token_stride == 0;
+}
+
+const HandleEntry = struct {
+    kind: HandleKind,
+    ptr: *anyopaque,
+};
+
+/// Live handles by token. Guarded by `handle_registry_mutex`.
+var handle_registry: std.AutoHashMapUnmanaged(usize, HandleEntry) = .{};
+var next_token_seq: usize = 0;
+
+/// Give a new handle its token and make it live. The caller hands the
+/// token out with `toOpaque`.
 fn registerHandle(comptime T: type, handle: *T) lattice_error {
+    const kind = kindForHandle(T);
     handle_registry_mutex.lock();
     defer handle_registry_mutex.unlock();
 
-    handle_registry.put(global_allocator, @intFromPtr(handle), kindForHandle(T)) catch {
+    // Skipping live tokens only matters once the sequence has wrapped.
+    var token: usize = undefined;
+    while (true) {
+        token = tokenBase(kind) + (next_token_seq % token_seq_count) * token_stride;
+        next_token_seq +%= 1;
+        if (!handle_registry.contains(token)) break;
+    }
+    handle_registry.put(global_allocator, token, .{ .kind = kind, .ptr = handle }) catch {
         return .err_out_of_memory;
     };
+    handle.header.token = token;
     return .ok;
 }
 
@@ -942,34 +1207,156 @@ fn unregisterHandle(comptime T: type, handle: *T) void {
     handle_registry_mutex.lock();
     defer handle_registry_mutex.unlock();
 
-    const addr = @intFromPtr(handle);
-    if (handle_registry.get(addr)) |kind| {
-        if (kind == kindForHandle(T)) {
-            _ = handle_registry.remove(addr);
+    const token = handle.header.token;
+    if (handle_registry.get(token)) |entry| {
+        if (entry.kind == kindForHandle(T) and entry.ptr == @as(*anyopaque, handle)) {
+            _ = handle_registry.remove(token);
         }
     }
 }
 
-/// Cast opaque C pointer to an internal handle after address-based liveness
-/// validation. This rejects stale pointers before dereferencing freed memory.
+/// The struct behind a live token of kind `T`, or null. Called with
+/// `handle_registry_mutex` held.
+fn lookupLocked(comptime T: type, addr: usize) ?*T {
+    const entry = handle_registry.get(addr) orelse return null;
+    if (entry.kind != kindForHandle(T)) return null;
+    const handle: *T = @ptrCast(@alignCast(entry.ptr));
+    if (handle.header.magic != HandleMagic or handle.header.kind != kindForHandle(T)) return null;
+    return handle;
+}
+
+/// Resolve an opaque C handle to its internal struct. A token that is not
+/// live, or is of another kind, gives null.
 fn toHandle(comptime T: type, ptr: anytype) ?*T {
     const addr = @intFromPtr(ptr);
     if (addr == 0) return null;
 
     handle_registry_mutex.lock();
-    const registered = if (handle_registry.get(addr)) |kind|
-        kind == kindForHandle(T)
-    else
-        false;
+    defer handle_registry_mutex.unlock();
+    return lookupLocked(T, addr);
+}
+
+/// What the caller is given for `handle`: its token.
+fn toOpaque(comptime T: type, handle: anytype) *T {
+    std.debug.assert(handle.header.token != 0);
+    return @ptrFromInt(handle.header.token);
+}
+
+/// Look up a database handle and pin it for the rest of the calling function,
+/// which must `releaseDb` it.
+///
+/// `toHandle` checks the registry and then lets go of the registry lock, so a
+/// close on another thread could free the handle between the check and the
+/// caller locking `mutex`. A pin taken under the registry lock closes that
+/// window: close detaches the handle, and its memory is freed only when the
+/// last pinned call releases it. Such a call finds the handle closed and
+/// returns without touching the database.
+fn acquireDb(ptr: ?*lattice_database) ?*DatabaseHandle {
+    const addr = @intFromPtr(ptr);
+    if (addr == 0) return null;
+
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    const handle = lookupLocked(DatabaseHandle, addr) orelse return null;
+    handle.header.pins += 1;
+    return handle;
+}
+
+fn releaseDb(handle: *DatabaseHandle) void {
+    handle_registry_mutex.lock();
+    std.debug.assert(handle.header.pins > 0);
+    handle.header.pins -= 1;
+    const free_now = handle.header.detached and handle.header.pins == 0;
     handle_registry_mutex.unlock();
 
-    if (!registered) return null;
+    if (free_now) global_allocator.destroy(handle);
+}
 
-    const handle: *T = @ptrCast(@alignCast(ptr));
-    if (handle.header.magic != HandleMagic or handle.header.kind != kindForHandle(T)) {
-        return null;
+/// Remove a closed database handle from the registry. Its memory goes when the
+/// last pin is released, which may be the closing call's own.
+fn detachDb(handle: *DatabaseHandle) void {
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    _ = handle_registry.remove(handle.header.token);
+    handle.header.detached = true;
+}
+
+// ============================================================================
+// Ended transactions
+// ============================================================================
+//
+// lattice.h promises that using a transaction handle after commit or rollback
+// returns LATTICE_ERROR_TXN_ABORTED. That used to be kept by holding every
+// finished TxnHandle, and its registry entry, until the database closed:
+// memory and registry size grew with every transaction ever run. Now the
+// TxnHandle is freed when the transaction ends, and a transaction token that
+// is no longer live resolves to the stand-in below.
+
+/// Stands in for every ended transaction. A stale token resolves to it and
+/// takes the path a retained closed handle used to, so callers get the same
+/// errors in the same order as before. Its database is permanently closed;
+/// every path checks that before touching `db`, which is never set.
+var retired_db_handle: DatabaseHandle = .{
+    .header = .{ .magic = HandleMagic, .kind = .database, .state = .closed, .pins = 0, .detached = false, .token = 0 },
+    .db = undefined,
+    .mutex = .{},
+    .active_children = 0,
+    .stream_readers = 0,
+    .closing = .init(true),
+};
+var retired_txn_handle: TxnHandle = .{
+    .header = .{ .magic = HandleMagic, .kind = .txn, .state = .closed, .pins = 0, .detached = false, .token = 0 },
+    .db_handle = &retired_db_handle,
+    .txn = .{
+        .id = 0,
+        .state = .aborted,
+        .mode = .read_only,
+        .isolation = .snapshot,
+        .start_ts = 0,
+        .commit_ts = 0,
+    },
+    .counted_child = false,
+};
+
+/// Resolve a caller's transaction token and pin it, and its database, for the
+/// rest of the calling function, which must `releaseTxn` it. An ended
+/// transaction resolves to `retired_txn_handle`; anything else that is not a
+/// live transaction token is rejected.
+///
+/// The pins are what make freeing safe: a commit on one thread can end a
+/// transaction another thread is still using, and the memory stays until that
+/// call is done with it.
+fn acquireTxn(ptr: ?*lattice_txn) ?*TxnHandle {
+    const addr = @intFromPtr(ptr);
+    if (addr == 0) return null;
+
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    if (lookupLocked(TxnHandle, addr)) |handle| {
+        handle.header.pins += 1;
+        handle.db_handle.header.pins += 1;
+        return handle;
     }
-    return handle;
+    // On 32-bit targets kinds share one range, and only a live token can be
+    // told apart from the others.
+    if (isTokenOf(.txn, addr) and !handle_registry.contains(addr)) return &retired_txn_handle;
+    return null;
+}
+
+fn releaseTxn(handle: *TxnHandle) void {
+    if (handle == &retired_txn_handle) return;
+
+    handle_registry_mutex.lock();
+    const db_handle = handle.db_handle;
+    std.debug.assert(handle.header.pins > 0 and db_handle.header.pins > 0);
+    handle.header.pins -= 1;
+    db_handle.header.pins -= 1;
+    const free_txn = handle.header.detached and handle.header.pins == 0;
+    const free_db = db_handle.header.detached and db_handle.header.pins == 0;
+    handle_registry_mutex.unlock();
+
+    if (free_txn) global_allocator.destroy(handle);
+    if (free_db) global_allocator.destroy(db_handle);
 }
 
 fn releaseDbChildLocked(db_handle: *DatabaseHandle, counted_child: *bool) void {
@@ -979,22 +1366,18 @@ fn releaseDbChildLocked(db_handle: *DatabaseHandle, counted_child: *bool) void {
     counted_child.* = false;
 }
 
+/// End a transaction handle after commit or rollback. Called with the database
+/// mutex held by a call that has the handle pinned; the handle leaves the
+/// registry here and its memory goes when that call releases it.
 fn retireTxnHandleLocked(txn_handle: *TxnHandle) void {
     const db_handle = txn_handle.db_handle;
     releaseDbChildLocked(db_handle, &txn_handle.counted_child);
     txn_handle.header.state = .closed;
-    txn_handle.next_retired = db_handle.retired_txns;
-    db_handle.retired_txns = txn_handle;
-}
 
-fn destroyRetiredTxnsLocked(db_handle: *DatabaseHandle) void {
-    var next = db_handle.retired_txns;
-    db_handle.retired_txns = null;
-    while (next) |txn_handle| {
-        next = txn_handle.next_retired;
-        unregisterHandle(TxnHandle, txn_handle);
-        global_allocator.destroy(txn_handle);
-    }
+    handle_registry_mutex.lock();
+    defer handle_registry_mutex.unlock();
+    _ = handle_registry.remove(txn_handle.header.token);
+    txn_handle.header.detached = true;
 }
 
 fn ensureActiveDbLocked(db_handle: *DatabaseHandle) lattice_error {
@@ -1023,9 +1406,15 @@ fn unlockTxnDb(txn_handle: *TxnHandle) void {
     txn_handle.db_handle.mutex.unlock();
 }
 
-/// Cast internal handle to opaque C pointer
-fn toOpaque(comptime T: type, handle: *anyopaque) *T {
-    return @ptrCast(handle);
+/// The buffer pool size an options struct's `cache_size_mb` asks for. A size
+/// set there wins over `LATTICE_BUFFER_POOL_MB`; 0 means not set, and then
+/// the variable decides if it is set, else the 100 MB every options struct
+/// defaults to.
+fn cacheSizeBytes(cache_size_mb: u32) usize {
+    const mib: usize = 1024 * 1024;
+    if (cache_size_mb > 0) return @as(usize, cache_size_mb) * mib;
+    if (DatabaseConfig.environmentBufferPoolSize() != null) return 0;
+    return 100 * mib;
 }
 
 fn buildOpenOptionsV1(options: ?*const lattice_open_options) OpenOptions {
@@ -1041,7 +1430,7 @@ fn buildOpenOptionsV1(options: ?*const lattice_open_options) OpenOptions {
         zig_options.create = opts.create;
         zig_options.read_only = opts.read_only;
         zig_options.page_size = if (opts.page_size == 0) types.DEFAULT_PAGE_SIZE else opts.page_size;
-        zig_options.config.buffer_pool_size = @as(usize, opts.cache_size_mb) * 1024 * 1024;
+        zig_options.config.buffer_pool_size = cacheSizeBytes(opts.cache_size_mb);
         zig_options.config.enable_vector = opts.enable_vector;
         zig_options.config.vector_dimensions = opts.vector_dimensions;
     }
@@ -1066,7 +1455,7 @@ fn buildOpenOptionsV2(options: ?*const lattice_open_options_v2) DatabaseError!Op
         zig_options.create = opts.create;
         zig_options.read_only = opts.read_only;
         zig_options.page_size = if (opts.page_size == 0) types.DEFAULT_PAGE_SIZE else opts.page_size;
-        zig_options.config.buffer_pool_size = @as(usize, opts.cache_size_mb) * 1024 * 1024;
+        zig_options.config.buffer_pool_size = cacheSizeBytes(opts.cache_size_mb);
         zig_options.config.enable_vector = opts.enable_vector;
         zig_options.config.vector_dimensions = opts.vector_dimensions;
         zig_options.config.enable_wal = opts.enable_wal;
@@ -1092,7 +1481,7 @@ fn buildOpenOptionsV3(options: ?*const lattice_open_options_v3) DatabaseError!Op
         zig_options.create = opts.create;
         zig_options.read_only = opts.read_only;
         zig_options.page_size = if (opts.page_size == 0) types.DEFAULT_PAGE_SIZE else opts.page_size;
-        zig_options.config.buffer_pool_size = @as(usize, opts.cache_size_mb) * 1024 * 1024;
+        zig_options.config.buffer_pool_size = cacheSizeBytes(opts.cache_size_mb);
         zig_options.config.enable_vector = opts.enable_vector;
         zig_options.config.vector_dimensions = opts.vector_dimensions;
         zig_options.config.enable_wal = opts.enable_wal;
@@ -1119,12 +1508,66 @@ fn buildOpenOptionsV4(options: ?*const lattice_open_options_v4) DatabaseError!Op
         zig_options.create = opts.create;
         zig_options.read_only = opts.read_only;
         zig_options.page_size = if (opts.page_size == 0) types.DEFAULT_PAGE_SIZE else opts.page_size;
-        zig_options.config.buffer_pool_size = @as(usize, opts.cache_size_mb) * 1024 * 1024;
+        zig_options.config.buffer_pool_size = cacheSizeBytes(opts.cache_size_mb);
         zig_options.config.enable_vector = opts.enable_vector;
         zig_options.config.vector_dimensions = opts.vector_dimensions;
         zig_options.config.enable_wal = opts.enable_wal;
         zig_options.config.enable_adjacency_cache = opts.enable_adjacency_cache;
         zig_options.lock = opts.lock;
+    }
+
+    return zig_options;
+}
+
+fn buildOpenOptionsV5(options: ?*const lattice_open_options_v5) DatabaseError!OpenOptions {
+    var zig_options = OpenOptions{
+        .create = false,
+        .read_only = false,
+        .config = DatabaseConfig{
+            .enable_wal = true,
+        },
+    };
+
+    if (options) |opts| {
+        if (opts.struct_size < @sizeOf(lattice_open_options_v5)) {
+            return DatabaseError.InvalidArgument;
+        }
+
+        zig_options.create = opts.create;
+        zig_options.read_only = opts.read_only;
+        zig_options.page_size = if (opts.page_size == 0) types.DEFAULT_PAGE_SIZE else opts.page_size;
+        zig_options.config.buffer_pool_size = cacheSizeBytes(opts.cache_size_mb);
+        zig_options.config.enable_vector = opts.enable_vector;
+        zig_options.config.vector_dimensions = opts.vector_dimensions;
+        zig_options.config.enable_wal = opts.enable_wal;
+        zig_options.config.enable_adjacency_cache = opts.enable_adjacency_cache;
+        zig_options.lock = opts.lock;
+        zig_options.config.sync_mode = switch (@as(lattice_sync_mode, @enumFromInt(opts.sync_mode))) {
+            .default => null,
+            .full => .full,
+            .normal => .normal,
+            _ => return DatabaseError.InvalidArgument,
+        };
+        zig_options.config.full_fsync = switch (@as(lattice_full_fsync, @enumFromInt(opts.full_fsync))) {
+            .default => null,
+            .off => false,
+            .on => true,
+            _ => return DatabaseError.InvalidArgument,
+        };
+        zig_options.config.vector_metric = switch (@as(lattice_vector_metric, @enumFromInt(opts.vector_metric))) {
+            .default => null,
+            .cosine => .cosine,
+            .euclidean => .euclidean,
+            .dot_product => .dot_product,
+            _ => return DatabaseError.InvalidArgument,
+        };
+        zig_options.config.vector_m = if (opts.vector_m == 0) null else opts.vector_m;
+        zig_options.config.vector_ef_construction = if (opts.vector_ef_construction == 0) null else opts.vector_ef_construction;
+        zig_options.config.changefeed_retention = if (opts.changefeed_retention == 0)
+            null
+        else
+            changefeed_mod.Retention.fromMode(opts.changefeed_retention, opts.changefeed_retention_value) orelse
+                return DatabaseError.InvalidArgument;
     }
 
     return zig_options;
@@ -1160,7 +1603,8 @@ fn adoptDatabase(db: *Database, db_out: *?*lattice_database) lattice_error {
         .db = db,
         .mutex = .{},
         .active_children = 0,
-        .retired_txns = null,
+        .stream_readers = 0,
+        .closing = .init(false),
     };
     const register_result = registerHandle(DatabaseHandle, handle);
     if (register_result != .ok) {
@@ -1169,7 +1613,13 @@ fn adoptDatabase(db: *Database, db_out: *?*lattice_database) lattice_error {
         return register_result;
     }
 
-    db_out.* = @ptrCast(handle);
+    // The default for a caller that does not choose: commits checkpoint as
+    // the variable says, while open and close still fold the log in.
+    if (checkpoint_mod.AutoCheckpointConfig.fromEnvironment()) |setting| {
+        db.setAutoCheckpoint(setting.get());
+    }
+
+    db_out.* = toOpaque(lattice_database, handle);
     return .ok;
 }
 
@@ -1230,9 +1680,21 @@ pub export fn lattice_open_v4(
     return openDatabase(path, zig_options, db_out);
 }
 
+/// Open a database file with v5 options: durability settings, and the
+/// vector index's metric and build parameters.
+pub export fn lattice_open_v5(
+    path: [*c]const u8,
+    options: ?*const lattice_open_options_v5,
+    db_out: *?*lattice_database,
+) lattice_error {
+    const zig_options = buildOpenOptionsV5(options) catch |err| return mapDatabaseError(err);
+    return openDatabase(path, zig_options, db_out);
+}
+
 /// Close a database
 pub export fn lattice_close(db: ?*lattice_database) lattice_error {
-    const handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(handle);
 
     handle.mutex.lock();
     if (handle.header.state != .active) {
@@ -1244,7 +1706,7 @@ pub export fn lattice_close(db: ?*lattice_database) lattice_error {
         return .err_invalid_arg;
     }
     handle.header.state = .closed;
-    destroyRetiredTxnsLocked(handle);
+    wakeStreamReadersForCloseLocked(handle);
     handle.mutex.unlock();
 
     var close_error: ?lattice_error = null;
@@ -1257,12 +1719,85 @@ pub export fn lattice_close(db: ?*lattice_database) lattice_error {
         };
     }
 
-    // Always close and free resources
+    // Always close and free resources. The handle's own memory goes when the
+    // last pinned call releases it, which is usually the deferred release above.
     handle.db.close();
-    unregisterHandle(DatabaseHandle, handle);
-    global_allocator.destroy(handle);
+    detachDb(handle);
 
     return close_error orelse .ok;
+}
+
+/// Fold the log into the database file now.
+pub export fn lattice_checkpoint(
+    db: ?*lattice_database,
+    mode: lattice_checkpoint_mode,
+    stats_out: ?*lattice_checkpoint_stats,
+) lattice_error {
+    const handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(handle);
+    const zig_mode: checkpoint_mod.CheckpointMode = switch (mode) {
+        .passive => .passive,
+        .full => .full,
+        .truncate => .truncate,
+        _ => return .err_invalid_arg,
+    };
+
+    handle.mutex.lock();
+    defer handle.mutex.unlock();
+    const active = ensureActiveDbLocked(handle);
+    if (active != .ok) return active;
+    if (handle.db.read_only) return .err_read_only;
+
+    const stats = handle.db.checkpoint(zig_mode) catch |err| return mapDatabaseError(err);
+    if (stats_out) |out| {
+        out.* = if (stats) |s| .{
+            .pages_flushed = s.pages_flushed,
+            .duration_ns = s.duration_ns,
+            .checkpoint_lsn = s.checkpoint_lsn,
+            .wal_truncated = s.wal_truncated,
+        } else .{ .pages_flushed = 0, .duration_ns = 0, .checkpoint_lsn = 0, .wal_truncated = false };
+    }
+    return .ok;
+}
+
+/// Set how commits checkpoint from now on; 0 frames switches them off.
+pub export fn lattice_set_auto_checkpoint(
+    db: ?*lattice_database,
+    max_wal_frames: u64,
+    min_interval_ms: u64,
+) lattice_error {
+    const handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(handle);
+
+    handle.mutex.lock();
+    defer handle.mutex.unlock();
+    const active = ensureActiveDbLocked(handle);
+    if (active != .ok) return active;
+
+    handle.db.setAutoCheckpoint(if (max_wal_frames == 0) null else .{
+        .max_wal_frames = max_wal_frames,
+        .min_interval_ns = std.math.mul(u64, min_interval_ms, std.time.ns_per_ms) catch std.math.maxInt(u64),
+    });
+    return .ok;
+}
+
+/// Wake every `lattice_stream_read` waiting on this database and wait for them
+/// to leave, so the database is not freed under them. Called by close with
+/// `mutex` held and the handle already marked closed, which is what the
+/// readers check when they wake.
+fn wakeStreamReadersForCloseLocked(handle: *DatabaseHandle) void {
+    if (handle.stream_readers == 0) return;
+
+    handle.closing.store(true, .release);
+    handle.db.stream_mutex.lock();
+    handle.db.stream_cond.broadcast();
+    handle.db.stream_mutex.unlock();
+
+    while (handle.stream_readers != 0) {
+        handle.mutex.unlock();
+        compat.sleep(std.time.ns_per_ms);
+        handle.mutex.lock();
+    }
 }
 
 // ============================================================================
@@ -1278,18 +1813,24 @@ pub export fn lattice_begin(
     const out = txn_out orelse return .err_invalid_arg;
     out.* = null;
 
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     db_handle.mutex.lock();
     defer db_handle.mutex.unlock();
     const active_db_result = ensureActiveDbLocked(db_handle);
     if (active_db_result != .ok) return active_db_result;
 
     // Map C API mode to TxnMode
-    const txn_mode: TxnMode = if (mode == .read_only) .read_only else .read_write;
+    const checked_mode = checkedEnum(lattice_txn_mode, &mode) orelse return .err_invalid_arg;
+    const txn_mode: TxnMode = if (checked_mode == .read_only) .read_only else .read_write;
 
     // Actually begin a transaction in the database
     const txn = db_handle.db.beginTransaction(txn_mode) catch |err| {
         return switch (err) {
+            // Only a handle opened read-only has no transactions; a database
+            // opened without a log has them like any other. A read
+            // transaction on a read-only handle is a stand-in that reads
+            // the committed state, which nothing can change under it.
             DatabaseError.TransactionsNotEnabled => {
                 if (txn_mode == .read_only) {
                     const txn_handle = global_allocator.create(TxnHandle) catch return .err_out_of_memory;
@@ -1305,7 +1846,6 @@ pub export fn lattice_begin(
                             .commit_ts = 0,
                         },
                         .counted_child = true,
-                        .next_retired = null,
                     };
                     const register_result = registerHandle(TxnHandle, txn_handle);
                     if (register_result != .ok) {
@@ -1313,14 +1853,12 @@ pub export fn lattice_begin(
                         return register_result;
                     }
                     db_handle.active_children += 1;
-                    out.* = @ptrCast(txn_handle);
+                    out.* = toOpaque(lattice_txn, txn_handle);
                     return .ok;
                 }
                 return .err_unsupported;
             },
-            DatabaseError.OutOfMemory => .err_out_of_memory,
-            DatabaseError.TransactionConflict => .err_lock_timeout,
-            else => .err,
+            else => mapDatabaseError(err),
         };
     };
 
@@ -1335,7 +1873,6 @@ pub export fn lattice_begin(
         .db_handle = db_handle,
         .txn = txn,
         .counted_child = true,
-        .next_retired = null,
     };
     const register_result = registerHandle(TxnHandle, txn_handle);
     if (register_result != .ok) {
@@ -1346,13 +1883,14 @@ pub export fn lattice_begin(
     }
     db_handle.active_children += 1;
 
-    out.* = @ptrCast(txn_handle);
+    out.* = toOpaque(lattice_txn, txn_handle);
     return .ok;
 }
 
 /// Commit a transaction
 pub export fn lattice_commit(txn: ?*lattice_txn) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const db_handle = txn_handle.db_handle;
     db_handle.mutex.lock();
     defer db_handle.mutex.unlock();
@@ -1380,7 +1918,8 @@ pub export fn lattice_commit(txn: ?*lattice_txn) lattice_error {
 
 /// Rollback a transaction
 pub export fn lattice_rollback(txn: ?*lattice_txn) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const db_handle = txn_handle.db_handle;
     db_handle.mutex.lock();
     defer db_handle.mutex.unlock();
@@ -1395,7 +1934,7 @@ pub export fn lattice_rollback(txn: ?*lattice_txn) lattice_error {
             retireTxnHandleLocked(txn_handle);
             return switch (err) {
                 DatabaseError.TransactionNotActive => .err_txn_aborted,
-                else => .err,
+                else => mapDatabaseError(err),
             };
         };
     }
@@ -1415,7 +1954,8 @@ pub export fn lattice_node_create(
     label: [*c]const u8,
     node_out: *lattice_node_id,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const maybe_label_slice = cStrToSlice(label);
     const labels: []const []const u8 = if (maybe_label_slice) |label_slice|
@@ -1445,7 +1985,8 @@ pub export fn lattice_node_add_label(
     node_id: lattice_node_id,
     label: [*c]const u8,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     if (label_slice.len == 0) return .err_invalid_arg;
@@ -1470,7 +2011,8 @@ pub export fn lattice_node_remove_label(
     node_id: lattice_node_id,
     label: [*c]const u8,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     if (label_slice.len == 0) return .err_invalid_arg;
@@ -1489,12 +2031,36 @@ pub export fn lattice_node_remove_label(
     return .ok;
 }
 
-/// Delete a node
+/// Map an error from deleting a node or creating an edge. The two errors
+/// these have of their own get their own codes; the rest map as before.
+fn mapGraphWriteError(err: anyerror) lattice_error {
+    return switch (err) {
+        error.NotFound => .err_not_found,
+        error.NodeHasRelationships => .err_has_relationships,
+        else => mapAnyError(err),
+    };
+}
+
+/// Delete a node. Refuses with err_has_relationships while the node still
+/// has relationships the transaction can see.
 pub export fn lattice_node_delete(
     txn: ?*lattice_txn,
     node_id: lattice_node_id,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    return deleteNodeFromC(txn, node_id, false);
+}
+
+/// Delete a node together with every relationship it has.
+pub export fn lattice_node_detach_delete(
+    txn: ?*lattice_txn,
+    node_id: lattice_node_id,
+) lattice_error {
+    return deleteNodeFromC(txn, node_id, true);
+}
+
+fn deleteNodeFromC(txn: ?*lattice_txn, node_id: lattice_node_id, detach: bool) lattice_error {
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const active_txn_result = lockActiveTxnDb(txn_handle);
     if (active_txn_result != .ok) return active_txn_result;
@@ -1504,8 +2070,12 @@ pub export fn lattice_node_delete(
 
     // Pass transaction if it's a real one (id != 0)
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
-    txn_handle.db_handle.db.deleteNode(txn_ptr, node_id) catch |err| {
-        return mapAnyError(err);
+    const db = txn_handle.db_handle.db;
+    const result = if (detach) db.detachDeleteNode(txn_ptr, node_id) else db.deleteNode(txn_ptr, node_id);
+    result catch |err| switch (err) {
+        // Deleting a node that is not there is not an error, here as before.
+        error.NotFound => {},
+        else => return mapGraphWriteError(err),
     };
 
     return .ok;
@@ -1518,7 +2088,8 @@ pub export fn lattice_node_set_property(
     key: [*c]const u8,
     value: ?*const lattice_value,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const key_slice = cStrToSlice(key) orelse return .err_invalid_arg;
     const c_val = value orelse return .err_invalid_arg;
@@ -1551,7 +2122,8 @@ pub export fn lattice_node_get_property(
     key: [*c]const u8,
     value_out: *lattice_value,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const key_slice = cStrToSlice(key) orelse return .err_invalid_arg;
 
@@ -1585,7 +2157,8 @@ pub export fn lattice_node_exists(
     node_id: lattice_node_id,
     exists_out: *bool,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const active_txn_result = lockActiveTxnDb(txn_handle);
     if (active_txn_result != .ok) return active_txn_result;
@@ -1611,13 +2184,20 @@ pub export fn lattice_get_nodes_by_label(
     node_ids_out: *?[*]lattice_node_id,
     count_out: *usize,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     if (label == null) return .err_invalid_arg;
 
     node_ids_out.* = null;
     count_out.* = 0;
 
     const label_slice = label[0..label_len];
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
+
     const owned = db_handle.db.getNodesByLabel(label_slice) catch |err| {
         return mapDatabaseError(err);
     };
@@ -1649,7 +2229,8 @@ pub export fn lattice_get_nodes_by_label_txn(
     node_ids_out: *?[*]lattice_node_id,
     count_out: *usize,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     if (label == null) return .err_invalid_arg;
 
     node_ids_out.* = null;
@@ -1688,7 +2269,8 @@ pub export fn lattice_get_all_nodes_txn(
     node_ids_out: *?[*]lattice_node_id,
     count_out: *usize,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     node_ids_out.* = null;
     count_out.* = 0;
@@ -1724,7 +2306,8 @@ pub export fn lattice_node_property_index_create(
     label: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1741,7 +2324,8 @@ pub export fn lattice_node_property_index_drop(
     label: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1758,7 +2342,8 @@ pub export fn lattice_node_fts_index_create(
     label: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1775,7 +2360,8 @@ pub export fn lattice_node_fts_index_drop(
     label: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1793,7 +2379,8 @@ pub export fn lattice_node_fts_index_exists(
     property: [*c]const u8,
     exists_out: *bool,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1810,7 +2397,8 @@ pub export fn lattice_edge_fts_index_create(
     edge_type: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1827,7 +2415,8 @@ pub export fn lattice_edge_fts_index_drop(
     edge_type: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1845,7 +2434,8 @@ pub export fn lattice_edge_fts_index_exists(
     property: [*c]const u8,
     exists_out: *bool,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -1866,7 +2456,8 @@ pub export fn lattice_nodes_find_by_label_property(
     node_ids_out: *?[*]lattice_node_id,
     count_out: *usize,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
     const c_value = value orelse return .err_invalid_arg;
@@ -1910,7 +2501,8 @@ pub export fn lattice_node_get_labels(
     node_id: lattice_node_id,
     labels_out: *[*c]u8,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const active_txn_result = lockActiveTxnDb(txn_handle);
     if (active_txn_result != .ok) return active_txn_result;
@@ -1967,7 +2559,8 @@ pub export fn lattice_serialize(
     out_bytes.* = null;
     out_len.* = 0;
 
-    const handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(handle);
 
     handle.mutex.lock();
     defer handle.mutex.unlock();
@@ -2021,6 +2614,50 @@ pub export fn lattice_deserialize_borrowed(
     return adoptDatabase(db, db_out);
 }
 
+/// lattice_deserialize with v5 options: the durability settings and the
+/// vector index options apply to the deserialized database as they would to
+/// a file. `create` and `read_only` are ignored, as in the v4 functions.
+pub export fn lattice_deserialize_v5(
+    bytes: [*c]const u8,
+    len: usize,
+    options: ?*const lattice_open_options_v5,
+    db_out: *?*lattice_database,
+) lattice_error {
+    return deserializeV5(bytes, len, options, db_out, false);
+}
+
+/// lattice_deserialize_borrowed with v5 options. The bytes must outlive the
+/// database, as there.
+pub export fn lattice_deserialize_borrowed_v5(
+    bytes: [*c]const u8,
+    len: usize,
+    options: ?*const lattice_open_options_v5,
+    db_out: *?*lattice_database,
+) lattice_error {
+    return deserializeV5(bytes, len, options, db_out, true);
+}
+
+fn deserializeV5(
+    bytes: [*c]const u8,
+    len: usize,
+    options: ?*const lattice_open_options_v5,
+    db_out: *?*lattice_database,
+    borrow: bool,
+) lattice_error {
+    db_out.* = null;
+    if (bytes == null) return .err_invalid_arg;
+
+    const zig_options = buildOpenOptionsV5(options) catch |err| return mapDatabaseError(err);
+
+    const db = Database.deserialize(global_allocator, bytes[0..len], .{
+        .config = zig_options.config,
+        .lock = zig_options.lock,
+        .borrow_bytes = borrow,
+    }) catch |err| return mapDatabaseError(err);
+
+    return adoptDatabase(db, db_out);
+}
+
 pub export fn lattice_free_bytes(bytes: [*c]u8, len: usize) void {
     if (bytes == null) return;
     global_allocator.free(bytes[0..len]);
@@ -2060,7 +2697,8 @@ fn streamPublishGetSequenceImpl(
     payload: ?*const lattice_value,
     sequence_out: ?*u64,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
     const kind_slice: ?[]const u8 = if (kind_len == 0)
@@ -2127,52 +2765,131 @@ pub export fn lattice_stream_read(
     batch_out: *?*lattice_stream_batch,
 ) lattice_error {
     batch_out.* = null;
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
 
-    var batch = db_handle.db.readStream(
-        stream_slice,
-        after_sequence,
-        limit,
-        timeout_ms,
-    ) catch |err| return mapDatabaseError(err);
-    errdefer batch.deinit();
+    // Registered as a reader for the whole call, waiting included, so close
+    // wakes this call and waits for it instead of freeing the database under it.
+    db_handle.mutex.lock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) {
+        db_handle.mutex.unlock();
+        return active;
+    }
+    db_handle.stream_readers += 1;
+    db_handle.mutex.unlock();
+    defer {
+        db_handle.mutex.lock();
+        db_handle.stream_readers -= 1;
+        db_handle.mutex.unlock();
+    }
 
-    const c_values = global_allocator.alloc(lattice_value, batch.records.len) catch {
+    var batch: StreamBatch = undefined;
+    const read_result = readStreamWaiting(db_handle, stream_slice, after_sequence, limit, timeout_ms, &batch);
+    if (read_result != .ok) return read_result;
+    return wrapStreamBatch(batch, batch_out);
+}
+
+/// Read a stream for `lattice_stream_read`, waiting up to `timeout_ms` for
+/// records to arrive.
+///
+/// `Database.readStream` can wait by itself, but it reads without the database
+/// mutex and so races with commits. Here each attempt reads under the mutex,
+/// like every other call, and the wait between attempts does not hold it, so a
+/// writer can commit what the reader is waiting for. The commit epoch is
+/// sampled before each attempt, so a commit that lands between an attempt and
+/// the wait is not slept through. Close sets `closing`, which ends the wait;
+/// the next attempt then finds the handle closed.
+fn readStreamWaiting(
+    db_handle: *DatabaseHandle,
+    stream: []const u8,
+    after_sequence: u64,
+    limit: usize,
+    timeout_ms: u32,
+    batch_out: *StreamBatch,
+) lattice_error {
+    const db = db_handle.db;
+    const deadline = compat.nanoTimestamp() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+
+    db.stream_mutex.lock();
+    var epoch = db.stream_epoch;
+    db.stream_mutex.unlock();
+
+    while (true) {
+        db_handle.mutex.lock();
+        if (db_handle.header.state != .active) {
+            db_handle.mutex.unlock();
+            return .err_invalid_arg;
+        }
+        var batch = db.readStream(stream, after_sequence, limit, 0) catch |err| {
+            db_handle.mutex.unlock();
+            return mapDatabaseError(err);
+        };
+        db_handle.mutex.unlock();
+
+        if (batch.records.len > 0 or compat.nanoTimestamp() >= deadline) {
+            batch_out.* = batch;
+            return .ok;
+        }
+        batch.deinit();
+
+        db.stream_mutex.lock();
+        while (db.stream_epoch == epoch and !db_handle.closing.load(.acquire)) {
+            const now = compat.nanoTimestamp();
+            if (now >= deadline) break;
+            db.stream_cond.timedWait(&db.stream_mutex, @intCast(deadline - now)) catch {};
+        }
+        epoch = db.stream_epoch;
+        db.stream_mutex.unlock();
+    }
+}
+
+/// Hand a stream batch to the caller as a handle. Takes ownership of `batch`;
+/// on any failure everything is released before returning.
+fn wrapStreamBatch(batch: StreamBatch, batch_out: *?*lattice_stream_batch) lattice_error {
+    var owned = batch;
+    const c_values = global_allocator.alloc(lattice_value, owned.records.len) catch {
+        owned.deinit();
         return .err_out_of_memory;
     };
-    var initialized: usize = 0;
-    errdefer {
-        for (c_values[0..initialized]) |*value| {
-            freeOwnedCValue(value);
-        }
-        global_allocator.free(c_values);
-    }
     for (c_values) |*value| emptyCValue(value);
 
-    for (batch.records, 0..) |record, i| {
+    for (owned.records, 0..) |record, i| {
         zigValueToOwnedCValue(record.payload, &c_values[i]) catch |err| {
+            freeStreamCValues(c_values);
+            owned.deinit();
             return mapValueConversionError(err);
         };
-        initialized += 1;
     }
 
     const handle = global_allocator.create(StreamBatchHandle) catch {
+        freeStreamCValues(c_values);
+        owned.deinit();
         return .err_out_of_memory;
     };
     handle.* = .{
         .header = HandleHeader.init(.stream_batch),
-        .batch = batch,
+        .batch = owned,
         .c_values = c_values,
     };
     const register_result = registerHandle(StreamBatchHandle, handle);
     if (register_result != .ok) {
+        freeStreamCValues(handle.c_values);
+        handle.batch.deinit();
         global_allocator.destroy(handle);
         return register_result;
     }
 
-    batch_out.* = @ptrCast(handle);
+    batch_out.* = toOpaque(lattice_stream_batch, handle);
     return .ok;
+}
+
+/// Free payloads converted for a stream batch. Entries never filled in are
+/// empty values, which free nothing.
+fn freeStreamCValues(values: []lattice_value) void {
+    for (values) |*value| freeOwnedCValue(value);
+    global_allocator.free(values);
 }
 
 pub export fn lattice_stream_batch_count(batch: ?*lattice_stream_batch) usize {
@@ -2202,10 +2919,7 @@ pub export fn lattice_stream_batch_get(
 pub export fn lattice_stream_batch_free(batch: ?*lattice_stream_batch) void {
     const handle = toHandle(StreamBatchHandle, batch) orelse return;
     unregisterHandle(StreamBatchHandle, handle);
-    for (handle.c_values) |*value| {
-        freeOwnedCValue(value);
-    }
-    global_allocator.free(handle.c_values);
+    freeStreamCValues(handle.c_values);
     handle.batch.deinit();
     global_allocator.destroy(handle);
 }
@@ -2219,11 +2933,17 @@ pub export fn lattice_stream_get_offset(
     exists_out: *bool,
     sequence_out: *u64,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
     const consumer_slice = cArgBytes(consumer, consumer_len) orelse return .err_invalid_arg;
     exists_out.* = false;
     sequence_out.* = 0;
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
 
     const value = db_handle.db.getStreamOffset(stream_slice, consumer_slice) catch |err| {
         return mapDatabaseError(err);
@@ -2241,13 +2961,65 @@ pub export fn lattice_stream_get_last_sequence(
     stream_len: usize,
     sequence_out: *u64,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
     sequence_out.* = 0;
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
 
     sequence_out.* = db_handle.db.getStreamLastSequence(stream_slice) catch |err| {
         return mapDatabaseError(err);
     };
+    return .ok;
+}
+
+/// Report the changefeed's retention policy, the oldest event it holds
+/// (0 when it holds none) and the last sequence it handed out.
+pub export fn lattice_changefeed_status(
+    db: ?*lattice_database,
+    retention_out: ?*u8,
+    retention_value_out: ?*u64,
+    oldest_sequence_out: ?*u64,
+    last_sequence_out: ?*u64,
+) lattice_error {
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
+
+    const status = db_handle.db.changefeedStatus() catch |err| return mapDatabaseError(err);
+    if (retention_out) |out| out.* = status.retention.mode();
+    if (retention_value_out) |out| out.* = status.retention.value();
+    if (oldest_sequence_out) |out| out.* = status.oldest_sequence orelse 0;
+    if (last_sequence_out) |out| out.* = status.last_sequence;
+    return .ok;
+}
+
+/// Apply the changefeed's retention policy in full now and make the result
+/// durable. Returns LATTICE_ERROR_LOCK_TIMEOUT while a write transaction is
+/// open and LATTICE_ERROR_READ_ONLY on a read-only handle.
+pub export fn lattice_changefeed_trim(
+    db: ?*lattice_database,
+    removed_out: ?*u64,
+) lattice_error {
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
+    if (removed_out) |out| out.* = 0;
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
+
+    const removed = db_handle.db.trimChangefeed() catch |err| return mapDatabaseError(err);
+    if (removed_out) |out| out.* = removed;
     return .ok;
 }
 
@@ -2259,7 +3031,8 @@ pub export fn lattice_stream_set_offset(
     consumer_len: usize,
     sequence: u64,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
     const consumer_slice = cArgBytes(consumer, consumer_len) orelse return .err_invalid_arg;
 
@@ -2285,7 +3058,8 @@ pub export fn lattice_stream_trim(
     stream_len: usize,
     through_sequence: u64,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const stream_slice = cArgBytes(stream, stream_len) orelse return .err_invalid_arg;
 
     const db_handle = txn_handle.db_handle;
@@ -2311,11 +3085,15 @@ pub export fn lattice_node_set_vector(
     vector: [*c]const f32,
     dimensions: u32,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
-    // Key is currently ignored - vectors are stored by node_id
-    // In future, we could support multiple vectors per node with different keys
-    _ = key;
+    // A node has one vector, which Cypher reads as `n.embedding`. Any other
+    // key used to be accepted and ignored, so a second vector under another
+    // name silently replaced the first.
+    if (cStrToSlice(key)) |key_slice| {
+        if (key_slice.len != 0 and !std.mem.eql(u8, key_slice, "embedding")) return .err_unsupported;
+    }
 
     // Convert C pointer to Zig slice
     const vector_slice = cEmbeddingVectorToSlice(vector, dimensions) orelse return .err_invalid_arg;
@@ -2329,6 +3107,84 @@ pub export fn lattice_node_set_vector(
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
 
     txn_handle.db_handle.db.setNodeVectorInTxn(txn_ptr, node_id, vector_slice) catch |err| {
+        return mapDatabaseError(err);
+    };
+
+    return .ok;
+}
+
+/// A node has one vector, which Cypher reads as `n.embedding`; the vector
+/// calls accept that name, "" or NULL for it.
+fn isVectorKey(key: [*c]const u8) bool {
+    const key_slice = cStrToSlice(key) orelse return true;
+    return key_slice.len == 0 or std.mem.eql(u8, key_slice, "embedding");
+}
+
+/// Get a node's vector as the transaction sees it. A node without one is
+/// success with a null vector and 0 dimensions. The caller frees the vector
+/// with lattice_free_vector().
+pub export fn lattice_node_get_vector(
+    txn: ?*lattice_txn,
+    node_id: lattice_node_id,
+    key: [*c]const u8,
+    vector_out: ?*?[*]f32,
+    dimensions_out: ?*u32,
+) lattice_error {
+    const out = vector_out orelse return .err_invalid_arg;
+    const dims_out = dimensions_out orelse return .err_invalid_arg;
+    out.* = null;
+    dims_out.* = 0;
+
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
+
+    if (!isVectorKey(key)) return .err_unsupported;
+
+    const active_txn_result = lockActiveTxnDb(txn_handle);
+    if (active_txn_result != .ok) return active_txn_result;
+    defer unlockTxnDb(txn_handle);
+
+    const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
+    const db = txn_handle.db_handle.db;
+
+    const exists = db.nodeExistsInTxn(txn_ptr, node_id) catch |err| return mapDatabaseError(err);
+    if (!exists) return .err_not_found;
+
+    const vector = (db.getNodeVectorInTxn(txn_ptr, node_id) catch |err| return mapDatabaseError(err)) orelse return .ok;
+    defer db.allocator.free(vector);
+    const copy = global_allocator.dupe(f32, vector) catch return .err_out_of_memory;
+    out.* = copy.ptr;
+    dims_out.* = @intCast(copy.len);
+    return .ok;
+}
+
+/// Free a vector returned by lattice_node_get_vector().
+pub export fn lattice_free_vector(vector: ?[*]f32, dimensions: u32) void {
+    const ptr = vector orelse return;
+    if (dimensions == 0) return;
+    global_allocator.free(ptr[0..dimensions]);
+}
+
+/// Remove a node's vector. Removing a vector the node does not have succeeds.
+pub export fn lattice_node_remove_vector(
+    txn: ?*lattice_txn,
+    node_id: lattice_node_id,
+    key: [*c]const u8,
+) lattice_error {
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
+
+    if (!isVectorKey(key)) return .err_unsupported;
+
+    const active_txn_result = lockActiveTxnDb(txn_handle);
+    if (active_txn_result != .ok) return active_txn_result;
+    defer unlockTxnDb(txn_handle);
+
+    if (txn_handle.txn.mode == .read_only) return .err_read_only;
+
+    const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
+
+    txn_handle.db_handle.db.removeNodeVectorInTxn(txn_ptr, node_id) catch |err| {
         return mapDatabaseError(err);
     };
 
@@ -2358,7 +3214,8 @@ pub export fn lattice_batch_insert(
 ) lattice_error {
     count_out.* = 0;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     if (nodes == null or count == 0 or node_ids_out == null) return .err_invalid_arg;
 
     const active_txn_result = lockActiveTxnDb(txn_handle);
@@ -2366,6 +3223,8 @@ pub export fn lattice_batch_insert(
     defer unlockTxnDb(txn_handle);
 
     if (txn_handle.txn.mode == .read_only) return .err_read_only;
+    // Refused before the first node is created, so nothing is left behind.
+    if (txn_handle.db_handle.db.vectorConfig() == null) return .err_unsupported;
 
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
 
@@ -2377,9 +3236,10 @@ pub export fn lattice_batch_insert(
         const label_slice = cStrToSlice(spec.label) orelse return .err_invalid_arg;
         const vector_slice = cEmbeddingVectorToSlice(spec.vector, spec.dimensions) orelse return .err_invalid_arg;
 
-        // Create node
-        const labels = [_][]const u8{label_slice};
-        const node_id = txn_handle.db_handle.db.createNode(txn_ptr, &labels) catch |err| {
+        // Create node. An empty label means no label, as in lattice_node_create.
+        const one_label = [_][]const u8{label_slice};
+        const labels: []const []const u8 = if (label_slice.len == 0) &.{} else &one_label;
+        const node_id = txn_handle.db_handle.db.createNode(txn_ptr, labels) catch |err| {
             return mapAnyError(err);
         };
 
@@ -2405,12 +3265,18 @@ pub export fn lattice_vector_search(
     ef_search: u16,
     result_out: *?*lattice_vector_result,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
 
     if (k == 0) return .err_invalid_arg;
 
     // Convert C pointer to Zig slice
     const query_vector = cEmbeddingVectorToSlice(vector, dimensions) orelse return .err_invalid_arg;
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
 
     // Perform the search
     const ef = if (ef_search == 0) null else ef_search;
@@ -2447,7 +3313,8 @@ pub export fn lattice_vector_search_txn(
     ef_search: u16,
     result_out: *?*lattice_vector_result,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     if (k == 0) return .err_invalid_arg;
 
@@ -2542,7 +3409,8 @@ pub export fn lattice_fts_search(
     limit: u32,
     result_out: *?*lattice_fts_result,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -2577,7 +3445,8 @@ pub export fn lattice_fts_search_txn(
     limit: u32,
     result_out: *?*lattice_fts_result,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
     if (query_text == null or query_len == 0 or limit == 0) return .err_invalid_arg;
@@ -2614,7 +3483,8 @@ pub export fn lattice_fts_search_fuzzy(
     min_term_length: u32,
     result_out: *?*lattice_fts_result,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
     if (query_text == null or query_len == 0 or limit == 0) return .err_invalid_arg;
@@ -2655,7 +3525,8 @@ pub export fn lattice_fts_search_fuzzy_txn(
     min_term_length: u32,
     result_out: *?*lattice_fts_result,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const label_slice = cStrToSlice(label) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
     if (query_text == null or query_len == 0 or limit == 0) return .err_invalid_arg;
@@ -2772,7 +3643,8 @@ pub export fn lattice_edge_create(
     edge_type: [*c]const u8,
     edge_out: *lattice_edge_id,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
 
@@ -2785,7 +3657,8 @@ pub export fn lattice_edge_create(
     // Pass transaction if it's a real one (id != 0)
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
     const edge_id = txn_handle.db_handle.db.createEdgeAndGetId(txn_ptr, source, target, type_slice) catch |err| {
-        return mapAnyError(err);
+        // err_not_found when either end does not exist.
+        return mapGraphWriteError(err);
     };
 
     edge_out.* = edge_id;
@@ -2799,7 +3672,8 @@ pub export fn lattice_edge_delete(
     target: lattice_node_id,
     edge_type: [*c]const u8,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
 
@@ -2825,7 +3699,8 @@ pub export fn lattice_edge_set_property(
     key: [*c]const u8,
     value: ?*const lattice_value,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const key_slice = cStrToSlice(key) orelse return .err_invalid_arg;
     const c_val = value orelse return .err_invalid_arg;
@@ -2853,7 +3728,8 @@ pub export fn lattice_edge_get_property(
     key: [*c]const u8,
     value_out: *lattice_value,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const key_slice = cStrToSlice(key) orelse return .err_invalid_arg;
 
     const active_txn_result = lockActiveTxnDb(txn_handle);
@@ -2886,7 +3762,8 @@ pub export fn lattice_edge_remove_property(
     edge_id: lattice_edge_id,
     key: [*c]const u8,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const key_slice = cStrToSlice(key) orelse return .err_invalid_arg;
 
@@ -2909,7 +3786,8 @@ pub export fn lattice_edge_property_index_create(
     edge_type: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -2926,7 +3804,8 @@ pub export fn lattice_edge_property_index_drop(
     edge_type: [*c]const u8,
     property: [*c]const u8,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
 
@@ -2947,7 +3826,8 @@ pub export fn lattice_edges_find_by_type_property(
     edge_ids_out: *?[*]lattice_edge_id,
     count_out: *usize,
 ) lattice_error {
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
     const property_slice = cStrToSlice(property) orelse return .err_invalid_arg;
     const c_value = value orelse return .err_invalid_arg;
@@ -2984,12 +3864,31 @@ pub export fn lattice_free_edge_ids(edge_ids: ?[*]lattice_edge_id, count: usize)
     global_allocator.free(ptr[0..count]);
 }
 
+fn terminatedEdgeTypes(arena: std.mem.Allocator, edges: []const Database.EdgeInfo) ![][:0]const u8 {
+    const out = try arena.alloc([:0]const u8, edges.len);
+    for (edges, 0..) |edge, i| {
+        if (i > 0 and std.mem.eql(u8, out[i - 1], edge.edge_type)) {
+            out[i] = out[i - 1];
+        } else {
+            out[i] = try arena.dupeZ(u8, edge.edge_type);
+        }
+    }
+    return out;
+}
+
 fn finishEdgeResultHandleLocked(
     txn_handle: *TxnHandle,
     edges: []Database.EdgeInfo,
     result_out: *?*lattice_edge_result,
 ) lattice_error {
+    var type_arena = std.heap.ArenaAllocator.init(global_allocator);
+    const edge_types_z = terminatedEdgeTypes(type_arena.allocator(), edges) catch {
+        type_arena.deinit();
+        txn_handle.db_handle.db.freeEdgeInfos(edges);
+        return .err_out_of_memory;
+    };
     const result_handle = global_allocator.create(EdgeResultHandle) catch {
+        type_arena.deinit();
         txn_handle.db_handle.db.freeEdgeInfos(edges);
         return .err_out_of_memory;
     };
@@ -2997,12 +3896,15 @@ fn finishEdgeResultHandleLocked(
     result_handle.* = EdgeResultHandle{
         .header = HandleHeader.init(.edge_result),
         .edges = edges,
+        .edge_types_z = edge_types_z,
+        .type_arena = type_arena,
         .count = edges.len,
         .db_handle = txn_handle.db_handle,
         .counted_child = true,
     };
     const register_result = registerHandle(EdgeResultHandle, result_handle);
     if (register_result != .ok) {
+        result_handle.type_arena.deinit();
         txn_handle.db_handle.db.freeEdgeInfos(edges);
         global_allocator.destroy(result_handle);
         return register_result;
@@ -3021,7 +3923,8 @@ pub export fn lattice_edge_get_outgoing(
 ) lattice_error {
     result_out.* = null;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const db_handle = txn_handle.db_handle;
     db_handle.mutex.lock();
@@ -3032,7 +3935,7 @@ pub export fn lattice_edge_get_outgoing(
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
 
     const edges = txn_handle.db_handle.db.getOutgoingEdgesInTxn(txn_ptr, node_id, 0) catch |err| {
-        return mapAnyError(err);
+        return mapDatabaseError(err);
     };
 
     return finishEdgeResultHandleLocked(txn_handle, edges, result_out);
@@ -3046,7 +3949,8 @@ pub export fn lattice_edge_get_incoming(
 ) lattice_error {
     result_out.* = null;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
 
     const db_handle = txn_handle.db_handle;
     db_handle.mutex.lock();
@@ -3057,7 +3961,7 @@ pub export fn lattice_edge_get_incoming(
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
 
     const edges = txn_handle.db_handle.db.getIncomingEdgesInTxn(txn_ptr, node_id, 0) catch |err| {
-        return mapAnyError(err);
+        return mapDatabaseError(err);
     };
 
     return finishEdgeResultHandleLocked(txn_handle, edges, result_out);
@@ -3073,7 +3977,8 @@ pub export fn lattice_edge_get_outgoing_by_type(
 ) lattice_error {
     result_out.* = null;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
 
     const db_handle = txn_handle.db_handle;
@@ -3084,7 +3989,7 @@ pub export fn lattice_edge_get_outgoing_by_type(
 
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
     const edges = txn_handle.db_handle.db.getOutgoingEdgesByTypeInTxn(txn_ptr, node_id, type_slice, limit) catch |err| {
-        return mapAnyError(err);
+        return mapDatabaseError(err);
     };
 
     return finishEdgeResultHandleLocked(txn_handle, edges, result_out);
@@ -3100,7 +4005,8 @@ pub export fn lattice_edge_get_incoming_by_type(
 ) lattice_error {
     result_out.* = null;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const type_slice = cStrToSlice(edge_type) orelse return .err_invalid_arg;
 
     const db_handle = txn_handle.db_handle;
@@ -3111,7 +4017,7 @@ pub export fn lattice_edge_get_incoming_by_type(
 
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
     const edges = txn_handle.db_handle.db.getIncomingEdgesByTypeInTxn(txn_ptr, node_id, type_slice, limit) catch |err| {
-        return mapAnyError(err);
+        return mapDatabaseError(err);
     };
 
     return finishEdgeResultHandleLocked(txn_handle, edges, result_out);
@@ -3126,7 +4032,8 @@ pub export fn lattice_edge_scan(
 ) lattice_error {
     result_out.* = null;
 
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
     const type_slice: ?[]const u8 = if (edge_type == null)
         null
     else
@@ -3140,7 +4047,7 @@ pub export fn lattice_edge_scan(
 
     const txn_ptr: ?*Transaction = if (txn_handle.txn.id != 0) &txn_handle.txn else null;
     const edges = txn_handle.db_handle.db.scanEdgesInTxn(txn_ptr, type_slice, limit) catch |err| {
-        return mapAnyError(err);
+        return mapDatabaseError(err);
     };
 
     return finishEdgeResultHandleLocked(txn_handle, edges, result_out);
@@ -3182,8 +4089,9 @@ pub export fn lattice_edge_result_get(
     const edge = result_handle.edges[index];
     source_out.* = edge.source;
     target_out.* = edge.target;
-    edge_type_out.* = edge.edge_type.ptr;
-    edge_type_len_out.* = @intCast(edge.edge_type.len);
+    const edge_type = result_handle.edge_types_z[index];
+    edge_type_out.* = edge_type.ptr;
+    edge_type_len_out.* = @intCast(edge_type.len);
 
     return .ok;
 }
@@ -3199,6 +4107,7 @@ pub export fn lattice_edge_result_free(result: ?*lattice_edge_result) void {
 
     // Free the edge infos through database
     result_handle.db_handle.db.freeEdgeInfos(result_handle.edges);
+    result_handle.type_arena.deinit();
 
     // Free the handle itself
     global_allocator.destroy(result_handle);
@@ -3216,7 +4125,8 @@ pub export fn lattice_query_prepare(
 ) lattice_error {
     query_out.* = null;
 
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
     const cypher_slice = cStrToSlice(cypher) orelse return .err_invalid_arg;
 
     db_handle.mutex.lock();
@@ -3243,7 +4153,11 @@ pub export fn lattice_query_prepare(
     }
     db_handle.active_children += 1;
 
-    query_out.* = @ptrCast(query_handle);
+    // Parse now, once. A query that does not parse still prepares: its
+    // error is reported by execute, with its location, as it always was.
+    query_handle.prepared = db_handle.db.prepareCached(cypher_copy);
+
+    query_out.* = toOpaque(lattice_query, query_handle);
     return .ok;
 }
 
@@ -3286,8 +4200,13 @@ pub export fn lattice_query_execute(
     result_out.* = null;
 
     const query_handle = toHandle(QueryHandle, query) orelse return .err_invalid_arg;
-    const txn_handle = toHandle(TxnHandle, txn) orelse return .err_invalid_arg;
-    if (query_handle.db_handle != txn_handle.db_handle) return .err_invalid_arg;
+    const txn_handle = acquireTxn(txn) orelse return .err_invalid_arg;
+    defer releaseTxn(txn_handle);
+    // An ended transaction has no database of its own; the active check below
+    // reports it as aborted, as it did when finished handles were retained.
+    if (txn_handle != &retired_txn_handle and query_handle.db_handle != txn_handle.db_handle) {
+        return .err_invalid_arg;
+    }
 
     const db_handle = query_handle.db_handle;
     db_handle.mutex.lock();
@@ -3303,7 +4222,12 @@ pub export fn lattice_query_execute(
     query_handle.clearLastError();
 
     // Execute the query (with or without parameters), retaining structured diagnostics.
-    var detailed = if (query_handle.parameters.count() > 0)
+    const params: ?*const std.StringHashMap(PropertyValue) = if (query_handle.parameters.count() > 0) &query_handle.parameters else null;
+    var detailed = if (query_handle.prepared) |prepared|
+        db_handle.db.executePreparedDetailedInTxn(txn_ptr, prepared, params) catch |err| {
+            return mapQueryError(err);
+        }
+    else if (query_handle.parameters.count() > 0)
         query_handle.db_handle.db.queryWithParamsDetailedInTxn(txn_ptr, query_handle.cypher, &query_handle.parameters) catch |err| {
             return mapQueryError(err);
         }
@@ -3359,7 +4283,7 @@ pub export fn lattice_query_execute(
         return register_result;
     }
 
-    result_out.* = @ptrCast(result_handle);
+    result_out.* = toOpaque(lattice_result, result_handle);
     return .ok;
 }
 
@@ -3397,6 +4321,7 @@ pub export fn lattice_query_writes(query: ?*lattice_query) bool {
     defer query_handle.db_handle.mutex.unlock();
     if (ensureActiveDbLocked(query_handle.db_handle) != .ok) return false;
 
+    if (query_handle.prepared) |prepared| return prepared.writes();
     return query_handle.db_handle.db.queryWrites(query_handle.cypher);
 }
 
@@ -3431,6 +4356,12 @@ pub export fn lattice_query_free(query: ?*lattice_query) void {
     defer db_handle.mutex.unlock();
     unregisterHandle(QueryHandle, query_handle);
     releaseDbChildLocked(db_handle, &query_handle.counted_child);
+
+    // The database cannot have closed: close refuses while a query is open.
+    if (query_handle.prepared) |prepared| {
+        db_handle.db.releasePrepared(prepared);
+        query_handle.prepared = null;
+    }
 
     // Clean up parameters
     query_handle.deinit();
@@ -3519,7 +4450,14 @@ pub export fn lattice_result_free(result: ?*lattice_result) void {
 
 /// Clear the query cache
 pub export fn lattice_query_cache_clear(db: ?*lattice_database) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
+
     db_handle.db.clearQueryCache();
     return .ok;
 }
@@ -3531,7 +4469,13 @@ pub export fn lattice_query_cache_stats(
     hits_out: ?*u64,
     misses_out: ?*u64,
 ) lattice_error {
-    const db_handle = toHandle(DatabaseHandle, db) orelse return .err_invalid_arg;
+    const db_handle = acquireDb(db) orelse return .err_invalid_arg;
+    defer releaseDb(db_handle);
+
+    db_handle.mutex.lock();
+    defer db_handle.mutex.unlock();
+    const active = ensureActiveDbLocked(db_handle);
+    if (active != .ok) return active;
 
     const stats = db_handle.db.queryCacheStats();
 
@@ -3548,12 +4492,13 @@ pub export fn lattice_query_cache_stats(
 
 /// Get version string
 pub export fn lattice_version() [*c]const u8 {
-    return "0.15.0";
+    return "0.18.1";
 }
 
 /// Get error message for error code
 pub export fn lattice_error_message(code: lattice_error) [*c]const u8 {
-    return switch (code) {
+    const known = checkedEnum(lattice_error, &code) orelse return "Unknown error";
+    return switch (known) {
         .ok => "Success",
         .err => "Generic error",
         .err_io => "I/O error",
@@ -3565,12 +4510,15 @@ pub export fn lattice_error_message(code: lattice_error) [*c]const u8 {
         .err_lock_timeout => "Lock timeout",
         .err_read_only => "Database is read-only",
         .err_full => "Database or buffer pool full",
-        .err_version_mismatch => "Version mismatch",
+        .err_version_mismatch => "Database was written by a newer LatticeDB in a format this version cannot read",
         .err_checksum => "Checksum error",
         .err_out_of_memory => "Out of memory",
         .err_unsupported => "Unsupported operation or value type",
         .err_value_too_large => "Value too large for database page size",
         .err_database_locked => "Database is open in another process",
+        .err_has_relationships => "Node still has relationships; delete them first or detach-delete the node",
+        .err_config_mismatch => "Open options contradict the vector index configuration stored in the database",
+        .err_needs_newer_writer => "Database needs a newer LatticeDB to write it; open it read-only",
     };
 }
 
@@ -3649,34 +4597,55 @@ pub export fn lattice_embedding_client_create(
     const endpoint = cStrToSlice(cfg.endpoint) orelse return .err_invalid_arg;
     const model = cStrToSlice(cfg.model) orelse return .err_invalid_arg;
 
-    const api_format: embedding_mod.ApiFormat = switch (cfg.api_format) {
+    const api_format_c = checkedEnum(lattice_embedding_api_format, &cfg.api_format) orelse return .err_invalid_arg;
+    const api_format: embedding_mod.ApiFormat = switch (api_format_c) {
         .ollama => .ollama,
         .openai => .openai,
     };
 
-    const api_key: ?[]const u8 = cStrToSlice(cfg.api_key);
+    const api_key_borrowed: ?[]const u8 = cStrToSlice(cfg.api_key);
 
     const timeout = if (cfg.timeout_ms == 0) @as(u32, 30_000) else cfg.timeout_ms;
 
-    const handle = global_allocator.create(EmbeddingClientHandle) catch return .err_out_of_memory;
+    var config_arena = std.heap.ArenaAllocator.init(global_allocator);
+    const owned = config_arena.allocator();
+    const endpoint_copy = owned.dupe(u8, endpoint) catch {
+        config_arena.deinit();
+        return .err_out_of_memory;
+    };
+    const model_copy = owned.dupe(u8, model) catch {
+        config_arena.deinit();
+        return .err_out_of_memory;
+    };
+    const api_key_copy: ?[]const u8 = if (api_key_borrowed) |key| owned.dupe(u8, key) catch {
+        config_arena.deinit();
+        return .err_out_of_memory;
+    } else null;
+
+    const handle = global_allocator.create(EmbeddingClientHandle) catch {
+        config_arena.deinit();
+        return .err_out_of_memory;
+    };
     handle.* = .{
         .header = HandleHeader.init(.embedding_client),
         .client = embedding_mod.EmbeddingClient.init(global_allocator, .{
-            .endpoint = endpoint,
-            .model = model,
+            .endpoint = endpoint_copy,
+            .model = model_copy,
             .api_format = api_format,
-            .api_key = api_key,
+            .api_key = api_key_copy,
             .timeout_ms = timeout,
         }),
+        .config_arena = config_arena,
     };
     const register_result = registerHandle(EmbeddingClientHandle, handle);
     if (register_result != .ok) {
         handle.client.deinit();
+        handle.config_arena.deinit();
         global_allocator.destroy(handle);
         return register_result;
     }
 
-    client_out.* = @ptrCast(handle);
+    client_out.* = toOpaque(lattice_embedding_client, handle);
     return .ok;
 }
 
@@ -3726,6 +4695,7 @@ pub export fn lattice_embedding_client_free(
     const handle = toHandle(EmbeddingClientHandle, client) orelse return;
     unregisterHandle(EmbeddingClientHandle, handle);
     handle.client.deinit();
+    handle.config_arena.deinit();
     global_allocator.destroy(handle);
 }
 
@@ -3751,7 +4721,7 @@ test "value type tags match header" {
 test "version returns expected string" {
     const version = lattice_version();
     try std.testing.expect(version != null);
-    try std.testing.expectEqualStrings("0.15.0", std.mem.sliceTo(version, 0));
+    try std.testing.expectEqualStrings("0.18.1", std.mem.sliceTo(version, 0));
 }
 
 test "error message returns valid strings" {
@@ -3766,6 +4736,42 @@ test "error message returns valid strings" {
     const too_large = lattice_error_message(.err_value_too_large);
     try std.testing.expect(too_large != null);
     try std.testing.expectEqualStrings("Value too large for database page size", std.mem.sliceTo(too_large, 0));
+}
+
+test "finished transaction handles are freed, not kept until close" {
+    const path = "/tmp/lattice_capi_internal_txn_handles_freed.db";
+    compat.fs.cwd().deleteFile(path) catch {};
+    compat.fs.cwd().deleteFile(path ++ "-wal") catch {};
+    defer {
+        compat.fs.cwd().deleteFile(path) catch {};
+        compat.fs.cwd().deleteFile(path ++ "-wal") catch {};
+    }
+
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{ .create = true, .cache_size_mb = 4, .vector_dimensions = 0 };
+    try std.testing.expectEqual(lattice_error.ok, lattice_open(path, &options, &db));
+    defer _ = lattice_close(db);
+
+    const liveHandles = struct {
+        fn count() usize {
+            handle_registry_mutex.lock();
+            defer handle_registry_mutex.unlock();
+            return handle_registry.count();
+        }
+    }.count;
+
+    const before = liveHandles();
+    for (0..200) |i| {
+        var txn: ?*lattice_txn = null;
+        const mode: lattice_txn_mode = if (i % 2 == 0) .read_write else .read_only;
+        try std.testing.expectEqual(lattice_error.ok, lattice_begin(db, mode, &txn));
+        if (i % 4 == 0) {
+            try std.testing.expectEqual(lattice_error.ok, lattice_rollback(txn));
+        } else {
+            try std.testing.expectEqual(lattice_error.ok, lattice_commit(txn));
+        }
+    }
+    try std.testing.expectEqual(before, liveHandles());
 }
 
 test "null handle returns error" {
@@ -3876,4 +4882,103 @@ test "vector parameter binding validation" {
     // Test that zero dimensions returns error (when query handle is null)
     const dummy_vec = [_]f32{1.0};
     try std.testing.expectEqual(lattice_error.err_invalid_arg, lattice_query_bind_vector(null, "query", &dummy_vec, 0));
+}
+
+test "an error the database names gets its own code, whichever function reports it" {
+    try std.testing.expectEqual(lattice_error.err_io, mapAnyError(error.IoError));
+    try std.testing.expectEqual(lattice_error.err_not_found, mapAnyError(error.NotFound));
+    try std.testing.expectEqual(lattice_error.err_read_only, mapAnyError(error.TransactionReadOnly));
+    try std.testing.expectEqual(lattice_error.err_invalid_arg, mapAnyError(error.TransactionNotActive));
+    try std.testing.expectEqual(lattice_error.err_value_too_large, mapAnyError(error.ValueTooLarge));
+    try std.testing.expectEqual(lattice_error.err_has_relationships, mapAnyError(error.NodeHasRelationships));
+    try std.testing.expectEqual(lattice_error.err_out_of_memory, mapAnyError(error.OutOfMemory));
+    try std.testing.expectEqual(lattice_error.err, mapAnyError(error.SomethingNoCodeDescribes));
+}
+
+test "begin and rollback on a handle that failed report an I/O error" {
+    var db: ?*lattice_database = null;
+    try std.testing.expectEqual(lattice_error.ok, lattice_open(":memory:", null, &db));
+    defer _ = lattice_close(db);
+
+    var txn: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.ok, lattice_begin(db, .read_write, &txn));
+    {
+        const handle = acquireDb(db).?;
+        defer releaseDb(handle);
+        handle.db.failed = true;
+    }
+    // A rollback on a failed handle ends the transaction without logging
+    // anything, and succeeds; a new transaction cannot begin.
+    try std.testing.expectEqual(lattice_error.ok, lattice_rollback(txn));
+    var second: ?*lattice_txn = null;
+    try std.testing.expectEqual(lattice_error.err_io, lattice_begin(db, .read_write, &second));
+    try std.testing.expect(second == null);
+    {
+        const handle = acquireDb(db).?;
+        defer releaseDb(handle);
+        handle.db.failed = false;
+    }
+}
+
+test "cache_size_mb wins over LATTICE_BUFFER_POOL_MB; 0 leaves it to the variable, else 100 MB" {
+    const env = compat.env;
+    const mib: usize = 1024 * 1024;
+    env.set("LATTICE_BUFFER_POOL_MB", "3");
+    defer env.unset("LATTICE_BUFFER_POOL_MB");
+    const set = buildOpenOptionsV5(&.{ .cache_size_mb = 8 }) catch unreachable;
+    try std.testing.expectEqual(8 * mib, set.config.effectiveBufferPoolSize());
+    const unset = buildOpenOptionsV5(&.{ .cache_size_mb = 0 }) catch unreachable;
+    try std.testing.expectEqual(3 * mib, unset.config.effectiveBufferPoolSize());
+    env.unset("LATTICE_BUFFER_POOL_MB");
+    const unset_no_env = buildOpenOptionsV5(&.{ .cache_size_mb = 0 }) catch unreachable;
+    try std.testing.expectEqual(100 * mib, unset_no_env.config.effectiveBufferPoolSize());
+}
+
+test "the default checkpoint interval follows cache_size_mb; a chosen one is used as given" {
+    const env = compat.env;
+    const path = "/tmp/lattice_capi_internal_ckpt_interval.db";
+    const cleanup = struct {
+        fn run() void {
+            inline for (.{ "", "-wal", "-journal" }) |suffix| compat.fs.cwd().deleteFile(path ++ suffix) catch {};
+        }
+    }.run;
+    cleanup();
+    defer cleanup();
+    env.unset(checkpoint_mod.AutoCheckpointConfig.environment_variable);
+
+    const frames = struct {
+        fn of(db: ?*lattice_database) !?u64 {
+            const handle = acquireDb(db) orelse return error.NoHandle;
+            defer releaseDb(handle);
+            const policy = handle.db.autoCheckpoint() orelse return null;
+            return policy.max_wal_frames;
+        }
+    }.of;
+
+    const cases = [_]struct { cache_mb: u32, frames: u64 }{
+        .{ .cache_mb = 4, .frames = 1000 },
+        .{ .cache_mb = 100, .frames = 3200 },
+    };
+    for (cases) |case| {
+        var db: ?*lattice_database = null;
+        const options = lattice_open_options{ .create = true, .cache_size_mb = case.cache_mb, .vector_dimensions = 0 };
+        try std.testing.expectEqual(lattice_error.ok, lattice_open(path, &options, &db));
+        defer _ = lattice_close(db);
+        try std.testing.expectEqual(@as(?u64, case.frames), try frames(db));
+
+        // The setter's count is used as it is; 0 is off.
+        try std.testing.expectEqual(lattice_error.ok, lattice_set_auto_checkpoint(db, 1000, 0));
+        try std.testing.expectEqual(@as(?u64, 1000), try frames(db));
+        try std.testing.expectEqual(lattice_error.ok, lattice_set_auto_checkpoint(db, 0, 0));
+        try std.testing.expectEqual(@as(?u64, null), try frames(db));
+    }
+
+    // So is the variable's.
+    env.set(checkpoint_mod.AutoCheckpointConfig.environment_variable, "1000");
+    defer env.unset(checkpoint_mod.AutoCheckpointConfig.environment_variable);
+    var db: ?*lattice_database = null;
+    const options = lattice_open_options{ .cache_size_mb = 100, .vector_dimensions = 0 };
+    try std.testing.expectEqual(lattice_error.ok, lattice_open(path, &options, &db));
+    defer _ = lattice_close(db);
+    try std.testing.expectEqual(@as(?u64, 1000), try frames(db));
 }

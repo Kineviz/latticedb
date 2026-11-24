@@ -13,6 +13,7 @@ const semantic = @import("semantic.zig");
 const executor = @import("executor.zig");
 const expression = @import("expression.zig");
 const parser = @import("parser.zig");
+const ast_util = @import("ast_util.zig");
 
 const Operator = executor.Operator;
 const OperatorError = executor.OperatorError;
@@ -28,6 +29,8 @@ const var_expand_ops = @import("operators/var_expand.zig");
 const limit_ops = @import("operators/limit.zig");
 const vector_ops = @import("operators/vector.zig");
 const fts_ops = @import("operators/fts.zig");
+const range_ops = @import("operators/index_range_scan.zig");
+const edge_type_scan_ops = @import("operators/edge_type_scan.zig");
 const mutation_ops = @import("operators/mutation.zig");
 const aggregate_ops = @import("operators/aggregate.zig");
 const distinct_ops = @import("operators/distinct.zig");
@@ -35,6 +38,12 @@ const unwind_ops = @import("operators/unwind.zig");
 const source_ops = @import("operators/source.zig");
 const materialize_ops = @import("operators/materialize.zig");
 const cross_product_ops = @import("operators/cross_product.zig");
+const union_ops = @import("operators/union.zig");
+const optional_ops = @import("operators/optional.zig");
+const path_ops = @import("operators/path.zig");
+const shortest_path_ops = @import("operators/shortest_path.zig");
+const subquery_ops = @import("operators/subquery.zig");
+const procedure_ops = @import("operators/procedure.zig");
 
 const btree = @import("../storage/btree.zig");
 const BTree = btree.BTree;
@@ -85,6 +94,9 @@ pub const PlannerError = error{
     /// `@@` was used on a variable whose pattern carries no label, so there is
     /// nothing to resolve the property against.
     UnlabeledFtsMatch,
+    /// A `<=>` WHERE asks for a vector index search on a database created
+    /// without a vector index.
+    MissingVectorIndex,
 };
 
 /// Storage context for planning (references to storage structures)
@@ -151,11 +163,36 @@ pub const QueryPlanner = struct {
     detail_len: usize = 0,
     edge_bindings: std.StringHashMap(EdgeBinding),
     hidden_binding_names: std.ArrayList([]u8),
+    /// One past the highest slot allocated so far.
     next_slot: u8,
+    /// The slot each variable name was first bound to in this query.
+    ///
+    /// Expressions find a variable's slot by name when the query runs, from
+    /// one name-to-slot map for the whole query. A name therefore has to keep
+    /// its slot across WITH scopes: `MATCH (a)-->(b) WITH b` once moved `b`
+    /// to slot 0, where the WITH, reading `b` by name, then found `a`.
+    name_slots: std.StringHashMap(u8),
+    /// Bindings a WITH dropped from scope that its own expressions read.
+    /// Registered for execution, but invisible to later clauses.
+    outer_bindings: std.StringHashMap(VarBinding),
+    /// Slots in use in the current scope.
+    used_slots: u16 = 0,
+    /// Slots used at any point of the query.
+    ever_used_slots: u16 = 0,
+    /// Slots of the scopes around the CALL { } being planned, which its
+    /// own variables must not take: the rows it returns are put together
+    /// from the outer row and its columns.
+    reserved_slots: u16 = 0,
+    /// A name that had to be bound to a second slot, which the plan refuses.
+    slot_conflict: ?[]const u8 = null,
     /// Number of output columns from the RETURN clause (set during planning)
     output_columns: u8 = 0,
     /// Explicit output column names from RETURN aliases.
     output_column_names: [MAX_SLOTS]?[]const u8,
+    /// Plans of the pattern subqueries found so far, made only for a query
+    /// that has some (`has_subqueries`).
+    subquery_plans: std.ArrayList(subquery_ops.SubqueryPlan) = .empty,
+    has_subqueries: bool = false,
     /// Which scan the planner chose for the most recent node pattern.
     ///
     /// An index scan and a label scan return the same rows, so behaviour alone
@@ -163,6 +200,42 @@ pub const QueryPlanner = struct {
     /// can assert an index is actually being used, rather than assuming it from
     /// a result set that would look identical either way.
     last_scan_kind: ScanKind = .none,
+    /// The full-text search each slot's index seek runs, when the MATCH
+    /// being planned seeks one index for it. The WHERE that follows does not
+    /// search again for the same predicate. Reset by every MATCH. Only the
+    /// slots in `fts_seek_mask` hold a search; the rest are undefined, so
+    /// planning a query without one costs nothing here.
+    fts_seeks: [MAX_SLOTS]fts_ops.Search = undefined,
+    fts_seek_ops: [MAX_SLOTS]*fts_ops.FtsIndexSeek = undefined,
+    fts_seek_mask: u16 = 0,
+    /// How many `@@` row filters (FtsSearchWithInput) the plan holds, so
+    /// tests can see a search planned once rather than twice.
+    fts_filter_count: u32 = 0,
+    /// How many index seeks a LIMIT bounds (see `boundSeek`), for tests.
+    fts_bounded_seeks: u32 = 0,
+    /// The query each slot's vector search uses; see
+    /// ExecutionContext.vector_queries.
+    vector_queries: executor.VectorQueries = .{},
+    /// WHERE conjuncts an index range scan answers, which the WHERE's filter
+    /// then leaves out.
+    consumed_conjuncts: std.ArrayList(*const ast.Expression) = .empty,
+    /// An ascending ORDER BY on a node's property, with a LIMIT, that the
+    /// first scan of the query could serve by reading an index in order.
+    order_hint: ?OrderHint = null,
+    /// Set once a scan reads in that order: the sort key to cut off on.
+    order_cutoff_key: ?*const ast.Expression = null,
+    /// The query sorts somewhere (an ORDER BY after RETURN or WITH), so a
+    /// range scan that does not read in the sort's order returns its nodes
+    /// in id order, as a label scan does: rows the sort finds equal then
+    /// keep the order they have without the index.
+    query_sorts: bool = false,
+
+    const OrderHint = struct {
+        variable: []const u8,
+        property: []const u8,
+        sort_key: *const ast.Expression,
+        descending: bool,
+    };
 
     /// How the planner resolved a node pattern to rows.
     pub const ScanKind = enum {
@@ -172,8 +245,21 @@ pub const QueryPlanner = struct {
         label_scan,
         /// Straight to the matching nodes through a property index.
         property_index_scan,
+        /// A range of an ordered property index (`<`, `>=`, `STARTS WITH`...).
+        property_range_scan,
+        /// Every node with the label, read through an ordered index in the
+        /// order an ORDER BY asks for.
+        property_order_scan,
         /// Straight to the matching entities through a full-text index.
         fts_index_seek,
+        /// A pattern starting from a relationship type, as one walk of the
+        /// edges rather than an expand from every node.
+        edge_type_scan,
+        /// The same from a relationship type's property index: the
+        /// relationships whose property lies in a range or equals a value.
+        edge_range_scan,
+        /// Straight to the nodes `WHERE id(n) = k` or `id(n) IN [...]` names.
+        node_id_seek,
     };
 
     const Self = @This();
@@ -189,6 +275,8 @@ pub const QueryPlanner = struct {
             .edge_bindings = std.StringHashMap(EdgeBinding).init(allocator),
             .hidden_binding_names = .empty,
             .next_slot = 0,
+            .name_slots = std.StringHashMap(u8).init(allocator),
+            .outer_bindings = std.StringHashMap(VarBinding).init(allocator),
             .output_columns = 0,
             .output_column_names = [_]?[]const u8{null} ** MAX_SLOTS,
             .last_scan_kind = .none,
@@ -203,6 +291,9 @@ pub const QueryPlanner = struct {
         self.pattern_labels.deinit();
         self.pattern_edge_types.deinit();
         self.edge_bindings.deinit();
+        self.name_slots.deinit();
+        self.outer_bindings.deinit();
+        self.consumed_conjuncts.deinit(self.allocator);
     }
 
     /// Plan a complete query
@@ -210,6 +301,12 @@ pub const QueryPlanner = struct {
         _ = analysis; // Used for validation, already done
 
         // Reset bindings for this query
+        self.name_slots.clearRetainingCapacity();
+        self.outer_bindings.clearRetainingCapacity();
+        self.used_slots = 0;
+        self.ever_used_slots = 0;
+        self.reserved_slots = 0;
+        self.slot_conflict = null;
         self.clearHiddenBindingNames();
         self.bindings.clearRetainingCapacity();
         self.pattern_labels.clearRetainingCapacity();
@@ -218,19 +315,65 @@ pub const QueryPlanner = struct {
         self.next_slot = 0;
         self.output_columns = 0;
         self.output_column_names = [_]?[]const u8{null} ** MAX_SLOTS;
+        self.consumed_conjuncts.clearRetainingCapacity();
+        self.order_hint = orderHintFor(query.clauses);
+        self.order_cutoff_key = null;
+        self.query_sorts = hasOrderBy(query.clauses);
+        self.subquery_plans = .empty;
+        self.has_subqueries = query.subqueries.len > 0;
 
-        var current_op: ?Operator = null;
+        var current_op: ?Operator = if (query.unions.len == 0)
+            try self.planClauses(query.clauses)
+        else
+            try self.planUnion(query);
+
+        if (self.has_subqueries) current_op = try self.hostSubqueries(query, current_op orelse return PlannerError.InvalidQuery);
+
+        if (self.slot_conflict) |name| {
+            self.setPlanDetail("Variable '{s}' is bound again where its earlier slot is taken; use a different name", .{name});
+            return PlannerError.InvalidQuery;
+        }
+        // Expressions a WITH evaluated still read the bindings it dropped.
+        var outer = self.outer_bindings.iterator();
+        while (outer.next()) |entry| {
+            if (self.bindings.contains(entry.key_ptr.*)) continue;
+            self.bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+        }
+
+        return current_op orelse PlannerError.InvalidQuery;
+    }
+
+    /// Plan the clauses of one single query, in order.
+    fn planClauses(self: *Self, clauses: []const ast.Clause) PlannerError!?Operator {
+        return self.planClausesOver(clauses, null);
+    }
+
+    /// Plan clauses over `input`, the rows they start from.
+    fn planClausesOver(self: *Self, clauses: []const ast.Clause, input: ?Operator) PlannerError!?Operator {
+        var current_op: ?Operator = input;
 
         // Process each clause. RETURN + trailing ORDER BY/SKIP/LIMIT is
         // planned as sort/window first, then projection, so ORDER BY can
         // reference non-returned variables (e.g. RETURN n.name ORDER BY n.age).
         var clause_idx: usize = 0;
-        while (clause_idx < query.clauses.len) : (clause_idx += 1) {
-            const clause = query.clauses[clause_idx];
+        while (clause_idx < clauses.len) : (clause_idx += 1) {
+            const clause = clauses[clause_idx];
+            if (self.has_subqueries) try self.planClauseSubqueries(clause);
             switch (clause) {
-                .match => |m| {
-                    const where_hint: ?*const ast.Expression = if (clause_idx + 1 < query.clauses.len)
-                        switch (query.clauses[clause_idx + 1]) {
+                .match => |m| if (m.optional) {
+                    const where: ?*const ast.WhereClause = if (clause_idx + 1 < clauses.len)
+                        switch (clauses[clause_idx + 1]) {
+                            .where => |w| w,
+                            else => null,
+                        }
+                    else
+                        null;
+                    // The WHERE is part of the OPTIONAL MATCH.
+                    if (where != null) clause_idx += 1;
+                    current_op = try self.planOptionalMatch(m, where, current_op orelse try self.singleRow());
+                } else {
+                    const where_hint: ?*const ast.Expression = if (clause_idx + 1 < clauses.len)
+                        switch (clauses[clause_idx + 1]) {
                             .where => |w| w.condition,
                             else => null,
                         }
@@ -238,7 +381,7 @@ pub const QueryPlanner = struct {
                         null;
                     current_op = try self.planMatch(m, current_op, where_hint);
                 },
-                .where => |w| current_op = try self.planWhere(w, current_op),
+                .where => |w| current_op = try self.planWhere(w, current_op, vectorLimitHint(clauses[clause_idx + 1 ..])),
                 .return_ => |r| {
                     // Where ORDER BY, SKIP, and LIMIT belong depends on whether
                     // the projection aggregates.
@@ -255,30 +398,59 @@ pub const QueryPlanner = struct {
                     // to indicate anything had gone wrong.
                     const aggregates = returnAggregates(r);
 
-                    var input_for_return = current_op;
+                    var input_for_return: ?Operator = current_op orelse try self.singleRow();
                     var lookahead = clause_idx + 1;
                     const first_trailing = lookahead;
-                    while (lookahead < query.clauses.len) : (lookahead += 1) {
-                        switch (query.clauses[lookahead]) {
+                    while (lookahead < clauses.len) : (lookahead += 1) {
+                        switch (clauses[lookahead]) {
                             .order_by, .skip, .limit => {},
                             else => break,
                         }
                         if (aggregates) continue;
-                        switch (query.clauses[lookahead]) {
-                            .order_by => |o| input_for_return = try self.planOrderBy(o, input_for_return, r),
-                            .skip => |s| input_for_return = try self.planSkip(s, input_for_return),
-                            .limit => |l| input_for_return = try self.planLimit(l, input_for_return),
+                        // DISTINCT sits on top of the projection, and SKIP
+                        // and LIMIT count the rows it lets through. Planned
+                        // underneath they cut the input first, so
+                        // `RETURN DISTINCT x LIMIT 2` over 1, 1, 1, 2 returned
+                        // one row. The sort stays underneath, where it can
+                        // still see what the projection discards, but it
+                        // keeps every row: a bound would be the same cut.
+                        // Distinct passes rows on in the order they arrive.
+                        switch (clauses[lookahead]) {
+                            .order_by => |o| input_for_return = try self.planOrderBy(
+                                o,
+                                try self.orderedCutoff(input_for_return, clauses[lookahead + 1 ..]),
+                                r,
+                                if (r.distinct) &.{} else clauses[lookahead + 1 ..],
+                            ),
+                            .skip => |s| if (!r.distinct) {
+                                input_for_return = try self.planSkip(s, input_for_return);
+                            },
+                            .limit => |l| if (!r.distinct) {
+                                input_for_return = try self.planLimit(l, input_for_return);
+                            },
                             else => unreachable,
                         }
                     }
 
                     current_op = try self.planReturn(r, input_for_return);
 
+                    if (r.distinct and !aggregates) {
+                        var i = first_trailing;
+                        while (i < lookahead) : (i += 1) {
+                            switch (clauses[i]) {
+                                .order_by => {},
+                                .skip => |sk| current_op = try self.planSkip(sk, current_op),
+                                .limit => |l| current_op = try self.planLimit(l, current_op),
+                                else => unreachable,
+                            }
+                        }
+                    }
+
                     if (aggregates) {
                         var i = first_trailing;
                         while (i < lookahead) : (i += 1) {
-                            switch (query.clauses[i]) {
-                                .order_by => |o| current_op = try self.planOrderByOnOutput(o, current_op, r),
+                            switch (clauses[i]) {
+                                .order_by => |o| current_op = try self.planOrderByOnOutput(o, current_op, r, clauses[i + 1 .. lookahead]),
                                 .skip => |sk| current_op = try self.planSkip(sk, current_op),
                                 .limit => |l| current_op = try self.planLimit(l, current_op),
                                 else => unreachable,
@@ -288,20 +460,117 @@ pub const QueryPlanner = struct {
 
                     clause_idx = lookahead - 1;
                 },
-                .order_by => |o| current_op = try self.planOrderBy(o, current_op, null),
+                .order_by => |o| current_op = try self.planOrderBy(o, current_op, null, clauses[clause_idx + 1 ..]),
                 .limit => |l| current_op = try self.planLimit(l, current_op),
                 .skip => |s| current_op = try self.planSkip(s, current_op),
                 .create => |c| current_op = try self.planCreate(c, current_op),
                 .delete => |d| current_op = try self.planDelete(d, current_op),
                 .set => |s| current_op = try self.planSet(s, current_op),
                 .remove => |r| current_op = try self.planRemove(r, current_op),
-                .with => |w| current_op = try self.planWith(w, current_op),
+                .with => |w| current_op = try self.planWith(w, current_op orelse try self.singleRow()),
                 .merge => |m| current_op = try self.planMerge(m, current_op),
                 .unwind => |u| current_op = try self.planUnwind(u, current_op),
+                .foreach => |f| current_op = try self.planForeach(f, current_op orelse try self.singleRow()),
+                .call_subquery => |sq| current_op = try self.planCallSubquery(sq, current_op orelse try self.singleRow()),
+                .call => |c| {
+                    // A CALL that is the whole query (with at most a WHERE on
+                    // what it yields) returns its columns itself.
+                    var standalone = clause_idx == 0;
+                    for (clauses[clause_idx + 1 ..]) |rest| {
+                        if (rest != .where) standalone = false;
+                    }
+                    current_op = try self.planCall(c, current_op orelse try self.singleRow(), standalone);
+                },
             }
         }
+        return current_op;
+    }
 
-        return current_op orelse PlannerError.InvalidQuery;
+    /// Plan `q1 UNION [ALL] q2 ...`: each single query on its own, then
+    /// their rows one query after another, without duplicates for UNION.
+    ///
+    /// Each single query starts with no variables in scope. Variables are
+    /// found by name when the query runs, through one map for the whole
+    /// query, so a name keeps its slot across the single queries the way it
+    /// does across WITH scopes (`name_slots`); the bindings of the queries
+    /// already planned are kept as outer bindings so that they are
+    /// registered too.
+    fn planUnion(self: *Self, query: *const ast.Query) PlannerError!Operator {
+        const inputs = self.allocator.alloc(Operator, query.unions.len + 1) catch return PlannerError.OutOfMemory;
+        var planned: usize = 0;
+        errdefer for (inputs[0..planned]) |input| input.deinit(self.allocator);
+
+        inputs[0] = try self.planUnionPart(query.clauses, 1);
+        planned = 1;
+        const columns = self.output_columns;
+        var names: [MAX_SLOTS]?[]const u8 = self.output_column_names;
+
+        for (query.unions, 1..) |branch, i| {
+            try self.startUnionPart();
+            inputs[i] = try self.planUnionPart(branch.clauses, i + 1);
+            planned += 1;
+            if (self.output_columns != columns) {
+                self.setPlanDetail("All queries in a UNION must return the same number of columns; query 1 returns {d}, query {d} returns {d}", .{ columns, i + 1, self.output_columns });
+                return PlannerError.InvalidQuery;
+            }
+            for (0..columns) |c| {
+                const first = names[c] orelse "";
+                const this = self.output_column_names[c] orelse "";
+                if (!std.mem.eql(u8, first, this)) {
+                    self.setPlanDetail("All queries in a UNION must return the same column names; column {d} is `{s}` in query 1 and `{s}` in query {d}", .{ c + 1, first, this, i + 1 });
+                    return PlannerError.InvalidQuery;
+                }
+            }
+            names = self.output_column_names;
+        }
+
+        const union_op = union_ops.Union.init(self.allocator, inputs) catch return PlannerError.OutOfMemory;
+        // From here the union owns the inputs.
+        planned = 0;
+        if (query.unions[0].all) return union_op.operator();
+
+        const distinct = distinct_ops.Distinct.init(self.allocator, union_op.operator()) catch {
+            union_op.operator().deinit(self.allocator);
+            return PlannerError.OutOfMemory;
+        };
+        return distinct.operator();
+    }
+
+    /// Plan one single query of a UNION, which has to end in RETURN.
+    fn planUnionPart(self: *Self, clauses: []const ast.Clause, number: usize) PlannerError!Operator {
+        var last = clauses.len;
+        while (last > 0) : (last -= 1) {
+            switch (clauses[last - 1]) {
+                .order_by, .skip, .limit => {},
+                else => break,
+            }
+        }
+        if (last == 0 or clauses[last - 1] != .return_) {
+            self.setPlanDetail("Every query in a UNION must end with RETURN; query {d} does not", .{number});
+            return PlannerError.InvalidQuery;
+        }
+        // Each query has its own ORDER BY and LIMIT, so each may read an
+        // index in its own order; no query's order may reach another's scan.
+        self.order_hint = orderHintFor(clauses);
+        self.order_cutoff_key = null;
+        self.query_sorts = hasOrderBy(clauses);
+        return (try self.planClauses(clauses)) orelse PlannerError.InvalidQuery;
+    }
+
+    /// Clear the scope for the next single query of a UNION.
+    fn startUnionPart(self: *Self) PlannerError!void {
+        var it = self.bindings.iterator();
+        while (it.next()) |entry| {
+            if (self.outer_bindings.contains(entry.key_ptr.*)) continue;
+            self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+        }
+        self.bindings.clearRetainingCapacity();
+        self.pattern_labels.clearRetainingCapacity();
+        self.pattern_edge_types.clearRetainingCapacity();
+        self.edge_bindings.clearRetainingCapacity();
+        self.used_slots = 0;
+        self.output_columns = 0;
+        self.output_column_names = [_]?[]const u8{null} ** MAX_SLOTS;
     }
 
     /// Plan a MATCH clause
@@ -312,13 +581,613 @@ pub const QueryPlanner = struct {
         where_hint: ?*const ast.Expression,
     ) PlannerError!Operator {
         var op = input;
+        self.fts_seek_mask = 0;
+
+        var edges: std.ArrayList(*const ast.EdgePattern) = .empty;
+        for (match.patterns) |pattern| {
+            for (pattern.elements) |element| {
+                switch (element) {
+                    .edge => |edge| edges.append(self.allocator, edge) catch return PlannerError.OutOfMemory,
+                    .node => {},
+                }
+            }
+        }
+        var state = MatchEdges{
+            .edges = edges.items,
+            .slots = self.allocator.alloc(?u8, edges.items.len) catch return PlannerError.OutOfMemory,
+        };
+        @memset(state.slots, null);
 
         for (match.patterns) |pattern| {
-            op = try self.planPattern(pattern, op, where_hint);
+            op = try self.planPattern(pattern, op, where_hint, &state);
         }
 
         return op orelse PlannerError.InvalidQuery;
     }
+
+    /// Plan `OPTIONAL MATCH patterns [WHERE condition]` over `input`.
+    ///
+    /// The patterns and the WHERE are planned as for MATCH, but over an
+    /// Argument leaf instead of the input, and an Apply runs that plan once
+    /// for each input row: every row it produces is passed on, and an input
+    /// row it produces nothing from is passed on once with the slots the plan
+    /// binds set to null. The WHERE belongs to the OPTIONAL MATCH, so a row
+    /// it rejects becomes nulls rather than disappearing.
+    fn planOptionalMatch(
+        self: *Self,
+        match: *const ast.MatchClause,
+        where: ?*const ast.WhereClause,
+        input: Operator,
+    ) PlannerError!Operator {
+        const argument = optional_ops.Argument.init(self.allocator) catch return PlannerError.OutOfMemory;
+        const slots_before = self.used_slots;
+
+        var inner = self.planMatch(match, argument.operator(), if (where) |w| w.condition else null) catch |err| {
+            argument.operator().deinit(self.allocator);
+            return err;
+        };
+        if (where) |w| {
+            if (self.has_subqueries) try self.planSubqueriesIn(w.condition);
+            try self.refuseBareDistance(w.condition, "OPTIONAL MATCH");
+            // A plain filter: the vector and full-text access paths that
+            // planWhere can choose consume their input up front, which an
+            // argument that yields one row per round does not allow.
+            const filter = filter_ops.Filter.init(self.allocator, inner, w.condition) catch {
+                inner.deinit(self.allocator);
+                return PlannerError.OutOfMemory;
+            };
+            inner = filter.operator();
+        }
+
+        const new_slots = self.used_slots & ~slots_before;
+        const apply = optional_ops.Apply.init(self.allocator, input, inner, argument, true, new_slots) catch {
+            inner.deinit(self.allocator);
+            return PlannerError.OutOfMemory;
+        };
+        return apply.operator();
+    }
+
+    /// Plan the pattern subqueries in the expressions a clause evaluates
+    /// over the rows in scope before it. A WHERE after WITH or OPTIONAL
+    /// MATCH sees the variables they bind, so its subqueries are planned
+    /// there instead.
+    fn planClauseSubqueries(self: *Self, clause: ast.Clause) PlannerError!void {
+        switch (clause) {
+            .where => |w| try self.planSubqueriesIn(w.condition),
+            .return_ => |r| for (r.items) |item| try self.planSubqueriesIn(item.expression),
+            .with => |w| for (w.items) |item| try self.planSubqueriesIn(item.expression),
+            .order_by => |o| for (o.items) |item| try self.planSubqueriesIn(item.expression),
+            .unwind => |u| try self.planSubqueriesIn(u.expression),
+            .delete => |d| for (d.expressions) |e| try self.planSubqueriesIn(e),
+            .set => |s| for (s.items) |item| switch (item) {
+                .property => |p| try self.planSubqueriesIn(p.value),
+                .replace_properties => |p| try self.planSubqueriesIn(p.map),
+                .merge_properties => |p| try self.planSubqueriesIn(p.map),
+                .labels => {},
+            },
+            // Elsewhere a subquery is left unplanned, and `hostSubqueries`
+            // refuses the query.
+            .foreach => |f| try self.planSubqueriesIn(f.list),
+            .call_subquery => {},
+            .match, .create, .merge, .remove, .limit, .skip, .call => {},
+        }
+    }
+
+    /// Plan every subquery in `expr` not planned yet, outermost first; one
+    /// inside another is planned with the outer one, which binds what it
+    /// sees.
+    fn planSubqueriesIn(self: *Self, expr: *const ast.Expression) PlannerError!void {
+        var found: std.ArrayList(*const ast.PatternSubquery) = .empty;
+        ast_util.collectSubqueries(self.allocator, expr, &found) catch |err| switch (err) {
+            error.OutOfMemory => return PlannerError.OutOfMemory,
+            error.Refused => {
+                self.setPlanDetail("A pattern predicate, EXISTS {{...}}, COUNT {{...}} or pattern comprehension inside a list comprehension, quantifier or reduce() is not supported", .{});
+                return PlannerError.InvalidQuery;
+            },
+        };
+        for (found.items) |sq| try self.planSubquery(sq);
+    }
+
+    /// Plan one subquery over an Argument leaf, as an OPTIONAL MATCH is
+    /// planned, in a scope of its own: the variables it introduces are
+    /// dropped from scope afterwards, and the slots they took are free again
+    /// for the clauses that follow, since its matches are rows of its own.
+    fn planSubquery(self: *Self, sq: *const ast.PatternSubquery) PlannerError!void {
+        for (self.subquery_plans.items) |p| {
+            if (p.node == sq) return;
+        }
+        if (sq.body) |body| return self.planSubqueryBody(sq, body);
+        // Each match is one value, not a group: an aggregate has nothing to
+        // aggregate over there.
+        for ([_]?*ast.Expression{ sq.where, sq.map }) |part| {
+            const expr = part orelse continue;
+            if (aggregate_ops.containsAggregate(expr)) {
+                self.setPlanDetail("An aggregate cannot be used inside a pattern comprehension, EXISTS {{...}} or COUNT {{...}} (line {d}, column {d})", .{ sq.location.line, sq.location.column });
+                return PlannerError.InvalidQuery;
+            }
+        }
+        const slots_before = self.used_slots;
+        var introduced: std.ArrayList([]const u8) = .empty;
+        for (sq.patterns) |pattern| {
+            if (pattern.path_variable) |name| {
+                if (!self.bindings.contains(name)) introduced.append(self.allocator, name) catch return PlannerError.OutOfMemory;
+            }
+            for (pattern.elements) |element| {
+                const name = switch (element) {
+                    .node => |n| n.variable,
+                    .edge => |e| e.variable,
+                } orelse continue;
+                if (!self.bindings.contains(name)) introduced.append(self.allocator, name) catch return PlannerError.OutOfMemory;
+            }
+        }
+
+        const argument = optional_ops.Argument.init(self.allocator) catch return PlannerError.OutOfMemory;
+        const clause = self.allocator.create(ast.MatchClause) catch return PlannerError.OutOfMemory;
+        clause.* = .{ .patterns = sq.patterns, .location = sq.location };
+        var op = self.planMatch(clause, argument.operator(), sq.where) catch |err| {
+            argument.operator().deinit(self.allocator);
+            return err;
+        };
+        if (sq.where) |condition| {
+            try self.planSubqueriesIn(condition);
+            try self.refuseBareDistance(condition, "a subquery or pattern comprehension");
+            const filter = filter_ops.Filter.init(self.allocator, op, condition) catch return PlannerError.OutOfMemory;
+            op = filter.operator();
+        }
+        if (sq.map) |map| try self.planSubqueriesIn(map);
+        const arguments = self.allocator.alloc(*optional_ops.Argument, 1) catch return PlannerError.OutOfMemory;
+        arguments[0] = argument;
+        self.subquery_plans.append(self.allocator, .{ .node = sq, .plan = op, .arguments = arguments }) catch
+            return PlannerError.OutOfMemory;
+
+        for (introduced.items) |name| {
+            if (self.bindings.fetchRemove(name)) |entry| {
+                self.outer_bindings.put(entry.key, entry.value) catch return PlannerError.OutOfMemory;
+            }
+            _ = self.pattern_labels.remove(name);
+            _ = self.pattern_edge_types.remove(name);
+            _ = self.edge_bindings.remove(name);
+        }
+        self.used_slots = slots_before;
+    }
+
+    /// Plan `EXISTS { query }`, `COUNT { query }` or `COLLECT { query }` as
+    /// CALL { } is planned, over an Argument leaf per query of a UNION,
+    /// except that every variable around it is in scope: each row the plan
+    /// gives is one row of the subquery, and COLLECT's value is its first
+    /// column. What it binds is out of scope again afterwards.
+    fn planSubqueryBody(self: *Self, sq: *const ast.PatternSubquery, body: *const ast.CallSubquery) PlannerError!void {
+        const a = self.allocator;
+        const saved_bindings = self.bindings.clone() catch return PlannerError.OutOfMemory;
+        const saved_labels = self.pattern_labels.clone() catch return PlannerError.OutOfMemory;
+        const saved_types = self.pattern_edge_types.clone() catch return PlannerError.OutOfMemory;
+        const saved_edges = self.edge_bindings.clone() catch return PlannerError.OutOfMemory;
+        const saved_used = self.used_slots;
+        const saved_reserved = self.reserved_slots;
+        const saved_columns = self.output_columns;
+        const saved_names = self.output_column_names;
+        const saved_hint = self.order_hint;
+        const saved_cutoff = self.order_cutoff_key;
+
+        const count = body.unions.len + 1;
+        const plans = a.alloc(Operator, count) catch return PlannerError.OutOfMemory;
+        const arguments = a.alloc(*optional_ops.Argument, count) catch return PlannerError.OutOfMemory;
+        var columns: u8 = 0;
+        var names: [MAX_SLOTS]?[]const u8 = undefined;
+        self.reserved_slots |= saved_used;
+        for (0..count) |b| {
+            const clauses = if (b == 0) body.clauses else body.unions[b - 1].clauses;
+            var it = self.bindings.iterator();
+            while (it.next()) |entry| {
+                if (self.outer_bindings.contains(entry.key_ptr.*)) continue;
+                self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+            }
+            self.bindings.deinit();
+            self.bindings = saved_bindings.clone() catch return PlannerError.OutOfMemory;
+            self.pattern_labels.deinit();
+            self.pattern_labels = saved_labels.clone() catch return PlannerError.OutOfMemory;
+            self.pattern_edge_types.deinit();
+            self.pattern_edge_types = saved_types.clone() catch return PlannerError.OutOfMemory;
+            self.edge_bindings.deinit();
+            self.edge_bindings = saved_edges.clone() catch return PlannerError.OutOfMemory;
+            self.used_slots = saved_used;
+            self.output_columns = 0;
+            self.output_column_names = [_]?[]const u8{null} ** MAX_SLOTS;
+            self.order_hint = null;
+            self.order_cutoff_key = null;
+
+            const argument = optional_ops.Argument.init(a) catch return PlannerError.OutOfMemory;
+            arguments[b] = argument;
+            plans[b] = (try self.planClausesOver(clauses, argument.operator())) orelse argument.operator();
+            if (b == 0) {
+                columns = self.output_columns;
+                names = self.output_column_names;
+            } else if (self.output_columns != columns) {
+                self.setPlanDetail("All queries in a UNION must return the same number of columns; query 1 returns {d}, query {d} returns {d}", .{ columns, b + 1, self.output_columns });
+                return PlannerError.InvalidQuery;
+            } else for (0..columns) |c| {
+                const first = names[c] orelse "";
+                const this = self.output_column_names[c] orelse "";
+                if (!std.mem.eql(u8, first, this)) {
+                    self.setPlanDetail("All queries in a UNION must return the same column names; column {d} is `{s}` in query 1 and `{s}` in query {d}", .{ c + 1, first, this, b + 1 });
+                    return PlannerError.InvalidQuery;
+                }
+            }
+        }
+
+        var inner = plans[0];
+        if (count > 1) {
+            const union_op = union_ops.Union.init(a, plans) catch return PlannerError.OutOfMemory;
+            inner = union_op.operator();
+            if (!body.unions[0].all) {
+                const distinct = distinct_ops.Distinct.init(a, inner) catch return PlannerError.OutOfMemory;
+                inner = distinct.operator();
+            }
+        }
+
+        var it = self.bindings.iterator();
+        while (it.next()) |entry| {
+            if (self.outer_bindings.contains(entry.key_ptr.*)) continue;
+            self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+        }
+        self.bindings = saved_bindings;
+        self.pattern_labels = saved_labels;
+        self.pattern_edge_types = saved_types;
+        self.edge_bindings = saved_edges;
+        self.used_slots = saved_used;
+        self.reserved_slots = saved_reserved;
+        self.output_columns = saved_columns;
+        self.output_column_names = saved_names;
+        self.order_hint = saved_hint;
+        self.order_cutoff_key = saved_cutoff;
+
+        self.subquery_plans.append(a, .{ .node = sq, .plan = inner, .arguments = arguments, .reopen = true }) catch
+            return PlannerError.OutOfMemory;
+    }
+
+    /// Put the subqueries' plans at the root, where execution can find them,
+    /// after checking that every subquery was planned: one where none is
+    /// planned (in a MATCH or CREATE pattern's properties, say) is refused.
+    fn hostSubqueries(self: *Self, query: *const ast.Query, root: Operator) PlannerError!Operator {
+        for (query.subqueries) |sq| {
+            for (self.subquery_plans.items) |p| {
+                if (p.node == sq) break;
+            } else {
+                self.setPlanDetail("A pattern predicate, EXISTS {{...}}, COUNT {{...}} or pattern comprehension is not supported here (line {d}, column {d})", .{ sq.location.line, sq.location.column });
+                return PlannerError.InvalidQuery;
+            }
+        }
+        const plans = self.subquery_plans.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
+        const host = subquery_ops.SubqueryHost.init(self.allocator, root, plans) catch return PlannerError.OutOfMemory;
+        return host.operator();
+    }
+
+    /// Plan `FOREACH (x IN list | clauses)`: an UNWIND of the list and the
+    /// clauses, over an Argument leaf, run to the end for each input row,
+    /// which then passes on unchanged. What FOREACH binds goes out of scope
+    /// after it, and the slots it took are free again.
+    fn planForeach(self: *Self, f: *const ast.ForeachClause, input: Operator) PlannerError!Operator {
+        const slots_before = self.used_slots;
+        var bound_before = std.StringHashMap(void).init(self.allocator);
+        defer bound_before.deinit();
+        var names = self.bindings.keyIterator();
+        while (names.next()) |name| bound_before.put(name.*, {}) catch return PlannerError.OutOfMemory;
+
+        const argument = optional_ops.Argument.init(self.allocator) catch return PlannerError.OutOfMemory;
+        const unwind = self.allocator.create(ast.UnwindClause) catch return PlannerError.OutOfMemory;
+        unwind.* = .{ .expression = f.list, .variable = f.variable, .location = f.location };
+        const over_list = self.planUnwind(unwind, argument.operator()) catch |err| {
+            argument.operator().deinit(self.allocator);
+            return err;
+        };
+        const inner = (try self.planClausesOver(f.clauses, over_list)) orelse return PlannerError.InvalidQuery;
+
+        var introduced: std.ArrayList([]const u8) = .empty;
+        defer introduced.deinit(self.allocator);
+        var bound = self.bindings.keyIterator();
+        while (bound.next()) |name| {
+            if (!bound_before.contains(name.*)) introduced.append(self.allocator, name.*) catch return PlannerError.OutOfMemory;
+        }
+        for (introduced.items) |name| {
+            if (self.bindings.fetchRemove(name)) |entry| {
+                self.outer_bindings.put(entry.key, entry.value) catch return PlannerError.OutOfMemory;
+            }
+            _ = self.pattern_labels.remove(name);
+            _ = self.pattern_edge_types.remove(name);
+            _ = self.edge_bindings.remove(name);
+        }
+        self.used_slots = slots_before;
+
+        // The writes run while the input is still being read: read it in
+        // full first, as SET and DELETE do, to release its page latches.
+        const materialized = try self.materializeInput(input);
+        const foreach = optional_ops.Foreach.init(self.allocator, materialized, inner, argument) catch return PlannerError.OutOfMemory;
+        return foreach.operator();
+    }
+
+    /// Plan `CALL { ... }`. Each query inside is planned over an Argument
+    /// leaf with only what its leading WITH imports in scope, its new
+    /// variables kept out of the outer slots, and its RETURN as usual; the
+    /// returned columns are then bound outside to slots of their own.
+    fn planCallSubquery(self: *Self, sq: *const ast.CallSubquery, input: Operator) PlannerError!Operator {
+        const a = self.allocator;
+        const saved_bindings = self.bindings.clone() catch return PlannerError.OutOfMemory;
+        const saved_labels = self.pattern_labels.clone() catch return PlannerError.OutOfMemory;
+        const saved_types = self.pattern_edge_types.clone() catch return PlannerError.OutOfMemory;
+        const saved_edges = self.edge_bindings.clone() catch return PlannerError.OutOfMemory;
+        const saved_used = self.used_slots;
+        const saved_reserved = self.reserved_slots;
+        const saved_columns = self.output_columns;
+        const saved_names = self.output_column_names;
+        const saved_hint = self.order_hint;
+        const saved_cutoff = self.order_cutoff_key;
+
+        const count = sq.unions.len + 1;
+        const plans = a.alloc(Operator, count) catch return PlannerError.OutOfMemory;
+        const arguments = a.alloc(*optional_ops.Argument, count) catch return PlannerError.OutOfMemory;
+        var columns: u8 = 0;
+        var names: [MAX_SLOTS]?[]const u8 = undefined;
+        var kinds: [MAX_SLOTS]semantic.VariableKind = undefined;
+
+        self.reserved_slots |= saved_used;
+        for (0..count) |b| {
+            const clauses = if (b == 0) sq.clauses else sq.unions[b - 1].clauses;
+            // What was bound before stays registered for execution.
+            var it = self.bindings.iterator();
+            while (it.next()) |entry| {
+                if (self.outer_bindings.contains(entry.key_ptr.*)) continue;
+                self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+            }
+            self.bindings.clearRetainingCapacity();
+            self.pattern_labels.clearRetainingCapacity();
+            self.pattern_edge_types.clearRetainingCapacity();
+            self.edge_bindings.clearRetainingCapacity();
+            self.used_slots = saved_used;
+            self.output_columns = 0;
+            self.output_column_names = [_]?[]const u8{null} ** MAX_SLOTS;
+
+            // The importing WITH only narrows the scope to its variables,
+            // which keep their slots.
+            var rest = clauses;
+            if (clauses.len > 0 and clauses[0] == .with) {
+                for (clauses[0].with.items) |item| {
+                    const name = item.expression.variable.name;
+                    const binding = saved_bindings.get(name) orelse return PlannerError.InvalidQuery;
+                    try self.bindVariable(name, binding.slot, binding.kind);
+                    if (saved_labels.get(name)) |labels| self.pattern_labels.put(name, labels) catch return PlannerError.OutOfMemory;
+                    if (saved_types.get(name)) |types| self.pattern_edge_types.put(name, types) catch return PlannerError.OutOfMemory;
+                    if (saved_edges.get(name)) |edge| self.edge_bindings.put(name, edge) catch return PlannerError.OutOfMemory;
+                }
+                rest = clauses[1..];
+            }
+
+            self.order_hint = null;
+            self.order_cutoff_key = null;
+            const argument = optional_ops.Argument.init(a) catch return PlannerError.OutOfMemory;
+            arguments[b] = argument;
+            plans[b] = (try self.planClausesOver(rest, argument.operator())) orelse argument.operator();
+
+            if (b == 0) {
+                columns = self.output_columns;
+                names = self.output_column_names;
+                const ret = returnClauseOf(clauses);
+                for (0..columns) |c| {
+                    kinds[c] = .alias;
+                    const r = ret orelse break;
+                    if (r.items[c].expression.* == .variable) {
+                        if (self.bindings.get(r.items[c].expression.variable.name)) |binding| kinds[c] = binding.kind;
+                    }
+                }
+            } else {
+                if (self.output_columns != columns) {
+                    self.setPlanDetail("All queries in a UNION must return the same number of columns; query 1 returns {d}, query {d} returns {d}", .{ columns, b + 1, self.output_columns });
+                    return PlannerError.InvalidQuery;
+                }
+                for (0..columns) |c| {
+                    const first = names[c] orelse "";
+                    const this = self.output_column_names[c] orelse "";
+                    if (!std.mem.eql(u8, first, this)) {
+                        self.setPlanDetail("All queries in a UNION must return the same column names; column {d} is `{s}` in query 1 and `{s}` in query {d}", .{ c + 1, first, this, b + 1 });
+                        return PlannerError.InvalidQuery;
+                    }
+                }
+            }
+        }
+
+        var inner = plans[0];
+        if (count > 1) {
+            const union_op = union_ops.Union.init(a, plans) catch return PlannerError.OutOfMemory;
+            inner = union_op.operator();
+            if (!sq.unions[0].all) {
+                const distinct = distinct_ops.Distinct.init(a, inner) catch return PlannerError.OutOfMemory;
+                inner = distinct.operator();
+            }
+        }
+
+        // Back to the outer scope, with the inner variables registered.
+        var it = self.bindings.iterator();
+        while (it.next()) |entry| {
+            if (self.outer_bindings.contains(entry.key_ptr.*)) continue;
+            self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+        }
+        self.bindings = saved_bindings;
+        self.pattern_labels = saved_labels;
+        self.pattern_edge_types = saved_types;
+        self.edge_bindings = saved_edges;
+        self.used_slots = saved_used;
+        self.reserved_slots = saved_reserved;
+        self.output_columns = saved_columns;
+        self.output_column_names = saved_names;
+        self.order_hint = saved_hint;
+        self.order_cutoff_key = saved_cutoff;
+
+        const out_slots = a.alloc(u8, columns) catch return PlannerError.OutOfMemory;
+        for (out_slots, 0..) |*slot, c| {
+            const name = names[c] orelse return PlannerError.InvalidQuery;
+            slot.* = try self.allocateNamedSlot(name);
+            try self.bindVariable(name, slot.*, kinds[c]);
+        }
+
+        // Writes inside run while the input is still being read: read it in
+        // full first, as FOREACH does.
+        const writes = blk: {
+            const q = ast.Query{ .clauses = sq.clauses, .allocator = a, .unions = sq.unions };
+            break :blk q.writesData();
+        };
+        const source = if (writes) try self.materializeInput(input) else input;
+        const call = optional_ops.CallSubquery.init(a, source, inner, arguments, out_slots) catch return PlannerError.OutOfMemory;
+        return call.operator();
+    }
+
+    /// The RETURN that ends `clauses`, before any ORDER BY, SKIP or LIMIT.
+    fn returnClauseOf(clauses: []const ast.Clause) ?*const ast.ReturnClause {
+        var last = clauses.len;
+        while (last > 0) : (last -= 1) {
+            switch (clauses[last - 1]) {
+                .order_by, .skip, .limit => {},
+                .return_ => |r| return r,
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Plan `CALL procedure() [YIELD ...]`: each input row once per row of the
+    /// procedure's answer, with the yielded columns bound as variables.
+    fn planCall(self: *Self, call: *const ast.CallClause, input: Operator, standalone: bool) PlannerError!Operator {
+        const procedure = procedure_ops.Procedure.find(call.procedure) orelse {
+            self.setPlanDetail("Unknown procedure '{s}'; the procedures are db.labels(), db.relationshipTypes(), db.propertyKeys() and db.indexes()", .{call.procedure});
+            return PlannerError.InvalidQuery;
+        };
+        if (call.arguments.len > 0) {
+            self.setPlanDetail("{s}() takes no arguments", .{procedure.name()});
+            return PlannerError.InvalidQuery;
+        }
+        if (!standalone and call.yield_all) {
+            self.setPlanDetail("YIELD * is only allowed when CALL {s}() is the whole query", .{procedure.name()});
+            return PlannerError.InvalidQuery;
+        }
+        if (!standalone and call.yields == null) {
+            self.setPlanDetail("CALL {s}() inside a larger query needs YIELD to name the columns it adds", .{procedure.name()});
+            return PlannerError.InvalidQuery;
+        }
+        const columns = procedure.columns();
+        const slots = self.allocator.alloc(?u8, columns.len) catch return PlannerError.OutOfMemory;
+        @memset(slots, null);
+        var names: [MAX_SLOTS][]const u8 = undefined;
+        var order: [MAX_SLOTS]u8 = undefined;
+        var count: usize = 0;
+
+        if (call.yields) |items| {
+            for (items) |item| {
+                const index = for (columns, 0..) |column, i| {
+                    if (std.mem.eql(u8, column, item.column)) break i;
+                } else {
+                    self.setPlanDetail("{s}() has no column `{s}`; it yields {s}", .{ procedure.name(), item.column, columnList(procedure) });
+                    return PlannerError.InvalidQuery;
+                };
+                if (slots[index] != null) {
+                    self.setPlanDetail("Column `{s}` is yielded twice", .{item.column});
+                    return PlannerError.InvalidQuery;
+                }
+                const name = item.alias orelse item.column;
+                const slot = try self.allocateNamedSlot(name);
+                try self.bindVariable(name, slot, .alias);
+                slots[index] = slot;
+                names[count] = name;
+                order[count] = slot;
+                count += 1;
+            }
+        } else {
+            for (columns, 0..) |column, i| {
+                const slot = try self.allocateNamedSlot(column);
+                try self.bindVariable(column, slot, .alias);
+                slots[i] = slot;
+                names[count] = column;
+                order[count] = slot;
+                count += 1;
+            }
+        }
+
+        if (standalone) {
+            // The columns are the result: the yielded ones, in the order
+            // asked for, which is the order their slots were taken in.
+            for (order[0..count], 0..) |slot, i| {
+                if (slot != i) return PlannerError.InvalidQuery;
+                self.output_column_names[i] = names[i];
+            }
+            self.output_columns = @intCast(count);
+        }
+
+        const database = self.storage.database orelse return PlannerError.MissingStorage;
+        const op = procedure_ops.ProcedureCall.init(self.allocator, input, procedure, slots, database) catch
+            return PlannerError.OutOfMemory;
+        return op.operator();
+    }
+
+    fn columnList(procedure: procedure_ops.Procedure) []const u8 {
+        return switch (procedure) {
+            .labels => "`label`",
+            .relationship_types => "`relationshipType`",
+            .property_keys => "`propertyKey`",
+            .indexes => "`type`, `entityType`, `labelOrType`, `property` and `encoding`",
+        };
+    }
+
+    /// The relationships of one MATCH clause, for relationship uniqueness.
+    ///
+    /// Cypher never binds one relationship twice within a MATCH, across all of
+    /// its comma-separated patterns. Each single-hop expand therefore skips
+    /// edges already bound by an earlier relationship of the clause. Only
+    /// relationships whose type sets overlap can collide, so only those get a
+    /// slot to hold their edge, which keeps the extra slots off ordinary
+    /// multi-type paths.
+    ///
+    /// A variable-length relationship that a later one could collide with
+    /// keeps its path's edge ids in a slot of their own, as a list, and
+    /// later relationships, single-hop or variable-length, skip those too.
+    /// Its own path never reuses an edge.
+    const MatchEdges = struct {
+        /// Every relationship pattern of the clause, in order.
+        edges: []const *const ast.EdgePattern,
+        /// The slot each planned relationship's edge, or variable-length
+        /// path, went to.
+        slots: []?u8,
+        /// How many relationships have been planned.
+        planned: usize = 0,
+
+        fn typesOverlap(a: []const []const u8, b: []const []const u8) bool {
+            if (a.len == 0 or b.len == 0) return true;
+            for (a) |x| {
+                for (b) |y| {
+                    if (std.mem.eql(u8, x, y)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Whether relationship `k` must keep its edge in a slot, because a
+        /// later relationship of the clause could match the same edge.
+        fn needsSlot(self: *const MatchEdges, k: usize) bool {
+            const edge = self.edges[k];
+            for (self.edges[k + 1 ..]) |later| {
+                if (typesOverlap(edge.types, later.types)) return true;
+            }
+            return false;
+        }
+
+        /// The slots of earlier relationships that relationship `k` must not
+        /// repeat.
+        fn distinctFrom(self: *const MatchEdges, allocator: Allocator, k: usize) PlannerError![]const u8 {
+            var slots: std.ArrayList(u8) = .empty;
+            for (self.edges[0..k], self.slots[0..k]) |earlier, slot| {
+                const s = slot orelse continue;
+                if (!typesOverlap(earlier.types, self.edges[k].types)) continue;
+                slots.append(allocator, s) catch return PlannerError.OutOfMemory;
+            }
+            return slots.items;
+        }
+    };
 
     /// Plan a single pattern
     fn planPattern(
@@ -326,36 +1195,66 @@ pub const QueryPlanner = struct {
         pattern: ast.Pattern,
         input: ?Operator,
         where_hint: ?*const ast.Expression,
+        match_edges: *MatchEdges,
     ) PlannerError!Operator {
+        if (pattern.shortest != .none) return self.planShortestPath(pattern, input, where_hint, match_edges);
         var op = input;
         var prev_node_slot: ?u8 = null;
+        // The pattern starts with a scan of every node and nothing on top of
+        // it, which a relationship type can replace.
+        var starts_with_all_nodes = false;
+        // A named path is put together from the slots its pattern fills.
+        var path_start: ?u8 = null;
+        var path_steps: std.ArrayList(path_ops.Step) = .empty;
 
-        for (pattern.elements) |element| {
+        for (pattern.elements, 0..) |element, element_index| {
             switch (element) {
                 .node => |node_pattern| {
+                    // A node variable bound earlier (in this clause or a
+                    // previous one) is that same node: no scan, only checks.
+                    const bound_slot: ?u8 = if (node_pattern.variable) |name| self.boundNodeSlot(name) else null;
+
                     // If prev_node_slot is set, this node follows an edge.
                     // Use the target slot from the Expand operator instead of allocating a new slot.
                     const slot = if (prev_node_slot != null and op != null)
                         prev_node_slot.? // Use target slot from preceding edge's Expand
+                    else if (bound_slot) |bound|
+                        bound
                     else
-                        try self.allocateSlot();
+                        try self.allocateNamedSlot(node_pattern.variable);
                     var node_var_name: ?[]const u8 = null;
 
                     // Bind variable if present
                     if (node_pattern.variable) |name| {
-                        try self.bindVariable(name, slot, .node);
                         node_var_name = name;
-                        self.pattern_labels.put(name, node_pattern.labels) catch {
-                            return PlannerError.OutOfMemory;
-                        };
+                        if (bound_slot == null) {
+                            try self.bindVariable(name, slot, .node);
+                        }
+                        if (bound_slot == null or node_pattern.labels.len > 0) {
+                            self.pattern_labels.put(name, node_pattern.labels) catch {
+                                return PlannerError.OutOfMemory;
+                            };
+                        }
                     }
 
                     // Determine if we need to create a scan or filter
                     const is_target_of_edge = prev_node_slot != null and op != null;
 
-                    if (is_target_of_edge) {
-                        // This node is the target of an edge - data comes from Expand operator.
-                        // If labels are specified, add a filter to check them.
+                    // `WHERE id(n) = k` names the node outright: read it, and
+                    // nothing else, whatever indexes the pattern could use.
+                    // Not beside a vector or full-text search, which plans its
+                    // own access path from the WHERE.
+                    const id_seek: ?IdSeek = blk: {
+                        const variable_name = node_var_name orelse break :blk null;
+                        const condition = where_hint orelse break :blk null;
+                        if (hasSearchConjunct(condition)) break :blk null;
+                        break :blk findWhereIdSeek(variable_name, condition);
+                    };
+
+                    if (is_target_of_edge or (bound_slot != null and op != null)) {
+                        // The node comes from the input: the target of an
+                        // Expand, or a node bound earlier. Labels the pattern
+                        // names are checked with filters.
                         if (node_pattern.labels.len > 0) {
                             const symbol_table = self.storage.symbol_table orelse return PlannerError.MissingStorage;
                             const label_id = symbol_table.lookup(node_pattern.labels[0]) catch |err| switch (err) {
@@ -390,7 +1289,7 @@ pub const QueryPlanner = struct {
                         const database = self.storage.database orelse return PlannerError.MissingStorage;
                         var scan_label_index: usize = 0;
                         var indexed_property: ?IndexedProperty = null;
-                        if (node_pattern.properties) |properties| {
+                        if (id_seek == null) if (node_pattern.properties) |properties| {
                             search: for (node_pattern.labels, 0..) |label_name, label_idx| {
                                 for (properties) |property| {
                                     if (!isIndependentExpression(property.value)) continue;
@@ -404,8 +1303,8 @@ pub const QueryPlanner = struct {
                                     }
                                 }
                             }
-                        }
-                        if (indexed_property == null) {
+                        };
+                        if (indexed_property == null and id_seek == null) {
                             if (node_var_name) |variable_name| {
                                 if (where_hint) |condition| {
                                     if (self.findWherePropertyIndex(
@@ -428,7 +1327,7 @@ pub const QueryPlanner = struct {
                         // rather than sitting on top of one.
                         var fts_candidates: [MAX_FTS_DISJUNCTS][]const fts_ops.Search = undefined;
                         var fts_candidate_count: usize = 0;
-                        if (indexed_property == null) {
+                        if (indexed_property == null and id_seek == null) {
                             if (node_var_name) |variable_name| {
                                 if (where_hint) |condition| {
                                     var seek_infos: [MAX_FTS_DISJUNCTS]FtsSearchInfo = undefined;
@@ -478,13 +1377,27 @@ pub const QueryPlanner = struct {
                             }
                         }
 
+                        // An ordered index answers ranges, and reads in order.
+                        var range_choice: ?RangeChoice = null;
+                        if (indexed_property == null and fts_candidate_count == 0 and id_seek == null) {
+                            if (node_var_name) |variable_name| {
+                                range_choice = try self.chooseRangeScan(variable_name, node_pattern.labels, where_hint, op == null);
+                                if (range_choice) |choice| scan_label_index = choice.label_index;
+                            }
+                        }
+
                         const scan_label_name = node_pattern.labels[scan_label_index];
                         const label_id = symbol_table.lookup(scan_label_name) catch |err| switch (err) {
                             symbols.SymbolError.NotFound => symbols.NULL_SYMBOL,
                             else => return PlannerError.InternalError,
                         };
 
-                        var new_op: Operator = if (fts_candidate_count > 0) blk: {
+                        var new_op: Operator = if (id_seek) |seek| blk: {
+                            const id_scan = scan_ops.NodeIdSeek.init(self.allocator, slot, seek.value, seek.list, database) catch
+                                return PlannerError.OutOfMemory;
+                            self.last_scan_kind = .node_id_seek;
+                            break :blk id_scan.operator();
+                        } else if (fts_candidate_count > 0) blk: {
                             const owned = self.allocator.alloc([]const fts_ops.Search, fts_candidate_count) catch {
                                 return PlannerError.OutOfMemory;
                             };
@@ -497,6 +1410,13 @@ pub const QueryPlanner = struct {
                                 database,
                             ) catch return PlannerError.OutOfMemory;
                             self.last_scan_kind = .fts_index_seek;
+                            // With one candidate the seek always runs that
+                            // search, so it answers the predicate itself.
+                            if (fts_candidate_count == 1) {
+                                self.fts_seeks[slot] = fts_candidates[0][0];
+                                self.fts_seek_ops[slot] = seek;
+                                self.fts_seek_mask |= @as(u16, 1) << @intCast(slot);
+                            }
                             break :blk seek.operator();
                         } else if (indexed_property) |property| blk: {
                             const property_scan = scan_ops.PropertyIndexScan.init(
@@ -509,6 +1429,19 @@ pub const QueryPlanner = struct {
                             ) catch return PlannerError.OutOfMemory;
                             self.last_scan_kind = .property_index_scan;
                             break :blk property_scan.operator();
+                        } else if (range_choice) |choice| blk: {
+                            const range_scan = range_ops.IndexRangeScan.init(
+                                self.allocator,
+                                slot,
+                                scan_label_name,
+                                choice.property,
+                                choice.conditions,
+                                choice.descending,
+                                database,
+                            ) catch return PlannerError.OutOfMemory;
+                            range_scan.id_order = choice.id_order;
+                            self.last_scan_kind = if (choice.conditions.len == 0) .property_order_scan else .property_range_scan;
+                            break :blk range_scan.operator();
                         } else blk: {
                             const label_scan = scan_ops.LabelScan.init(self.allocator, slot, label_id, database) catch {
                                 return PlannerError.OutOfMemory;
@@ -517,9 +1450,10 @@ pub const QueryPlanner = struct {
                             break :blk label_scan.operator();
                         };
 
-                        // Chain filters for additional labels (AND semantics)
+                        // Chain filters for additional labels (AND semantics);
+                        // a seek by id guarantees none of them.
                         for (node_pattern.labels, 0..) |label_name, label_idx| {
-                            if (label_idx == scan_label_index) continue;
+                            if (label_idx == scan_label_index and id_seek == null) continue;
                             const extra_id = symbol_table.lookup(label_name) catch |err| switch (err) {
                                 symbols.SymbolError.NotFound => symbols.NULL_SYMBOL,
                                 else => return PlannerError.InternalError,
@@ -539,6 +1473,20 @@ pub const QueryPlanner = struct {
                         } else {
                             op = new_op;
                         }
+                    } else if (id_seek) |seek| {
+                        // No labels: the seek alone, or crossed with what came before.
+                        const database = self.storage.database orelse return PlannerError.MissingStorage;
+                        const id_scan = scan_ops.NodeIdSeek.init(self.allocator, slot, seek.value, seek.list, database) catch
+                            return PlannerError.OutOfMemory;
+                        self.last_scan_kind = .node_id_seek;
+                        if (op) |existing_op| {
+                            const cross = cross_product_ops.CrossProduct.init(self.allocator, existing_op, id_scan.operator()) catch {
+                                return PlannerError.OutOfMemory;
+                            };
+                            op = cross.operator();
+                        } else {
+                            op = id_scan.operator();
+                        }
                     } else if (op == null) {
                         // All nodes scan (no labels, no previous operator)
                         _ = self.storage.node_tree orelse return PlannerError.MissingStorage;
@@ -547,6 +1495,7 @@ pub const QueryPlanner = struct {
                             return PlannerError.OutOfMemory;
                         };
                         op = all_scan.operator();
+                        starts_with_all_nodes = element_index == 0 and node_pattern.properties == null and node_pattern.label_expr == null;
                     } else {
                         // No labels but existing operator — cross join with all nodes scan
                         _ = self.storage.node_tree orelse return PlannerError.MissingStorage;
@@ -595,18 +1544,50 @@ pub const QueryPlanner = struct {
                         }
                     }
 
+                    // What a label expression asks beyond the labels every
+                    // match has, `(n:A|B)`, is checked on each node.
+                    if (node_pattern.label_expr) |labels| {
+                        const var_name = node_var_name orelse try self.bindInternalVariable(slot, .node);
+                        const subject = try self.newExpression(.{ .variable = .{ .name = var_name, .location = node_pattern.location } });
+                        const label_test = self.allocator.create(ast.LabelTest) catch return PlannerError.OutOfMemory;
+                        label_test.* = .{ .subject = subject, .labels = labels, .location = node_pattern.location };
+                        const predicate = try self.newExpression(.{ .label_test = label_test });
+                        const label_filter = filter_ops.Filter.init(self.allocator, op.?, predicate) catch return PlannerError.OutOfMemory;
+                        op = label_filter.operator();
+                    }
+
                     prev_node_slot = slot;
+                    if (path_start == null) path_start = slot;
                 },
                 .edge => |edge_pattern| {
                     // Need previous node to expand from
                     const source_slot = prev_node_slot orelse return PlannerError.InvalidQuery;
-                    const target_slot = try self.allocateSlot();
+                    // When the far end is a bound node, expand into it.
+                    const next_node: ?*const ast.NodePattern = if (element_index + 1 < pattern.elements.len) switch (pattern.elements[element_index + 1]) {
+                        .node => |n| n,
+                        .edge => null,
+                    } else null;
+                    const next_variable: ?[]const u8 = if (next_node) |n| n.variable else null;
+                    const bound_target: ?u8 = if (next_variable) |name| self.boundNodeSlot(name) else null;
+                    const target_slot = bound_target orelse try self.allocateNamedSlot(next_variable);
 
                     // Optional edge variable
                     var edge_slot: ?u8 = null;
                     var edge_var_name: ?[]const u8 = null;
-                    if (edge_pattern.variable) |name| {
-                        edge_slot = try self.allocateSlot();
+                    // A variable-length relationship's variable is the list
+                    // of the relationships its path went through.
+                    var rels_slot: ?u8 = null;
+                    var rels_name: ?[]const u8 = null;
+                    if (edge_pattern.quantifier != null and (edge_pattern.variable != null or edge_pattern.properties != null)) {
+                        rels_slot = try self.allocateNamedSlot(edge_pattern.variable);
+                        if (edge_pattern.variable) |name| {
+                            try self.bindVariable(name, rels_slot.?, .alias);
+                            rels_name = name;
+                        } else {
+                            rels_name = try self.bindInternalVariable(rels_slot.?, .alias);
+                        }
+                    } else if (edge_pattern.variable) |name| {
+                        edge_slot = try self.allocateNamedSlot(name);
                         try self.bindVariable(name, edge_slot.?, .edge);
                         edge_var_name = name;
                         // Every type the pattern named, because `-[r:A|B]->` has
@@ -632,16 +1613,35 @@ pub const QueryPlanner = struct {
                         }
                     }
 
-                    // Determine edge type
-                    var edge_type: ?SymbolId = null;
-                    if (edge_pattern.types.len > 0) {
-                        const symbol_table = self.storage.symbol_table orelse return PlannerError.MissingStorage;
-                        edge_type = symbol_table.lookup(edge_pattern.types[0]) catch |err| switch (err) {
-                            // Unknown relationship type should behave like an empty match, not a planning error.
-                            symbols.SymbolError.NotFound => symbols.NULL_SYMBOL,
-                            else => return PlannerError.InternalError,
-                        };
+                    // A named path needs every relationship it goes through.
+                    if (edge_slot == null and pattern.path_variable != null and edge_pattern.quantifier == null) {
+                        edge_slot = try self.allocateSlot();
+                        _ = try self.bindInternalVariable(edge_slot.?, .edge);
                     }
+
+                    // Relationship uniqueness within the MATCH clause.
+                    const edge_index = match_edges.planned;
+                    match_edges.planned += 1;
+                    var path_slot: ?u8 = null;
+                    if (edge_pattern.quantifier != null) {
+                        // A path's edges go in a slot of their own, never in
+                        // the relationship's variable.
+                        if (match_edges.needsSlot(edge_index)) {
+                            path_slot = try self.allocateSlot();
+                            _ = try self.bindInternalVariable(path_slot.?, .alias);
+                        }
+                        match_edges.slots[edge_index] = path_slot;
+                    } else {
+                        if (edge_slot == null and match_edges.needsSlot(edge_index)) {
+                            edge_slot = try self.allocateSlot();
+                            _ = try self.bindInternalVariable(edge_slot.?, .edge);
+                        }
+                        match_edges.slots[edge_index] = edge_slot;
+                    }
+                    const distinct_from = try match_edges.distinctFrom(self.allocator, edge_index);
+
+                    // Every type the pattern accepts, as in `-[:A|B]->`.
+                    const edge_types = try self.resolveEdgeTypes(edge_pattern.types);
 
                     // Map direction
                     const expand_dir: expand_ops.ExpandDirection = switch (edge_pattern.direction) {
@@ -654,14 +1654,59 @@ pub const QueryPlanner = struct {
                     _ = self.storage.edge_store orelse return PlannerError.MissingStorage;
                     const database = self.storage.database orelse return PlannerError.MissingStorage;
 
-                    if (edge_pattern.quantifier) |quant| {
+                    // `(a)-[r:T]->(b)` from an unlabelled, unbound `a`: walk
+                    // the edges of those types once instead of expanding
+                    // every node.
+                    const type_scan = starts_with_all_nodes and element_index == 1 and
+                        edge_pattern.quantifier == null and edge_types.len > 0 and
+                        expand_dir != .both and bound_target == null and distinct_from.len == 0;
+                    const edge_range = if (type_scan and edge_types.len == 1)
+                        try self.chooseEdgeRangeScan(edge_pattern.types[0], edge_var_name, edge_pattern.properties, where_hint)
+                    else
+                        null;
+                    if (edge_range) |choice| {
+                        op.?.deinit(self.allocator);
+                        const scan = range_ops.IndexRangeScan.init(
+                            self.allocator,
+                            source_slot,
+                            edge_pattern.types[0],
+                            choice.property,
+                            choice.conditions,
+                            false,
+                            database,
+                        ) catch return PlannerError.OutOfMemory;
+                        scan.edges = .{ .end_slot = target_slot, .edge_slot = edge_slot, .incoming = expand_dir == .incoming };
+                        op = scan.operator();
+                        self.last_scan_kind = .edge_range_scan;
+                        if (pattern.path_variable != null) {
+                            path_steps.append(self.allocator, .{ .single = .{ .edge_slot = edge_slot.?, .node_slot = target_slot } }) catch
+                                return PlannerError.OutOfMemory;
+                        }
+                    } else if (type_scan) {
+                        op.?.deinit(self.allocator);
+                        const scan = edge_type_scan_ops.EdgeTypeScan.init(
+                            self.allocator,
+                            source_slot,
+                            target_slot,
+                            edge_slot,
+                            edge_types,
+                            expand_dir == .incoming,
+                            database,
+                        ) catch return PlannerError.OutOfMemory;
+                        op = scan.operator();
+                        self.last_scan_kind = .edge_type_scan;
+                        if (pattern.path_variable != null) {
+                            path_steps.append(self.allocator, .{ .single = .{ .edge_slot = edge_slot.?, .node_slot = target_slot } }) catch
+                                return PlannerError.OutOfMemory;
+                        }
+                    } else if (edge_pattern.quantifier) |quant| {
                         // Variable-length path: use VariableLengthExpand
                         const var_expand = var_expand_ops.VariableLengthExpand.init(
                             self.allocator,
                             op.?,
                             source_slot,
                             target_slot,
-                            edge_type,
+                            .{ .types = edge_types, .distinct_from = distinct_from, .target_bound = bound_target != null },
                             expand_dir,
                             database,
                             quant.min_hops,
@@ -669,6 +1714,14 @@ pub const QueryPlanner = struct {
                         ) catch {
                             return PlannerError.OutOfMemory;
                         };
+                        var_expand.path_slot = path_slot;
+                        var_expand.rels_slot = rels_slot;
+                        if (pattern.path_variable != null) {
+                            const walk_slot = try self.allocateSlot();
+                            _ = try self.bindInternalVariable(walk_slot, .alias);
+                            var_expand.walk_slot = walk_slot;
+                            path_steps.append(self.allocator, .{ .walk = walk_slot }) catch return PlannerError.OutOfMemory;
+                        }
                         op = var_expand.operator();
                     } else {
                         // Regular single-hop expand
@@ -678,18 +1731,28 @@ pub const QueryPlanner = struct {
                             source_slot,
                             target_slot,
                             edge_slot,
-                            edge_type,
+                            .{ .types = edge_types, .distinct_from = distinct_from, .target_bound = bound_target != null },
                             expand_dir,
                             database,
                         ) catch {
                             return PlannerError.OutOfMemory;
                         };
+                        if (pattern.path_variable != null) {
+                            path_steps.append(self.allocator, .{ .single = .{ .edge_slot = edge_slot.?, .node_slot = target_slot } }) catch
+                                return PlannerError.OutOfMemory;
+                        }
                         op = expand.operator();
                     }
 
-                    // Add relationship property filters for inline maps:
-                    // [:TYPE {k: v}] -> Filter(edge.k = v)
-                    if (edge_pattern.properties) |props| {
+                    // A variable-length relationship's map holds for every
+                    // relationship of the path: all(x IN r WHERE x.k = v).
+                    if (edge_pattern.quantifier != null) {
+                        if (edge_pattern.properties) |props| {
+                            if (props.len > 0) op = try self.filterEachRelationship(op.?, rels_name.?, props, edge_pattern.location);
+                        }
+                    } else if (edge_pattern.properties) |props| {
+                        // Add relationship property filters for inline maps:
+                        // [:TYPE {k: v}] -> Filter(edge.k = v)
                         const var_name = edge_var_name orelse return PlannerError.InvalidQuery;
                         const loc = edge_pattern.location;
                         for (props) |prop| {
@@ -719,7 +1782,150 @@ pub const QueryPlanner = struct {
             }
         }
 
+        if (pattern.path_variable) |name| {
+            const path_slot = try self.allocateNamedSlot(name);
+            try self.bindVariable(name, path_slot, .alias);
+            const steps = path_steps.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
+            const bind = path_ops.BindPath.init(self.allocator, op orelse return PlannerError.InvalidQuery, path_start.?, steps, path_slot) catch
+                return PlannerError.OutOfMemory;
+            op = bind.operator();
+        }
+
         return op orelse PlannerError.InvalidQuery;
+    }
+
+    /// `p = shortestPath((a)-[r:T*..n]->(b))`: each end is matched as a
+    /// pattern of one node, then ShortestPath searches between them.
+    /// Semantic analysis has checked the shape.
+    fn planShortestPath(
+        self: *Self,
+        pattern: ast.Pattern,
+        input: ?Operator,
+        where_hint: ?*const ast.Expression,
+        match_edges: *MatchEdges,
+    ) PlannerError!Operator {
+        const edge = pattern.elements[1].edge;
+        var op = input;
+        var ends: [2]u8 = undefined;
+        for ([2]usize{ 0, 2 }, &ends) |index, *slot| {
+            var node = pattern.elements[index].node.*;
+            if (node.variable == null) node.variable = try self.hiddenName();
+            var elements = [_]ast.PatternElement{.{ .node = &node }};
+            op = try self.planPattern(.{ .elements = &elements }, op, where_hint, match_edges);
+            slot.* = self.boundNodeSlot(node.variable.?) orelse return PlannerError.InvalidQuery;
+        }
+
+        // The relationships of a shortest path are not kept from the
+        // MATCH's other relationships.
+        match_edges.slots[match_edges.planned] = null;
+        match_edges.planned += 1;
+
+        const database = self.storage.database orelse return PlannerError.MissingStorage;
+        const types = try self.resolveEdgeTypes(edge.types);
+        const quant = edge.quantifier orelse ast.RangeQuantifier{ .min_hops = 1, .max_hops = 1 };
+        const search = shortest_path_ops.ShortestPath.init(
+            self.allocator,
+            op.?,
+            ends[0],
+            ends[1],
+            .{ .types = types },
+            switch (edge.direction) {
+                .outgoing => .outgoing,
+                .incoming => .incoming,
+                .both => .both,
+            },
+            database,
+            quant.min_hops,
+            quant.max_hops,
+            pattern.shortest == .all,
+        ) catch return PlannerError.OutOfMemory;
+        if (edge.variable) |name| {
+            const slot = try self.allocateNamedSlot(name);
+            try self.bindVariable(name, slot, .alias);
+            search.rels_slot = slot;
+        }
+        if (pattern.path_variable) |name| {
+            const slot = try self.allocateNamedSlot(name);
+            try self.bindVariable(name, slot, .alias);
+            search.path_slot = slot;
+        }
+        return search.operator();
+    }
+
+    /// A name for an anonymous variable the planner needs to refer to,
+    /// which no query can spell.
+    fn hiddenName(self: *Self) PlannerError![]const u8 {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var buf: [32]u8 = undefined;
+            const candidate = std.fmt.bufPrint(&buf, "  end {d}", .{attempt}) catch return PlannerError.InternalError;
+            if (self.bindings.contains(candidate)) continue;
+            const owned = self.allocator.dupe(u8, candidate) catch return PlannerError.OutOfMemory;
+            self.hidden_binding_names.append(self.allocator, owned) catch return PlannerError.OutOfMemory;
+            return owned;
+        }
+    }
+
+    /// Keep the rows whose relationship list `rels` has every property of
+    /// `props` on every relationship, as `-[*1..3 {k: v}]->` asks:
+    /// `all(x IN rels WHERE x.k = v AND ...)`. An empty path passes.
+    fn filterEachRelationship(
+        self: *Self,
+        input: Operator,
+        rels: []const u8,
+        props: []const ast.PropertyEntry,
+        loc: ast.SourceLocation,
+    ) PlannerError!Operator {
+        const element = "  relationship";
+        var condition: ?*ast.Expression = null;
+        for (props) |prop| {
+            const var_expr = try self.newExpression(.{ .variable = .{ .name = element, .location = loc } });
+            const access = self.allocator.create(ast.PropertyAccess) catch return PlannerError.OutOfMemory;
+            access.* = .{ .object = var_expr, .property = prop.key, .location = loc };
+            const eq = self.allocator.create(ast.BinaryExpr) catch return PlannerError.OutOfMemory;
+            eq.* = .{ .left = try self.newExpression(.{ .property_access = access }), .operator = .eq, .right = prop.value, .location = loc };
+            const eq_expr = try self.newExpression(.{ .binary = eq });
+            if (condition) |left| {
+                const both = self.allocator.create(ast.BinaryExpr) catch return PlannerError.OutOfMemory;
+                both.* = .{ .left = left, .operator = .and_, .right = eq_expr, .location = loc };
+                condition = try self.newExpression(.{ .binary = both });
+            } else condition = eq_expr;
+        }
+        const all = self.allocator.create(ast.ListComprehension) catch return PlannerError.OutOfMemory;
+        all.* = .{
+            .kind = .all,
+            .variable = element,
+            .list = try self.newExpression(.{ .variable = .{ .name = rels, .location = loc } }),
+            .where = condition,
+            .map = null,
+            .location = loc,
+        };
+        const predicate = try self.newExpression(.{ .comprehension = all });
+        const filter = filter_ops.Filter.init(self.allocator, input, predicate) catch return PlannerError.OutOfMemory;
+        return filter.operator();
+    }
+
+    fn newExpression(self: *Self, value: ast.Expression) PlannerError!*ast.Expression {
+        const expr = self.allocator.create(ast.Expression) catch return PlannerError.OutOfMemory;
+        expr.* = value;
+        return expr;
+    }
+
+    /// Resolve a relationship pattern's type names to symbol ids.
+    ///
+    /// A type the database has never seen resolves to `NULL_SYMBOL`, which no
+    /// edge carries, so it matches nothing rather than failing the plan.
+    fn resolveEdgeTypes(self: *Self, names: []const []const u8) PlannerError![]const SymbolId {
+        if (names.len == 0) return &.{};
+        const symbol_table = self.storage.symbol_table orelse return PlannerError.MissingStorage;
+        const ids = self.allocator.alloc(SymbolId, names.len) catch return PlannerError.OutOfMemory;
+        for (names, ids) |name, *id| {
+            id.* = symbol_table.lookup(name) catch |err| switch (err) {
+                symbols.SymbolError.NotFound => symbols.NULL_SYMBOL,
+                else => return PlannerError.InternalError,
+            };
+        }
+        return ids;
     }
 
     fn isIndependentExpression(expr: *const ast.Expression) bool {
@@ -797,6 +2003,53 @@ pub const QueryPlanner = struct {
         count.* += 1;
     }
 
+    const IdSeek = struct {
+        value: *const ast.Expression,
+        /// `id(n) IN list` rather than `id(n) = value`.
+        list: bool,
+    };
+
+    /// Whether `expr` is `id(variable_name)`.
+    fn isIdOf(variable_name: []const u8, expr: *const ast.Expression) bool {
+        const call = switch (expr.*) {
+            .function_call => |call| call,
+            else => return false,
+        };
+        if (!std.ascii.eqlIgnoreCase(call.name, "id") or call.arguments.len != 1) return false;
+        return switch (call.arguments[0].*) {
+            .variable => |variable| std.mem.eql(u8, variable.name, variable_name),
+            else => false,
+        };
+    }
+
+    /// A conjunct of the WHERE that names the node by id: `id(n) = v`,
+    /// `v = id(n)` or `id(n) IN list`, with `v` and `list` not depending on
+    /// the row. The condition stays in the WHERE; this only picks the nodes
+    /// to look at.
+    fn findWhereIdSeek(variable_name: []const u8, expr: *const ast.Expression) ?IdSeek {
+        const binary = switch (expr.*) {
+            .binary => |binary| binary,
+            else => return null,
+        };
+        switch (binary.operator) {
+            .and_ => return findWhereIdSeek(variable_name, binary.left) orelse
+                findWhereIdSeek(variable_name, binary.right),
+            .eq => {
+                if (isIdOf(variable_name, binary.left) and isIndependentExpression(binary.right))
+                    return .{ .value = binary.right, .list = false };
+                if (isIdOf(variable_name, binary.right) and isIndependentExpression(binary.left))
+                    return .{ .value = binary.left, .list = false };
+                return null;
+            },
+            .in_ => {
+                if (isIdOf(variable_name, binary.left) and isIndependentExpression(binary.right))
+                    return .{ .value = binary.right, .list = true };
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     fn findWherePropertyIndex(
         self: *Self,
         variable_name: []const u8,
@@ -860,35 +2113,565 @@ pub const QueryPlanner = struct {
         };
     }
 
+    const RangeChoice = struct {
+        label_index: usize,
+        property: []const u8,
+        /// Empty for a read of the whole label in the property's order.
+        conditions: []const range_ops.Condition,
+        /// Read from the last value down.
+        descending: bool,
+        /// Return the range's nodes in id order (see `query_sorts`).
+        id_order: bool,
+    };
+
+    const RangeConjunct = struct {
+        property: []const u8,
+        condition: range_ops.Condition,
+    };
+
+    const MAX_RANGE_CONJUNCTS = 16;
+
+    /// Whether to read the node pattern's label through an ordered index, and
+    /// which conjuncts of the WHERE that answers.
+    ///
+    /// The rule, without statistics to go on: a range on an indexed property
+    /// is always read from the index, which reads only matching entries and
+    /// so is never much worse than the label scan and filter it replaces
+    /// (measured at 200,000 nodes, a range matching every node costs about the
+    /// same either way). Equality indexes win over ranges (planned before
+    /// this), and ranges over the ORDER BY: a range on the ORDER BY's property
+    /// is read in order; a range on another property is read as a range and
+    /// sorted. With no usable range, an ORDER BY on an indexed property with a
+    /// LIMIT reads the index in order and stops after the first k rows.
+    fn chooseRangeScan(
+        self: *Self,
+        variable_name: []const u8,
+        labels: []const []const u8,
+        where_hint: ?*const ast.Expression,
+        first_scan: bool,
+    ) PlannerError!?RangeChoice {
+        // Vector and full-text predicates plan their own access paths from
+        // the WHERE as written, and emit their rows nearest or best first,
+        // not in the index's order.
+        const searches = if (where_hint) |condition| hasSearchConjunct(condition) else false;
+        const search_branch = if (where_hint) |condition| hasSearchBranch(condition) else false;
+        var hint: ?OrderHint = null;
+        if (first_scan and !search_branch) {
+            if (self.order_hint) |h| {
+                if (std.mem.eql(u8, h.variable, variable_name)) hint = h;
+            }
+        }
+
+        var conjuncts: [MAX_RANGE_CONJUNCTS]RangeConjunct = undefined;
+        var count: usize = 0;
+        if (where_hint) |condition| {
+            if (!searches) collectRangeConjuncts(variable_name, condition, false, &conjuncts, &count);
+        }
+
+        var chosen_property: ?[]const u8 = null;
+        var chosen_label: usize = 0;
+        var ordered = false;
+        if (hint) |h| {
+            if (self.orderedIndexLabel(labels, h.property, false)) |label_idx| {
+                if (hasConjunctOn(conjuncts[0..count], h.property)) {
+                    chosen_property = h.property;
+                    chosen_label = label_idx;
+                    ordered = true;
+                }
+            }
+        }
+        if (chosen_property == null) {
+            for (conjuncts[0..count]) |conjunct| {
+                if (self.orderedIndexLabel(labels, conjunct.property, false)) |label_idx| {
+                    chosen_property = conjunct.property;
+                    chosen_label = label_idx;
+                    break;
+                }
+            }
+        }
+        if (chosen_property == null) {
+            // Every node with the label, nulls included: a dense index.
+            if (hint) |h| {
+                if (self.orderedIndexLabel(labels, h.property, true)) |label_idx| {
+                    chosen_property = h.property;
+                    chosen_label = label_idx;
+                    ordered = true;
+                }
+            }
+        }
+        const property = chosen_property orelse return null;
+
+        var conditions: std.ArrayList(range_ops.Condition) = .empty;
+        for (conjuncts[0..count]) |conjunct| {
+            if (!std.mem.eql(u8, conjunct.property, property)) continue;
+            conditions.append(self.allocator, conjunct.condition) catch return PlannerError.OutOfMemory;
+            self.consumed_conjuncts.append(self.allocator, conjunct.condition.predicate) catch return PlannerError.OutOfMemory;
+        }
+        if (ordered) {
+            self.order_cutoff_key = hint.?.sort_key;
+            self.order_hint = null;
+        }
+        return .{
+            .label_index = chosen_label,
+            .property = property,
+            .conditions = conditions.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
+            .descending = ordered and hint.?.descending,
+            .id_order = !ordered and self.query_sorts,
+        };
+    }
+
+    const EdgeRangeChoice = struct {
+        property: []const u8,
+        conditions: []const range_ops.Condition,
+    };
+
+    /// Whether a pattern that starts from a relationship type can read the
+    /// type's property index instead of walking every relationship: some
+    /// conjunct of the WHERE, or an entry of the relationship's inline map,
+    /// compares an indexed property with a value (`=`, `<`, `<=`, `>`,
+    /// `>=`, `STARTS WITH`). The conditions stay in the WHERE and the
+    /// inline map's filter, which check every row the index returns.
+    fn chooseEdgeRangeScan(
+        self: *Self,
+        edge_type: []const u8,
+        variable_name: ?[]const u8,
+        inline_properties: ?[]ast.PropertyEntry,
+        where_hint: ?*const ast.Expression,
+    ) PlannerError!?EdgeRangeChoice {
+        const database = self.storage.database orelse return null;
+        var conjuncts: [MAX_RANGE_CONJUNCTS]RangeConjunct = undefined;
+        var count: usize = 0;
+        if (inline_properties) |entries| {
+            for (entries) |entry| {
+                if (count == conjuncts.len or !isIndependentExpression(entry.value)) continue;
+                conjuncts[count] = .{ .property = entry.key, .condition = .{ .op = .eq, .value = entry.value, .predicate = entry.value } };
+                count += 1;
+            }
+        }
+        if (variable_name) |name| {
+            if (where_hint) |condition| {
+                if (!hasSearchConjunct(condition)) collectRangeConjuncts(name, condition, true, &conjuncts, &count);
+            }
+        }
+        const property = for (conjuncts[0..count]) |conjunct| {
+            const definition = (database.edgePropertyIndex(edge_type, conjunct.property) catch null) orelse continue;
+            if (definition.encoding.isOrdered()) break conjunct.property;
+        } else return null;
+
+        var conditions: std.ArrayList(range_ops.Condition) = .empty;
+        for (conjuncts[0..count]) |conjunct| {
+            if (!std.mem.eql(u8, conjunct.property, property)) continue;
+            conditions.append(self.allocator, conjunct.condition) catch return PlannerError.OutOfMemory;
+        }
+        return .{
+            .property = property,
+            .conditions = conditions.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
+        };
+    }
+
+    /// The first of `labels` with an ordered index on `property`, one that
+    /// also holds the nodes without the property when `dense`.
+    fn orderedIndexLabel(self: *Self, labels: []const []const u8, property: []const u8, dense: bool) ?usize {
+        const database = self.storage.database orelse return null;
+        for (labels, 0..) |label_name, label_idx| {
+            const definition = (database.nodePropertyIndex(label_name, property) catch null) orelse continue;
+            if (if (dense) definition.encoding == .ordered_dense else definition.encoding.isOrdered()) return label_idx;
+        }
+        return null;
+    }
+
+    fn hasConjunctOn(conjuncts: []const RangeConjunct, property: []const u8) bool {
+        for (conjuncts) |conjunct| {
+            if (std.mem.eql(u8, conjunct.property, property)) return true;
+        }
+        return false;
+    }
+
+    /// Whether a conjunct of `expr` is a vector or full-text predicate.
+    fn hasSearchConjunct(expr: *const ast.Expression) bool {
+        const binary = switch (expr.*) {
+            .binary => |binary| binary,
+            else => return false,
+        };
+        switch (binary.operator) {
+            .and_ => return hasSearchConjunct(binary.left) or hasSearchConjunct(binary.right),
+            .vector_distance, .fts_match => return true,
+            .lt, .lte => return binary.left.* == .binary and binary.left.binary.operator == .vector_distance,
+            else => return false,
+        }
+    }
+
+    /// Whether `expr` holds a vector or full-text predicate as a conjunct or
+    /// as a branch of an OR among its conjuncts. planWhere runs an OR of `@@`
+    /// predicates as one search beside the other conditions, and the search
+    /// emits its rows best first, so a scan below it cannot serve the sort.
+    fn hasSearchBranch(expr: *const ast.Expression) bool {
+        const binary = switch (expr.*) {
+            .binary => |binary| binary,
+            else => return false,
+        };
+        return switch (binary.operator) {
+            .and_, .or_ => hasSearchBranch(binary.left) or hasSearchBranch(binary.right),
+            else => hasSearchConjunct(expr),
+        };
+    }
+
+    /// The conjuncts of `expr` that compare a property of `variable_name`
+    /// with a value independent of the row: `<`, `<=`, `>`, `>=` either way
+    /// round, and `STARTS WITH`.
+    fn collectRangeConjuncts(
+        variable_name: []const u8,
+        expr: *const ast.Expression,
+        with_equality: bool,
+        out: *[MAX_RANGE_CONJUNCTS]RangeConjunct,
+        count: *usize,
+    ) void {
+        const binary = switch (expr.*) {
+            .binary => |binary| binary,
+            else => return,
+        };
+        if (binary.operator == .and_) {
+            collectRangeConjuncts(variable_name, binary.left, with_equality, out, count);
+            collectRangeConjuncts(variable_name, binary.right, with_equality, out, count);
+            return;
+        }
+        if (count.* == out.len) return;
+        const op: range_ops.RangeOp, const flipped: range_ops.RangeOp = switch (binary.operator) {
+            .lt => .{ .lt, .gt },
+            .lte => .{ .lte, .gte },
+            .gt => .{ .gt, .lt },
+            .gte => .{ .gte, .lte },
+            .starts_with => .{ .starts_with, .starts_with },
+            .eq => if (with_equality) .{ .eq, .eq } else return,
+            else => return,
+        };
+        if (propertyEqualityForVariable(variable_name, binary.left, binary.right)) |found| {
+            out[count.*] = .{ .property = found.name, .condition = .{ .op = op, .value = found.value, .predicate = expr } };
+            count.* += 1;
+        } else if (op != .starts_with) {
+            if (propertyEqualityForVariable(variable_name, binary.right, binary.left)) |found| {
+                out[count.*] = .{ .property = found.name, .condition = .{ .op = flipped, .value = found.value, .predicate = expr } };
+                count.* += 1;
+            }
+        }
+    }
+
+    /// `expr` without the conjuncts a scan below answers, or null when
+    /// nothing is left.
+    fn residualCondition(self: *Self, expr: *const ast.Expression) PlannerError!?*const ast.Expression {
+        for (self.consumed_conjuncts.items) |consumed| {
+            if (consumed == expr) return null;
+        }
+        const binary = switch (expr.*) {
+            .binary => |binary| binary,
+            else => return expr,
+        };
+        if (binary.operator != .and_) return expr;
+        const left = try self.residualCondition(binary.left);
+        const right = try self.residualCondition(binary.right);
+        const l = left orelse return right;
+        const r = right orelse return l;
+        if (l == binary.left and r == binary.right) return expr;
+        const narrowed = self.allocator.create(ast.BinaryExpr) catch return PlannerError.OutOfMemory;
+        narrowed.* = .{ .left = @constCast(l), .operator = .and_, .right = @constCast(r), .location = binary.location };
+        const result = self.allocator.create(ast.Expression) catch return PlannerError.OutOfMemory;
+        result.* = .{ .binary = narrowed };
+        return result;
+    }
+
+    fn hasOrderBy(clauses: []const ast.Clause) bool {
+        for (clauses) |clause| {
+            if (clause == .order_by) return true;
+        }
+        return false;
+    }
+
+    /// The ORDER BY a query's first scan could serve in order: a single
+    /// MATCH pattern, an optional WHERE, then a RETURN that neither
+    /// aggregates nor deduplicates, sorted first by a property of a
+    /// variable, either way, with a LIMIT.
+    fn orderHintFor(clauses: []const ast.Clause) ?OrderHint {
+        if (clauses.len < 3) return null;
+        const match = switch (clauses[0]) {
+            .match => |m| m,
+            else => return null,
+        };
+        if (match.patterns.len != 1) return null;
+        // OPTIONAL MATCH plans its pattern over an argument row, never as
+        // the query's first scan, and pads a miss with nulls; keep its order
+        // out of the scan's hands rather than rely on that.
+        if (match.optional) return null;
+        var i: usize = 1;
+        if (std.meta.activeTag(clauses[i]) == .where) i += 1;
+        if (i + 1 >= clauses.len) return null;
+        const ret = switch (clauses[i]) {
+            .return_ => |r| r,
+            else => return null,
+        };
+        if (ret.distinct or returnAggregates(ret)) return null;
+        const order = switch (clauses[i + 1]) {
+            .order_by => |o| o,
+            else => return null,
+        };
+        if (order.items.len == 0) return null;
+        // The index holds nulls where ORDER BY puts them by default: last
+        // ascending, first descending. NULLS FIRST or LAST that says
+        // otherwise would need them read out of turn.
+        if (order.items[0].nulls) |nulls| {
+            if ((nulls == .first) != order.items[0].descending) return null;
+        }
+        var limited = false;
+        for (clauses[i + 2 ..]) |clause| {
+            switch (clause) {
+                .limit => limited = true,
+                .skip => {},
+                else => break,
+            }
+        }
+        if (!limited) return null;
+        const key = resolveOrderAlias(order.items[0].expression, ret);
+        const access = switch (key.*) {
+            .property_access => |access| access,
+            else => return null,
+        };
+        const variable = switch (access.object.*) {
+            .variable => |variable| variable,
+            else => return null,
+        };
+        return .{ .variable = variable.name, .property = access.property, .sort_key = key, .descending = order.items[0].descending };
+    }
+
+    /// The input, under a cutoff when a scan below reads in the sort's order.
+    fn orderedCutoff(self: *Self, input: ?Operator, following: []const ast.Clause) PlannerError!?Operator {
+        const key = self.order_cutoff_key orelse return input;
+        self.order_cutoff_key = null;
+        const input_op = input orelse return input;
+        const cutoff = range_ops.OrderedCutoff.init(self.allocator, input_op, key, try self.sortBounds(following)) catch {
+            return PlannerError.OutOfMemory;
+        };
+        return cutoff.operator();
+    }
+
     /// Plan a WHERE clause
     /// Detects vector distance (<=>)  and FTS match (@@) operators and creates
     /// specialized search operators for them instead of generic filters.
-    fn planWhere(self: *Self, where: *const ast.WhereClause, input: ?Operator) PlannerError!Operator {
+    fn planWhere(
+        self: *Self,
+        where: *const ast.WhereClause,
+        input: ?Operator,
+        limit_hint: VectorLimitHint,
+    ) PlannerError!Operator {
         const input_op = input orelse return PlannerError.InvalidQuery;
+        // A seek answers only the WHERE of its own MATCH, planned next.
+        defer self.fts_seek_mask = 0;
+
+        // What an index range scan below already answers is left out.
+        var condition: *const ast.Expression = where.condition;
+        if (self.consumed_conjuncts.items.len > 0) {
+            const residual = try self.residualCondition(where.condition);
+            self.consumed_conjuncts.clearRetainingCapacity();
+            condition = residual orelse return input_op;
+        }
 
         // Check for vector search pattern: x.embedding <=> $query [< threshold]
-        if (self.detectVectorSearch(where.condition)) |vector_info| {
-            return self.planVectorSearch(input_op, vector_info);
+        if (self.detectVectorSearch(condition)) |vector_info| {
+            // An ORDER BY keeps the LIMIT bounding the search only when it
+            // sorts nearest first by this search's own distance, the order
+            // the search already returns its results in.
+            var hint = limit_hint;
+            if (hint.order) |order| {
+                if (!self.orderFollowsSearch(order, hint.ret, vector_info)) hint = .{};
+            }
+            return self.planVectorSearch(input_op, vector_info, hint);
         }
 
         // Check for FTS pattern: x.text @@ $query, or a disjunction of them
-        if (self.detectFtsSearch(where.condition)) |fts_info| {
+        if (self.detectFtsSearch(condition)) |fts_info| {
+            // The MATCH already seeks this very search for the variable, and
+            // every row it gives matches: searching again filters nothing
+            // out. It used to run the whole search a second time.
+            if (self.seekAnswers(fts_info)) {
+                self.boundSeek(input_op, fts_info, limit_hint);
+                return input_op;
+            }
             return self.planFtsSearch(input_op, &[_]FtsSearchInfo{fts_info});
         }
         {
             var disjuncts: [MAX_FTS_DISJUNCTS]FtsSearchInfo = undefined;
             var count: usize = 0;
-            if (self.collectFtsDisjuncts(where.condition, &disjuncts, &count) and count > 1) {
+            if (self.collectFtsDisjuncts(condition, &disjuncts, &count) and count > 1) {
                 return self.planFtsSearch(input_op, disjuncts[0..count]);
             }
         }
 
+        // An OR of searches beside other conditions runs as that search, so
+        // it scores what it matches, and the rest filters its rows. As a
+        // filter alone it matched the same rows but left score() null,
+        // unless an index range scan had taken the other conditions.
+        if (condition.* == .binary and condition.binary.operator == .and_) {
+            var disjuncts: [MAX_FTS_DISJUNCTS]FtsSearchInfo = undefined;
+            if (self.ftsDisjunctionConjunct(condition, &disjuncts)) |found| {
+                const search = try self.planFtsSearch(input_op, disjuncts[0..found.count]);
+                std.debug.assert(self.consumed_conjuncts.items.len == 0);
+                self.consumed_conjuncts.append(self.allocator, found.conjunct) catch return PlannerError.OutOfMemory;
+                const rest = try self.residualCondition(condition);
+                self.consumed_conjuncts.clearRetainingCapacity();
+                const filter = filter_ops.Filter.init(self.allocator, search, rest.?) catch {
+                    return PlannerError.OutOfMemory;
+                };
+                return filter.operator();
+            }
+        }
+
         // Default: create a filter operator
-        const filter = filter_ops.Filter.init(self.allocator, input_op, where.condition) catch {
+        try self.refuseBareDistance(condition, "this MATCH");
+        const filter = filter_ops.Filter.init(self.allocator, input_op, condition) catch {
             return PlannerError.OutOfMemory;
         };
 
         return filter.operator();
+    }
+
+    /// A WHERE that is a bare `x <=> q` is a search only where planWhere
+    /// plans it as one: the whole WHERE of a MATCH, over a property and a
+    /// vector. As a row filter it would be a distance read as true or false,
+    /// passing every row but an exact match, in no order; it is refused.
+    fn refuseBareDistance(self: *Self, condition: *const ast.Expression, comptime where_written: []const u8) PlannerError!void {
+        if (condition.* != .binary or condition.binary.operator != .vector_distance) return;
+        self.setPlanDetail("A WHERE of only `<=>` ranks the rows of a MATCH by distance, which " ++ where_written ++ " cannot do; give it a bound instead, as in `WHERE n.embedding <=> $q < 0.5`", .{});
+        return PlannerError.InvalidQuery;
+    }
+
+    /// Whether the index seek planned for the predicate's variable runs the
+    /// same search as the predicate: same index, same query text or
+    /// parameter.
+    fn seekAnswers(self: *Self, info: FtsSearchInfo) bool {
+        const slot = info.variable_slot orelse return false;
+        if (self.fts_seek_mask & (@as(u16, 1) << @intCast(slot)) == 0) return false;
+        const seek = self.fts_seeks[slot];
+        if (seek.kind != .node) return false;
+        const property = info.property_name orelse return false;
+        if (!std.mem.eql(u8, seek.property, property)) return false;
+        if (!optionalEql(seek.param_name, info.param_name)) return false;
+        if (!optionalEql(seek.literal_query, info.query_text)) return false;
+        // The index the predicate means, resolved the way planFtsSearch
+        // would; the seek's is the one its pattern's labels name.
+        const resolved = self.resolveFtsIndex(info) catch return false;
+        return resolved.kind == seek.kind and std.mem.eql(u8, resolved.scope, seek.scope);
+    }
+
+    /// Let the RETURN's LIMIT bound the seek that answers the WHERE, when
+    /// its rows reach the LIMIT one for one (nothing between the seek and
+    /// the WHERE) and in the seek's order: no ORDER BY, or `score(x)`
+    /// descending for the seek's variable. The seek then keeps the best
+    /// SKIP + LIMIT matches (an exact top k) instead of every match.
+    fn boundSeek(self: *Self, input_op: Operator, info: FtsSearchInfo, hint: VectorLimitHint) void {
+        const slot = info.variable_slot orelse return;
+        const seek = self.fts_seek_ops[slot];
+        // A named path over the seek passes its rows on one for one.
+        const below = if (path_ops.BindPath.of(input_op)) |bind| bind.input else input_op;
+        if (below.ptr != @as(*anyopaque, @ptrCast(seek))) return;
+        const limit = hint.limit orelse return;
+        if (hint.order) |order| {
+            if (!self.orderFollowsScore(order, hint.ret, slot)) return;
+        }
+        seek.bound = .{ .limit = limit, .skip = hint.skip };
+        self.fts_bounded_seeks += 1;
+    }
+
+    /// Whether `order` is one descending `score(x)` for the variable in
+    /// `slot`, or the alias of a RETURN item that is.
+    fn orderFollowsScore(self: *Self, order: *const ast.OrderByClause, ret: ?*const ast.ReturnClause, slot: u8) bool {
+        if (order.items.len != 1 or !order.items[0].descending) return false;
+        var expr = order.items[0].expression;
+        if (expr.* == .variable) {
+            const r = ret orelse return false;
+            const name = expr.variable.name;
+            expr = for (r.items) |item| {
+                if (item.alias) |alias| {
+                    if (std.mem.eql(u8, alias, name)) break item.expression;
+                }
+            } else return false;
+        }
+        if (expr.* != .function_call) return false;
+        const call = expr.function_call;
+        if (!std.ascii.eqlIgnoreCase(call.name, "score") or call.arguments.len != 1) return false;
+        const arg = call.arguments[0];
+        if (arg.* != .variable) return false;
+        return self.getSlot(arg.variable.name) == slot;
+    }
+
+    fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    /// The LIMIT and SKIP that bound a vector predicate's answer.
+    const VectorLimitHint = struct {
+        limit: ?*const ast.Expression = null,
+        skip: ?*const ast.Expression = null,
+        /// The ORDER BY between the RETURN and the LIMIT, which the hint
+        /// holds only if it sorts by the search's distance.
+        order: ?*const ast.OrderByClause = null,
+        ret: ?*const ast.ReturnClause = null,
+    };
+
+    /// The LIMIT (and SKIP) of the RETURN that follows a WHERE, when the rows
+    /// the WHERE produces reach that LIMIT in order and one for one: a
+    /// RETURN that neither aggregates nor deduplicates. An ORDER BY is
+    /// passed along for planWhere to check against the search. Anything
+    /// else between them could drop or reorder rows, so no hint.
+    fn vectorLimitHint(rest: []const ast.Clause) VectorLimitHint {
+        if (rest.len == 0) return .{};
+        const ret = switch (rest[0]) {
+            .return_ => |r| r,
+            else => return .{},
+        };
+        if (ret.distinct or returnAggregates(ret)) return .{};
+        var hint = VectorLimitHint{ .ret = ret };
+        for (rest[1..]) |clause| {
+            switch (clause) {
+                .skip => |s| hint.skip = s.count,
+                .limit => |l| hint.limit = l.count,
+                .order_by => |o| hint.order = o,
+                else => break,
+            }
+        }
+        if (hint.limit == null) return .{};
+        return hint;
+    }
+
+    /// Whether `order` sorts nearest first by the distance the search in
+    /// `info` measures: one ascending item that is `x.prop <=> query` for the
+    /// search's variable, property and query, or the alias of a RETURN item
+    /// that is.
+    fn orderFollowsSearch(
+        self: *Self,
+        order: *const ast.OrderByClause,
+        ret: ?*const ast.ReturnClause,
+        info: VectorSearchInfo,
+    ) bool {
+        if (order.items.len != 1 or order.items[0].descending) return false;
+        var expr = order.items[0].expression;
+        if (expr.* == .variable) {
+            const r = ret orelse return false;
+            const name = expr.variable.name;
+            expr = for (r.items) |item| {
+                if (item.alias) |alias| {
+                    if (std.mem.eql(u8, alias, name)) break item.expression;
+                }
+            } else return false;
+        }
+        if (expr.* != .binary or expr.binary.operator != .vector_distance) return false;
+        const same = self.extractVectorInfo(expr.binary.*) orelse return false;
+        if (same.variable_slot != info.variable_slot) return false;
+        if (!std.mem.eql(u8, same.property_name orelse return false, info.property_name orelse return false)) return false;
+        if (info.param_name) |name| {
+            return same.param_name != null and std.mem.eql(u8, same.param_name.?, name);
+        }
+        const want = info.query_vector orelse return false;
+        const got = same.query_vector orelse return false;
+        return std.mem.eql(f32, want, got);
     }
 
     /// Information extracted from a vector search pattern
@@ -899,8 +2682,8 @@ pub const QueryPlanner = struct {
         param_name: ?[]const u8,
         /// Literal query vector (if provided directly)
         query_vector: ?[]const f32,
-        /// Distance threshold (e.g., 0.5 from < 0.5)
-        threshold: ?f32,
+        /// Distance threshold (e.g., 0.5 from < 0.5, or $t)
+        threshold: ?vector_ops.VectorSearchWithInput.Threshold,
         /// The property being searched
         property_name: ?[]const u8,
     };
@@ -918,14 +2701,19 @@ pub const QueryPlanner = struct {
                     const inner = binary.left.binary;
                     if (inner.operator == .vector_distance) {
                         var info = self.extractVectorInfo(inner.*) orelse return null;
-                        // Extract threshold from right side
-                        if (binary.right.* == .literal) {
-                            const lit = binary.right.literal;
-                            if (lit.value == .float) {
-                                info.threshold = @floatCast(lit.value.float);
-                            } else if (lit.value == .integer) {
-                                info.threshold = @floatFromInt(lit.value.integer);
-                            }
+                        const inclusive = binary.operator == .lte;
+                        // The threshold has to be a number or a parameter.
+                        // Anything else is left to the filter, which evaluates
+                        // the comparison exactly; ignoring it here returned
+                        // rows regardless of the bound.
+                        switch (binary.right.*) {
+                            .literal => |lit| switch (lit.value) {
+                                .float => |f| info.threshold = .{ .value = .{ .literal = @floatCast(f) }, .inclusive = inclusive },
+                                .integer => |i| info.threshold = .{ .value = .{ .literal = @floatFromInt(i) }, .inclusive = inclusive },
+                                else => return null,
+                            },
+                            .parameter => |p| info.threshold = .{ .value = .{ .parameter = p.name }, .inclusive = inclusive },
+                            else => return null,
                         }
                         return info;
                     }
@@ -979,21 +2767,37 @@ pub const QueryPlanner = struct {
     }
 
     /// Plan a vector search operator
-    fn planVectorSearch(self: *Self, input: Operator, info: VectorSearchInfo) PlannerError!Operator {
-        _ = self.storage.hnsw_index orelse return PlannerError.MissingStorage;
+    fn planVectorSearch(self: *Self, input: Operator, info: VectorSearchInfo, limit_hint: VectorLimitHint) PlannerError!Operator {
+        // Up to 0.18.0 this was the generic "could not create execution plan".
+        if (self.storage.hnsw_index == null) {
+            self.setPlanDetail(
+                "This database was created without a vector index, so `WHERE ... <=> ...` has no index to search. " ++
+                    "Open it with vectors enabled and vector dimensions set to add one.",
+                .{},
+            );
+            return PlannerError.MissingVectorIndex;
+        }
         const database = self.storage.database orelse return PlannerError.MissingStorage;
 
         const output_slot = info.variable_slot orelse return PlannerError.InvalidQuery;
+        self.vector_queries.set(output_slot, .{
+            .property = info.property_name orelse return PlannerError.InvalidQuery,
+            .param_name = info.param_name,
+            .literal = info.query_vector,
+        });
 
-        const k: u32 = 100; // Default k for search
+        const bound = vector_ops.VectorSearchWithInput.Bound{
+            .threshold = info.threshold,
+            .limit = limit_hint.limit,
+            .skip = limit_hint.skip,
+        };
         const vector_search = if (info.query_vector) |query_vector|
             vector_ops.VectorSearchWithInput.initWithLiteral(
                 self.allocator,
                 input,
                 output_slot,
                 query_vector,
-                k,
-                info.threshold,
+                bound,
                 database,
             ) catch return PlannerError.OutOfMemory
         else blk: {
@@ -1003,8 +2807,7 @@ pub const QueryPlanner = struct {
                 input,
                 output_slot,
                 param_name,
-                k,
-                info.threshold,
+                bound,
                 database,
             ) catch return PlannerError.OutOfMemory;
         };
@@ -1101,6 +2904,25 @@ pub const QueryPlanner = struct {
         out[count.*] = info;
         count.* += 1;
         return true;
+    }
+
+    /// The first conjunct of `expr`, an AND, that is an OR of `@@`
+    /// predicates `collectFtsDisjuncts` can plan as one search, with the
+    /// searches in `out`.
+    fn ftsDisjunctionConjunct(
+        self: *Self,
+        expr: *const ast.Expression,
+        out: *[MAX_FTS_DISJUNCTS]FtsSearchInfo,
+    ) ?struct { conjunct: *const ast.Expression, count: usize } {
+        if (expr.* != .binary) return null;
+        const binary = expr.binary;
+        if (binary.operator == .and_) {
+            return self.ftsDisjunctionConjunct(binary.left, out) orelse self.ftsDisjunctionConjunct(binary.right, out);
+        }
+        if (binary.operator != .or_) return null;
+        var count: usize = 0;
+        if (!self.collectFtsDisjuncts(expr, out, &count) or count < 2) return null;
+        return .{ .conjunct = expr, .count = count };
     }
 
     /// Extract FTS search info from a binary expression with fts_match operator
@@ -1235,7 +3057,10 @@ pub const QueryPlanner = struct {
         // either. Mixing them would need two scans joined, which is a different
         // shape than this.
         for (searches[1..]) |search| {
-            if (search.kind != searches[0].kind) return PlannerError.InvalidQuery;
+            if (search.kind != searches[0].kind) {
+                self.setPlanDetail("An OR of @@ predicates must search only nodes or only relationships", .{});
+                return PlannerError.InvalidQuery;
+            }
         }
 
         const fts_search = fts_ops.FtsSearchWithInput.init(
@@ -1248,6 +3073,7 @@ pub const QueryPlanner = struct {
         ) catch {
             return PlannerError.OutOfMemory;
         };
+        self.fts_filter_count += 1;
 
         return fts_search.operator();
     }
@@ -1255,6 +3081,7 @@ pub const QueryPlanner = struct {
     /// Plan a RETURN clause
     fn planReturn(self: *Self, ret: *const ast.ReturnClause, input: ?Operator) PlannerError!Operator {
         const input_op = input orelse return PlannerError.InvalidQuery;
+        try self.checkProjectionWidth("RETURN", ret.items.len);
 
         // Check if any RETURN items contain aggregate functions
         var has_aggregates = false;
@@ -1289,8 +3116,7 @@ pub const QueryPlanner = struct {
                 .expr = item.expression,
                 .output_slot = @intCast(i),
             };
-            self.output_column_names[i] = item.alias orelse
-                self.columnNameForExpression(item.expression);
+            self.output_column_names[i] = columnName(self, item);
         }
 
         const project = project_ops.Project.init(self.allocator, input_op, items) catch {
@@ -1305,6 +3131,37 @@ pub const QueryPlanner = struct {
             result_op = distinct.operator();
         }
         return result_op;
+    }
+
+    /// Refuse a RETURN or WITH with more items than a row has slots.
+    ///
+    /// A projection writes item i to slot i of its output row, and a row has
+    /// `MAX_SLOTS` slots. Nothing checked the count, so a wider projection
+    /// wrote past the end of the row: a panic in a debug build and undefined
+    /// behaviour in a release one.
+    fn checkProjectionWidth(self: *Self, clause_name: []const u8, item_count: usize) PlannerError!void {
+        if (item_count <= MAX_SLOTS) return;
+        self.setPlanDetail(
+            "{s} has {d} items, but at most {d} are supported.",
+            .{ clause_name, item_count, MAX_SLOTS },
+        );
+        return PlannerError.TooManyVariables;
+    }
+
+    /// Name a RETURN item's result column.
+    ///
+    /// An alias wins. Otherwise the column is named after the expression,
+    /// falling back to the expression's text as written. A column must never
+    /// be left unnamed here, because the caller would then name it after
+    /// whichever variable happens to share its slot.
+    fn columnName(self: *Self, item: ast.ReturnItem) ?[]const u8 {
+        if (item.alias) |alias| return alias;
+        // A quoted name keeps its backticks in the column, as written:
+        // `n.my prop` would read as something else.
+        if (std.mem.indexOfScalar(u8, item.text, '`') != null) return item.text;
+        if (self.columnNameForExpression(item.expression)) |name| return name;
+        if (item.text.len > 0) return item.text;
+        return null;
     }
 
     /// Name an unaliased RETURN item after the expression it projects.
@@ -1330,12 +3187,15 @@ pub const QueryPlanner = struct {
                 ) catch null;
             },
             .function_call => |call| blk: {
-                if (call.arguments.len != 1) break :blk call.name;
-                const arg = self.columnNameForExpression(call.arguments[0]) orelse break :blk call.name;
+                if (call.star) {
+                    break :blk std.fmt.allocPrint(self.allocator, "{s}(*)", .{call.name}) catch null;
+                }
+                if (call.arguments.len != 1) break :blk null;
+                const arg = self.columnNameForExpression(call.arguments[0]) orelse break :blk null;
                 break :blk std.fmt.allocPrint(
                     self.allocator,
-                    "{s}({s})",
-                    .{ call.name, arg },
+                    "{s}({s}{s})",
+                    .{ call.name, if (call.distinct) "DISTINCT " else "", arg },
                 ) catch null;
             },
             else => null,
@@ -1344,6 +3204,23 @@ pub const QueryPlanner = struct {
 
     /// Plan a RETURN clause with aggregations
     fn planAggregateReturn(self: *Self, ret: *const ast.ReturnClause, input_op: Operator) PlannerError!Operator {
+        return self.planAggregateReturnInto(ret, input_op, null);
+    }
+
+    /// Plan an aggregating projection whose item i goes to `slots[i]`, or to
+    /// slot i when `slots` is null.
+    fn planAggregateReturnInto(
+        self: *Self,
+        ret: *const ast.ReturnClause,
+        input_op: Operator,
+        slots: ?[]const u8,
+    ) PlannerError!Operator {
+        for (ret.items) |item| {
+            if (self.needsAggregateProjection(item.expression)) {
+                return self.planAggregateProjection(ret, input_op, slots);
+            }
+        }
+
         self.output_columns = @intCast(ret.items.len);
 
         // Separate items into grouping keys and aggregates
@@ -1358,9 +3235,8 @@ pub const QueryPlanner = struct {
         defer proj_items.deinit(self.allocator);
 
         for (ret.items, 0..) |item, i| {
-            const slot: u8 = @intCast(i);
-            self.output_column_names[i] = item.alias orelse
-                self.columnNameForExpression(item.expression);
+            const slot: u8 = if (slots) |given| given[i] else @intCast(i);
+            self.output_column_names[i] = columnName(self, item);
 
             if (self.isDirectAggregate(item.expression)) |agg_info| {
                 // Direct aggregate function call: count(n), sum(n.val), etc.
@@ -1420,6 +3296,212 @@ pub const QueryPlanner = struct {
         return aggregate.operator();
     }
 
+    /// Whether a projection item needs aggregates computed first and an
+    /// expression evaluated over them afterwards: `count(n) + 1`, an
+    /// aggregate inside CASE, or an aggregate nested in another (which is
+    /// refused there).
+    fn needsAggregateProjection(self: *Self, expr: *const ast.Expression) bool {
+        if (!aggregate_ops.containsAggregate(expr)) return false;
+        const direct = self.isDirectAggregate(expr) orelse return true;
+        const arg = direct.arg orelse return false;
+        return aggregate_ops.containsAggregate(arg);
+    }
+
+    /// One aggregate call of an aggregating projection and the slot of the
+    /// aggregate's output row that holds its value.
+    const AggregateCall = struct {
+        expr: *const ast.Expression,
+        slot: u8,
+    };
+
+    /// Replaces aggregate calls and grouping keys inside a projection item
+    /// with the slots that hold their values after aggregation.
+    const AggregateRewrite = struct {
+        planner: *QueryPlanner,
+        calls: *std.ArrayList(AggregateCall),
+        keys: *std.ArrayList(aggregate_ops.GroupKey),
+        aggs: *std.ArrayList(aggregate_ops.AggregateItem),
+        /// Slots of the aggregate's output row already taken.
+        used: *u16,
+        clause_name: []const u8,
+
+        pub fn replace(self: *AggregateRewrite, e: *ast.Expression) ast_util.RewriteError!?*ast.Expression {
+            for (self.keys.items) |key| {
+                if (ast_util.expressionsEqual(key.expr, e)) return try self.planner.aggregateSlotVariable(key.output_slot);
+            }
+            // A subquery beside an aggregate, `count(m) + COUNT { (n)-->() }`,
+            // reads only grouping keys, so its value is one per group: it is
+            // computed before grouping, as one more key.
+            if (e.* == .subquery) {
+                const Ignore = struct {
+                    rewrite: *AggregateRewrite,
+                    pub fn skip(ig: @This(), name: []const u8) bool {
+                        for (ig.rewrite.keys.items) |key| {
+                            if (key.expr.* == .variable and std.mem.eql(u8, key.expr.variable.name, name)) return true;
+                        }
+                        // Bound inside the subquery, not around it.
+                        return !ig.rewrite.planner.bindings.contains(name);
+                    }
+                };
+                if (ast_util.firstFreeVariableWith(e, Ignore{ .rewrite = self })) |name| {
+                    self.planner.setPlanDetail(
+                        "{s} uses `{s}` in {s} beside an aggregate, but `{s}` is not a grouping key; return it as an item of its own",
+                        .{ self.clause_name, name, e.subquery.name(), name },
+                    );
+                    return error.Refused;
+                }
+                const slot = try self.freeSlot();
+                try self.keys.append(self.planner.allocator, .{ .expr = e, .output_slot = slot });
+                return try self.planner.aggregateSlotVariable(slot);
+            }
+            const call = switch (e.*) {
+                .function_call => |f| f,
+                else => return null,
+            };
+            if (!aggregate_ops.isAggregateFunction(call.name)) return null;
+            for (self.calls.items) |known| {
+                if (ast_util.expressionsEqual(known.expr, e)) return try self.planner.aggregateSlotVariable(known.slot);
+            }
+            const info = self.planner.isDirectAggregate(e) orelse {
+                self.planner.setPlanDetail("{s}() takes one argument", .{call.name});
+                return error.Refused;
+            };
+            if (info.arg) |arg| {
+                if (aggregate_ops.containsAggregate(arg)) {
+                    self.planner.setPlanDetail("{s}() cannot take an aggregate as its argument; aggregates do not nest", .{call.name});
+                    return error.Refused;
+                }
+            }
+            const slot = try self.freeSlot();
+            try self.aggs.append(self.planner.allocator, .{
+                .func = info.func,
+                .expr = info.arg,
+                .output_slot = slot,
+                .distinct = info.distinct,
+            });
+            try self.calls.append(self.planner.allocator, .{ .expr = e, .slot = slot });
+            return try self.planner.aggregateSlotVariable(slot);
+        }
+
+        /// A slot of the aggregate's output row no key or aggregate holds.
+        fn freeSlot(self: *AggregateRewrite) ast_util.RewriteError!u8 {
+            const free = all_slots & ~self.used.*;
+            if (free == 0) {
+                self.planner.setPlanDetail(
+                    "{s} needs more than {d} values for its grouping keys and aggregates; a row holds {d}",
+                    .{ self.clause_name, MAX_SLOTS, MAX_SLOTS },
+                );
+                return error.Refused;
+            }
+            const slot: u8 = @ctz(free);
+            self.used.* |= slotBit(slot);
+            return slot;
+        }
+    };
+
+    /// The aggregate-slot variables the rewrite put in, which are not free.
+    fn isAggregateSlotName(name: []const u8) bool {
+        return std.mem.startsWith(u8, name, AGGREGATE_SLOT_PREFIX);
+    }
+
+    const AGGREGATE_SLOT_PREFIX = "  aggregate slot ";
+
+    /// A reference to slot `slot` of an aggregate's output row, by a name
+    /// no query can spell (it starts with spaces), registered for execution.
+    fn aggregateSlotVariable(self: *Self, slot: u8) error{OutOfMemory}!*ast.Expression {
+        const name = std.fmt.allocPrint(self.allocator, AGGREGATE_SLOT_PREFIX ++ "{d}", .{slot}) catch return error.OutOfMemory;
+        self.outer_bindings.put(name, .{ .name = name, .slot = slot, .kind = .alias }) catch return error.OutOfMemory;
+        const expr = self.allocator.create(ast.Expression) catch return error.OutOfMemory;
+        expr.* = .{ .variable = .{ .name = name, .location = .{ .line = 0, .column = 0 } } };
+        return expr;
+    }
+
+    /// Plan a projection whose items are expressions over aggregates, such
+    /// as `count(n) + 1`, `sum(n.x) / count(n)` or an aggregate inside CASE.
+    ///
+    /// The aggregation is planned over the distinct aggregate calls found in
+    /// the items, each written to a slot of the aggregate's output row, and
+    /// grouped by the items that contain no aggregate. A projection then
+    /// evaluates each item over that row, with every aggregate call and every
+    /// grouping key replaced by the slot holding its value. Anything else an
+    /// item uses outside an aggregate would have no value after grouping, so
+    /// it is refused, as openCypher refuses it.
+    fn planAggregateProjection(
+        self: *Self,
+        ret: *const ast.ReturnClause,
+        input_op: Operator,
+        slots: ?[]const u8,
+    ) PlannerError!Operator {
+        const items = ret.items;
+        const clause_name: []const u8 = if (slots == null) "RETURN" else "WITH";
+        self.output_columns = @intCast(items.len);
+
+        var keys: std.ArrayList(aggregate_ops.GroupKey) = .empty;
+        var aggs: std.ArrayList(aggregate_ops.AggregateItem) = .empty;
+        var calls: std.ArrayList(AggregateCall) = .empty;
+        var used: u16 = 0;
+
+        // Grouping keys and plain aggregate items keep their output slots.
+        for (items, 0..) |item, i| {
+            const slot: u8 = if (slots) |given| given[i] else @intCast(i);
+            self.output_column_names[i] = columnName(self, item);
+            if (!aggregate_ops.containsAggregate(item.expression)) {
+                keys.append(self.allocator, .{ .expr = item.expression, .output_slot = slot }) catch return PlannerError.OutOfMemory;
+                used |= slotBit(slot);
+            } else if (!self.needsAggregateProjection(item.expression)) {
+                const info = self.isDirectAggregate(item.expression).?;
+                aggs.append(self.allocator, .{
+                    .func = info.func,
+                    .expr = info.arg,
+                    .output_slot = slot,
+                    .distinct = info.distinct,
+                }) catch return PlannerError.OutOfMemory;
+                calls.append(self.allocator, .{ .expr = item.expression, .slot = slot }) catch return PlannerError.OutOfMemory;
+                used |= slotBit(slot);
+            }
+        }
+
+        var rewriter = AggregateRewrite{
+            .planner = self,
+            .calls = &calls,
+            .keys = &keys,
+            .aggs = &aggs,
+            .used = &used,
+            .clause_name = clause_name,
+        };
+        const project_items = self.allocator.alloc(project_ops.ProjectItem, items.len) catch return PlannerError.OutOfMemory;
+        for (items, project_items, 0..) |item, *project_item, i| {
+            const slot: u8 = if (slots) |given| given[i] else @intCast(i);
+            const expr = if (self.needsAggregateProjection(item.expression))
+                ast_util.rewrite(self.allocator, item.expression, &rewriter) catch |err| return switch (err) {
+                    error.OutOfMemory => PlannerError.OutOfMemory,
+                    error.Refused => PlannerError.InvalidQuery,
+                }
+            else
+                self.aggregateSlotVariable(slot) catch return PlannerError.OutOfMemory;
+
+            if (ast_util.firstFreeVariable(expr, &isAggregateSlotName)) |name| {
+                self.setPlanDetail(
+                    "{s} item `{s}` uses `{s}` outside an aggregate, but `{s}` is not a grouping key; return it as an item of its own or aggregate it",
+                    .{ clause_name, item.text, name, name },
+                );
+                return PlannerError.InvalidQuery;
+            }
+            project_item.* = .{ .expr = expr, .output_slot = slot };
+        }
+
+        const aggregate = aggregate_ops.Aggregate.init(
+            self.allocator,
+            input_op,
+            keys.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
+            aggs.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
+        ) catch return PlannerError.OutOfMemory;
+        const project = project_ops.Project.init(self.allocator, aggregate.operator(), project_items) catch {
+            return PlannerError.OutOfMemory;
+        };
+        return project.operator();
+    }
+
     /// Check if an expression is a direct aggregate function call (e.g., count(n), sum(n.val))
     /// Returns the aggregate function type, argument, and distinct flag if so
     fn isDirectAggregate(self: *Self, expr: *const ast.Expression) ?struct { func: aggregate_ops.AggregateFunc, arg: ?*const ast.Expression, distinct: bool } {
@@ -1461,6 +3543,27 @@ pub const QueryPlanner = struct {
             if (std.mem.eql(u8, alias, name)) return item.expression;
         }
         return expr;
+    }
+
+    /// Substitute, in an ORDER BY item that runs before projection, each
+    /// RETURN alias it uses with the expression the alias stands for:
+    /// `ORDER BY toUpper(nm)` after `RETURN n.name AS nm`.
+    fn substituteOrderAliases(self: *Self, expr: *ast.Expression, ret: ?*const ast.ReturnClause) PlannerError!*ast.Expression {
+        const clause = ret orelse return expr;
+        if (expr.* == .variable) return resolveOrderAlias(expr, ret);
+        const Substitute = struct {
+            clause: *const ast.ReturnClause,
+            pub fn replace(sub: *@This(), e: *ast.Expression) ast_util.RewriteError!?*ast.Expression {
+                if (e.* != .variable) return null;
+                for (sub.clause.items) |item| {
+                    const alias = item.alias orelse continue;
+                    if (std.mem.eql(u8, alias, e.variable.name)) return item.expression;
+                }
+                return null;
+            }
+        };
+        var substitute = Substitute{ .clause = clause };
+        return ast_util.rewrite(self.allocator, expr, &substitute) catch PlannerError.OutOfMemory;
     }
 
     /// Does this RETURN clause aggregate?
@@ -1513,9 +3616,21 @@ pub const QueryPlanner = struct {
                 }
                 break :blk true;
             },
-            else => false,
+            else => ast_util.expressionsEqual(a, b),
         };
     }
+
+    /// Replaces what names a RETURN column, its alias or an item written
+    /// the same way, with that column of the projected row.
+    const OutputColumnRewrite = struct {
+        planner: *QueryPlanner,
+        ret: *const ast.ReturnClause,
+
+        pub fn replace(self: *OutputColumnRewrite, e: *ast.Expression) ast_util.RewriteError!?*ast.Expression {
+            const slot = outputSlotFor(e, self.ret) orelse return null;
+            return try self.planner.aggregateSlotVariable(slot);
+        }
+    };
 
     /// Plan an ORDER BY that runs after projection, sorting by output column.
     fn planOrderByOnOutput(
@@ -1523,6 +3638,7 @@ pub const QueryPlanner = struct {
         order: *const ast.OrderByClause,
         input: ?Operator,
         ret: *const ast.ReturnClause,
+        following: []const ast.Clause,
     ) PlannerError!Operator {
         const input_op = input orelse return PlannerError.InvalidQuery;
 
@@ -1532,21 +3648,37 @@ pub const QueryPlanner = struct {
         errdefer self.allocator.free(sort_items);
 
         for (order.items, 0..) |item, i| {
-            // Naming something the projection does not produce is an error
-            // rather than something to sort arbitrarily by. Silently returning
-            // rows in an unhelpful order is how this went unnoticed before.
-            const slot = outputSlotFor(item.expression, ret) orelse {
-                self.allocator.free(sort_items);
+            if (outputSlotFor(item.expression, ret)) |slot| {
+                sort_items[i] = .{
+                    .expr = item.expression,
+                    .descending = item.descending,
+                    .nulls = item.nulls,
+                    .slot = slot,
+                };
+                continue;
+            }
+            // An expression over returned columns, `ORDER BY m.name` after
+            // `RETURN n AS m, count(*)`: each column it uses is read from
+            // the projected row. Anything else has no value after grouping,
+            // and naming it is an error rather than an arbitrary order.
+            var rewriter = OutputColumnRewrite{ .planner = self, .ret = ret };
+            const expr = ast_util.rewrite(self.allocator, item.expression, &rewriter) catch return PlannerError.OutOfMemory;
+            if (aggregate_ops.containsAggregate(expr)) {
+                self.setPlanDetail("ORDER BY item {d} aggregates, but the RETURN does not return that aggregate; return it and order by its alias", .{i + 1});
                 return PlannerError.InvalidQuery;
-            };
+            }
+            if (ast_util.firstFreeVariable(expr, &isAggregateSlotName)) |name| {
+                self.setPlanDetail("ORDER BY item {d} uses `{s}`, which the aggregating RETURN does not return; return it, or order by a returned column", .{ i + 1, name });
+                return PlannerError.InvalidQuery;
+            }
             sort_items[i] = .{
-                .expr = item.expression,
+                .expr = expr,
                 .descending = item.descending,
-                .slot = slot,
+                .nulls = item.nulls,
             };
         }
 
-        const sort = limit_ops.Sort.init(self.allocator, input_op, sort_items) catch {
+        const sort = limit_ops.Sort.initBounded(self.allocator, input_op, sort_items, try self.sortBounds(following)) catch {
             return PlannerError.OutOfMemory;
         };
 
@@ -1559,6 +3691,7 @@ pub const QueryPlanner = struct {
         order: *const ast.OrderByClause,
         input: ?Operator,
         ret: ?*const ast.ReturnClause,
+        following: []const ast.Clause,
     ) PlannerError!Operator {
         const input_op = input orelse return PlannerError.InvalidQuery;
 
@@ -1569,16 +3702,38 @@ pub const QueryPlanner = struct {
 
         for (order.items, 0..) |item, i| {
             sort_items[i] = .{
-                .expr = resolveOrderAlias(item.expression, ret),
+                .expr = try self.substituteOrderAliases(item.expression, ret),
                 .descending = item.descending,
+                .nulls = item.nulls,
             };
         }
 
-        const sort = limit_ops.Sort.init(self.allocator, input_op, sort_items) catch {
+        const sort = limit_ops.Sort.initBounded(self.allocator, input_op, sort_items, try self.sortBounds(following)) catch {
             return PlannerError.OutOfMemory;
         };
 
         return sort.operator();
+    }
+
+    /// The SKIP and LIMIT clauses that directly follow an ORDER BY, which
+    /// tell the sort how many rows it has to keep.
+    fn sortBounds(self: *Self, following: []const ast.Clause) PlannerError![]const limit_ops.RowBound {
+        var count: usize = 0;
+        while (count < following.len) : (count += 1) {
+            switch (following[count]) {
+                .skip, .limit => {},
+                else => break,
+            }
+        }
+        const bounds = self.allocator.alloc(limit_ops.RowBound, count) catch return PlannerError.OutOfMemory;
+        for (following[0..count], bounds) |clause, *bound| {
+            bound.* = switch (clause) {
+                .skip => |sk| .{ .skip = sk.count },
+                .limit => |l| .{ .limit = l.count },
+                else => unreachable,
+            };
+        }
+        return bounds;
     }
 
     /// Plan a LIMIT clause
@@ -1633,7 +3788,7 @@ pub const QueryPlanner = struct {
                                 need_create = false;
                             } else {
                                 // New variable - allocate slot and bind
-                                slot = try self.allocateSlot();
+                                slot = try self.allocateNamedSlot(name);
                                 try self.bindVariable(name, slot, .node);
                             }
                         } else {
@@ -1669,13 +3824,14 @@ pub const QueryPlanner = struct {
                         // If there's a pending edge, now we have the target - create it
                         if (pending_edge) |pe| {
                             if (pe.edge_pattern.types.len == 0) {
-                                return PlannerError.InvalidQuery; // Edge type required
+                                self.setPlanDetail("CREATE needs a relationship type, as in -[:TYPE]->", .{});
+                                return PlannerError.InvalidQuery;
                             }
 
                             // Bind edge variable if present
                             var edge_slot: ?u8 = null;
                             if (pe.edge_pattern.variable) |edge_name| {
-                                const edge_var_slot = try self.allocateSlot();
+                                const edge_var_slot = try self.allocateNamedSlot(edge_name);
                                 try self.bindVariable(edge_name, edge_var_slot, .edge);
                                 edge_slot = edge_var_slot;
                             }
@@ -1731,6 +3887,7 @@ pub const QueryPlanner = struct {
 
             // Check for dangling edge (edge without target node)
             if (pending_edge != null) {
+                self.setPlanDetail("CREATE needs a node at each end of a relationship", .{});
                 return PlannerError.InvalidQuery;
             }
         }
@@ -1748,6 +3905,7 @@ pub const QueryPlanner = struct {
         for (delete.expressions) |expr| {
             // Expression should be a variable reference
             if (expr.* != .variable) {
+                self.setPlanDetail("DELETE takes variables bound to nodes or relationships", .{});
                 return PlannerError.InvalidQuery;
             }
 
@@ -1763,6 +3921,7 @@ pub const QueryPlanner = struct {
                     delete.detach,
                     database,
                 ) catch return PlannerError.OutOfMemory;
+                delete_node.location = expr.getLocation();
 
                 op = delete_node.operator();
             } else if (binding.kind == .edge) {
@@ -1775,6 +3934,9 @@ pub const QueryPlanner = struct {
                 ) catch return PlannerError.OutOfMemory;
 
                 op = delete_edge.operator();
+            } else {
+                self.setPlanDetail("DELETE needs a node or relationship; '{s}' is a value", .{var_name});
+                return PlannerError.InvalidQuery;
             }
         }
 
@@ -1809,7 +3971,10 @@ pub const QueryPlanner = struct {
                     const var_name = getVariableName(l.target) orelse return PlannerError.InvalidQuery;
                     const binding = self.bindings.get(var_name) orelse return PlannerError.InvalidQuery;
 
-                    if (binding.kind != .node) return PlannerError.InvalidQuery;
+                    if (binding.kind != .node) {
+                        self.setPlanDetail("SET can add labels only to a node; '{s}' is not one", .{var_name});
+                        return PlannerError.InvalidQuery;
+                    }
 
                     const set_labels = mutation_ops.SetLabels.init(
                         self.allocator,
@@ -1905,18 +4070,42 @@ pub const QueryPlanner = struct {
     /// Plan a WITH clause (projection that feeds into next query part)
     fn planWith(self: *Self, with_clause: *const ast.WithClause, input: ?Operator) PlannerError!Operator {
         const input_op = input orelse return PlannerError.InvalidQuery;
+        try self.checkProjectionWidth("WITH", with_clause.items.len);
 
-        // Preserve upstream bindings referenced by WITH expressions so runtime
-        // evaluation can resolve them even after WITH scope rebinding.
-        var required_input_bindings: std.ArrayList(VarBinding) = .empty;
-        defer required_input_bindings.deinit(self.allocator);
-        for (with_clause.items) |item| {
-            try self.collectReferencedBindings(item.expression, &required_input_bindings);
+        // The slot each item goes to. A name keeps the slot it already had
+        // (see `name_slots`); other items take slots no earlier scope used
+        // where there are any.
+        const items = with_clause.items;
+        const out_slots = self.allocator.alloc(u8, items.len) catch return PlannerError.OutOfMemory;
+        const placed = self.allocator.alloc(bool, items.len) catch return PlannerError.OutOfMemory;
+        @memset(placed, false);
+        var taken: u16 = 0;
+        for (items, 0..) |item, i| {
+            const name = withItemName(item) orelse continue;
+            const slot = self.name_slots.get(name) orelse continue;
+            if (taken & slotBit(slot) != 0) continue;
+            // A slot of a scope around CALL { } stays with the variable that
+            // holds it.
+            if (self.reserved_slots & slotBit(slot) != 0) {
+                const holder = self.bindings.get(name) orelse continue;
+                if (holder.slot != slot) continue;
+            }
+            out_slots[i] = slot;
+            placed[i] = true;
+            taken |= slotBit(slot);
+        }
+        for (items, 0..) |_, i| {
+            if (placed[i]) continue;
+            var free = all_slots & ~taken & ~self.ever_used_slots & ~self.reserved_slots;
+            if (free == 0) free = all_slots & ~taken & ~self.reserved_slots;
+            if (free == 0) return PlannerError.TooManyVariables;
+            out_slots[i] = @ctz(free);
+            taken |= slotBit(out_slots[i]);
         }
 
         // Check for aggregates (same logic as RETURN)
         var has_aggregates = false;
-        for (with_clause.items) |item| {
+        for (items) |item| {
             if (aggregate_ops.containsAggregate(item.expression)) {
                 has_aggregates = true;
                 break;
@@ -1929,22 +4118,22 @@ pub const QueryPlanner = struct {
             const ret = self.allocator.create(ast.ReturnClause) catch return PlannerError.OutOfMemory;
             ret.* = .{
                 .distinct = with_clause.distinct,
-                .items = with_clause.items,
+                .items = items,
                 .location = with_clause.location,
             };
-            op = try self.planAggregateReturn(ret, input_op);
+            op = try self.planAggregateReturnInto(ret, input_op, out_slots);
         } else {
             // Simple projection
-            var items = self.allocator.alloc(project_ops.ProjectItem, with_clause.items.len) catch {
+            var project_items = self.allocator.alloc(project_ops.ProjectItem, items.len) catch {
                 return PlannerError.OutOfMemory;
             };
-            for (with_clause.items, 0..) |item, i| {
-                items[i] = .{
+            for (items, 0..) |item, i| {
+                project_items[i] = .{
                     .expr = item.expression,
-                    .output_slot = @intCast(i),
+                    .output_slot = out_slots[i],
                 };
             }
-            const project = project_ops.Project.init(self.allocator, input_op, items) catch {
+            const project = project_ops.Project.init(self.allocator, input_op, project_items) catch {
                 return PlannerError.OutOfMemory;
             };
             op = project.operator();
@@ -1958,39 +4147,61 @@ pub const QueryPlanner = struct {
             op = distinct.operator();
         }
 
+        // What each item carries on: a node or relationship variable stays
+        // one, anything else is a value.
+        const item_kinds = self.allocator.alloc(semantic.VariableKind, items.len) catch {
+            return PlannerError.OutOfMemory;
+        };
+        for (items, item_kinds) |item, *kind| {
+            kind.* = .alias;
+            if (item.expression.* == .variable) {
+                if (self.bindings.get(item.expression.variable.name)) |binding| kind.* = binding.kind;
+            }
+        }
+
+        // Expressions before the WITH, its own included, still read the
+        // bindings it does not carry on. They stay registered for execution,
+        // out of later clauses' scope.
+        var upstream = self.bindings.iterator();
+        while (upstream.next()) |entry| {
+            self.outer_bindings.put(entry.key_ptr.*, entry.value_ptr.*) catch return PlannerError.OutOfMemory;
+        }
+
         // Reset bindings to WITH aliases (WITH introduces a new scope)
         self.bindings.clearRetainingCapacity();
         // What comes through a WITH is an alias rather than a node written with a
         // label, so the labels that were in scope before it no longer describe it.
         self.pattern_labels.clearRetainingCapacity();
         self.pattern_edge_types.clearRetainingCapacity();
-        self.next_slot = 0;
+        self.used_slots = taken;
 
-        for (with_clause.items, 0..) |item, i| {
-            const name = item.alias orelse getExpressionName(item.expression) orelse continue;
-            try self.bindVariable(name, @intCast(i), .node);
-            self.next_slot = @intCast(i + 1);
-        }
-
-        // Keep upstream bindings used by WITH expressions available for execution.
-        for (required_input_bindings.items) |binding| {
-            if (!self.bindings.contains(binding.name)) {
-                try self.bindVariable(binding.name, binding.slot, binding.kind);
-                if (binding.slot >= self.next_slot) {
-                    self.next_slot = binding.slot + 1;
-                }
-            }
+        for (items, 0..) |item, i| {
+            const name = withItemName(item) orelse continue;
+            try self.bindVariable(name, out_slots[i], item_kinds[i]);
         }
 
         // Add WHERE filter if present
         if (with_clause.where) |condition| {
+            if (self.has_subqueries) try self.planSubqueriesIn(condition);
+            try self.refuseBareDistance(condition, "WITH");
             const filter = filter_ops.Filter.init(self.allocator, op, condition) catch {
                 return PlannerError.OutOfMemory;
             };
             op = filter.operator();
         }
 
+        // An aggregating WITH plans as a RETURN does, which names columns;
+        // a WITH returns none, so a query that ends in a write after it
+        // returns nothing.
+        self.output_columns = 0;
         return op;
+    }
+
+    /// The name a WITH item is known by afterwards: its alias, or the
+    /// variable it passes on.
+    fn withItemName(item: ast.ReturnItem) ?[]const u8 {
+        if (item.alias) |alias| return alias;
+        return getVariableName(item.expression);
     }
 
     /// Plan a MERGE clause (node pattern or simple relationship pattern).
@@ -2031,22 +4242,21 @@ pub const QueryPlanner = struct {
                 properties = kvs;
             }
 
+            // ON CREATE SET and ON MATCH SET can only name the merged node by
+            // its variable. Semantic analysis refuses them on a MERGE without
+            // one; this refuses them too rather than guess what an item means.
+            // (It used to apply each `x.key = value` to the merged node whatever
+            // `x` named, and drop label and map items.)
             var on_create_props: []const mutation_ops.CreateNode.PropertyKV = &.{};
             if (merge_clause.on_create) |items| {
-                if (node_pattern.variable) |name| {
-                    on_create_props = try self.extractSetPropertiesForTarget(items, name);
-                } else {
-                    on_create_props = try self.extractSetProperties(items);
-                }
+                const name = node_pattern.variable orelse return self.refuseAnonymousMergeSet("ON CREATE SET");
+                on_create_props = try self.extractSetPropertiesForTarget(items, name);
             }
 
             var on_match_props: []const mutation_ops.CreateNode.PropertyKV = &.{};
             if (merge_clause.on_match) |items| {
-                if (node_pattern.variable) |name| {
-                    on_match_props = try self.extractSetPropertiesForTarget(items, name);
-                } else {
-                    on_match_props = try self.extractSetProperties(items);
-                }
+                const name = node_pattern.variable orelse return self.refuseAnonymousMergeSet("ON MATCH SET");
+                on_match_props = try self.extractSetPropertiesForTarget(items, name);
             }
 
             const materialized_input: ?Operator = if (input) |inp| try self.materializeInput(inp) else null;
@@ -2080,8 +4290,14 @@ pub const QueryPlanner = struct {
                 else => return PlannerError.InvalidQuery,
             };
 
-            if (edge.types.len == 0) return PlannerError.InvalidQuery;
-            if (edge.direction == .both) return PlannerError.InvalidQuery;
+            if (edge.types.len == 0) {
+                self.setPlanDetail("MERGE needs a relationship type, as in -[:TYPE]->", .{});
+                return PlannerError.InvalidQuery;
+            }
+            if (edge.direction == .both) {
+                self.setPlanDetail("MERGE needs a relationship direction, -> or <-", .{});
+                return PlannerError.InvalidQuery;
+            }
 
             var op: ?Operator = if (input) |inp| try self.materializeInput(inp) else null;
             const left_slot = try self.resolveMergeNodeSlot(&op, left, database);
@@ -2100,7 +4316,7 @@ pub const QueryPlanner = struct {
                         if (binding.kind != .edge) return PlannerError.InvalidQuery;
                         break :blk binding.slot;
                     }
-                    const slot = try self.allocateSlot();
+                    const slot = try self.allocateNamedSlot(name);
                     try self.bindVariable(name, slot, .edge);
                     break :blk slot;
                 }
@@ -2200,31 +4416,18 @@ pub const QueryPlanner = struct {
         return slot;
     }
 
-    /// Wrap an input operator in a Materialize barrier to release page latches
-    /// before downstream mutation operators write to the same storage pages.
+    /// Wrap an input operator in a Materialize barrier, so every row of the
+    /// input is read before the clause downstream writes anything.
     fn materializeInput(self: *Self, input: Operator) PlannerError!Operator {
         const mat = materialize_ops.Materialize.init(self.allocator, input) catch return PlannerError.OutOfMemory;
         return mat.operator();
     }
 
-    /// Extract property key-value pairs from SET items (for MERGE ON CREATE/ON MATCH)
-    fn extractSetProperties(self: *Self, items: []const ast.SetItem) PlannerError![]const mutation_ops.CreateNode.PropertyKV {
-        var kvs: std.ArrayList(mutation_ops.CreateNode.PropertyKV) = .empty;
-        defer kvs.deinit(self.allocator);
-
-        for (items) |item| {
-            switch (item) {
-                .property => |p| {
-                    kvs.append(self.allocator, .{
-                        .key = p.property_name,
-                        .value_expr = p.value,
-                    }) catch return PlannerError.OutOfMemory;
-                },
-                else => {}, // Labels and map operations not supported in MERGE ON CREATE/MATCH
-            }
-        }
-
-        return kvs.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
+    /// The failure for ON CREATE SET or ON MATCH SET on a MERGE node that has
+    /// no variable, which no item can name.
+    fn refuseAnonymousMergeSet(self: *Self, comptime clause_name: []const u8) PlannerError {
+        self.setPlanDetail(clause_name ++ " requires a variable on the MERGE target pattern", .{});
+        return PlannerError.InvalidQuery;
     }
 
     /// Extract SET property key/value pairs for a specific target variable.
@@ -2253,17 +4456,20 @@ pub const QueryPlanner = struct {
         return kvs.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
     }
 
+    /// The input for a clause that opens a query without reading anything:
+    /// one row with nothing bound, so `RETURN 1` and `UNWIND [1, 2] AS x`
+    /// evaluate their expressions exactly once.
+    fn singleRow(self: *Self) PlannerError!Operator {
+        const single = source_ops.SingleRow.init(self.allocator) catch return PlannerError.OutOfMemory;
+        return single.operator();
+    }
+
     /// Plan an UNWIND clause (expand list into rows)
     fn planUnwind(self: *Self, unwind_clause: *const ast.UnwindClause, input: ?Operator) PlannerError!Operator {
         // Standalone UNWIND uses a synthetic single-row input.
-        const input_op = if (input) |op|
-            op
-        else blk: {
-            const single = source_ops.SingleRow.init(self.allocator) catch return PlannerError.OutOfMemory;
-            break :blk single.operator();
-        };
+        const input_op = input orelse try self.singleRow();
 
-        const slot = try self.allocateSlot();
+        const slot = try self.allocateNamedSlot(unwind_clause.variable);
         try self.bindVariable(unwind_clause.variable, slot, .alias);
 
         const unwind = unwind_ops.Unwind.init(
@@ -2274,34 +4480,6 @@ pub const QueryPlanner = struct {
         ) catch return PlannerError.OutOfMemory;
 
         return unwind.operator();
-    }
-
-    fn collectReferencedBindings(self: *Self, expr: *const ast.Expression, out: *std.ArrayList(VarBinding)) PlannerError!void {
-        switch (expr.*) {
-            .variable => |v| {
-                const binding = self.bindings.get(v.name) orelse return PlannerError.InvalidQuery;
-                for (out.items) |existing| {
-                    if (std.mem.eql(u8, existing.name, binding.name)) return;
-                }
-                out.append(self.allocator, binding) catch return PlannerError.OutOfMemory;
-            },
-            .property_access => |pa| try self.collectReferencedBindings(pa.object, out),
-            .binary => |b| {
-                try self.collectReferencedBindings(b.left, out);
-                try self.collectReferencedBindings(b.right, out);
-            },
-            .unary => |u| try self.collectReferencedBindings(u.operand, out),
-            .function_call => |f| {
-                for (f.arguments) |arg| try self.collectReferencedBindings(arg, out);
-            },
-            .list => |l| {
-                for (l.elements) |elem| try self.collectReferencedBindings(elem, out);
-            },
-            .map => |m| {
-                for (m.entries) |entry| try self.collectReferencedBindings(entry.value, out);
-            },
-            .literal, .parameter => {},
-        }
     }
 
     fn bindInternalVariable(self: *Self, slot: u8, kind: semantic.VariableKind) PlannerError![]const u8 {
@@ -2330,14 +4508,47 @@ pub const QueryPlanner = struct {
         self.hidden_binding_names.clearRetainingCapacity();
     }
 
-    /// Allocate a new variable slot
+    const all_slots: u16 = std.math.maxInt(u16) >> (16 - MAX_SLOTS);
+
+    /// Allocate a new variable slot.
+    ///
+    /// A slot no earlier scope used is preferred, so that two names rarely
+    /// share a slot across WITH scopes (see `name_slots`); once those run
+    /// out, any slot free in the current scope.
     fn allocateSlot(self: *Self) PlannerError!u8 {
-        if (self.next_slot >= MAX_SLOTS) {
+        var free = all_slots & ~self.ever_used_slots & ~self.reserved_slots;
+        if (free == 0) free = all_slots & ~self.used_slots & ~self.reserved_slots;
+        if (free == 0) {
+            self.setPlanDetail("The query uses more than {d} variables, including ones the planner adds for patterns", .{MAX_SLOTS});
             return PlannerError.TooManyVariables;
         }
-        const slot = self.next_slot;
-        self.next_slot += 1;
+        const slot: u8 = @ctz(free);
+        self.markSlot(slot);
         return slot;
+    }
+
+    /// Allocate the slot for a variable about to be bound: the slot the name
+    /// had earlier in the query, if it is free in this scope.
+    fn allocateNamedSlot(self: *Self, name: ?[]const u8) PlannerError!u8 {
+        if (name) |n| {
+            if (self.name_slots.get(n)) |slot| {
+                if ((self.used_slots | self.reserved_slots) & slotBit(slot) == 0) {
+                    self.markSlot(slot);
+                    return slot;
+                }
+            }
+        }
+        return self.allocateSlot();
+    }
+
+    fn slotBit(slot: u8) u16 {
+        return @as(u16, 1) << @intCast(slot);
+    }
+
+    fn markSlot(self: *Self, slot: u8) void {
+        self.used_slots |= slotBit(slot);
+        self.ever_used_slots |= slotBit(slot);
+        if (slot >= self.next_slot) self.next_slot = slot + 1;
     }
 
     /// Bind a variable name to a slot
@@ -2349,6 +4560,13 @@ pub const QueryPlanner = struct {
         }) catch {
             return PlannerError.OutOfMemory;
         };
+        self.markSlot(slot);
+        const first = self.name_slots.getOrPut(name) catch return PlannerError.OutOfMemory;
+        if (!first.found_existing) {
+            first.value_ptr.* = slot;
+        } else if (first.value_ptr.* != slot and self.slot_conflict == null) {
+            self.slot_conflict = name;
+        }
     }
 
     fn setPlanDetail(self: *Self, comptime fmt: []const u8, args: anytype) void {
@@ -2365,6 +4583,13 @@ pub const QueryPlanner = struct {
     pub fn planErrorDetail(self: *const Self) ?[]const u8 {
         if (self.detail_len == 0) return null;
         return self.detail_buf[0..self.detail_len];
+    }
+
+    /// The slot of a node variable that is already bound.
+    fn boundNodeSlot(self: *const Self, name: []const u8) ?u8 {
+        const binding = self.bindings.get(name) orelse return null;
+        if (binding.kind != .node) return null;
+        return binding.slot;
     }
 
     /// Get the slot for a variable
@@ -2386,16 +4611,6 @@ pub const QueryPlanner = struct {
 fn getVariableName(expr: *const ast.Expression) ?[]const u8 {
     return switch (expr.*) {
         .variable => |v| v.name,
-        else => null,
-    };
-}
-
-/// Get a name for an expression (variable name or property access path)
-fn getExpressionName(expr: *const ast.Expression) ?[]const u8 {
-    return switch (expr.*) {
-        .variable => |v| v.name,
-        .property_access => |pa| pa.property,
-        .function_call => |f| f.name,
         else => null,
     };
 }

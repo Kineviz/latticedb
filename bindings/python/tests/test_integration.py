@@ -279,6 +279,43 @@ class TestNodeOperations:
                 txn.set_property(node.id, "score", 3.14)
                 txn.commit()
 
+    def test_none_stores_no_property(self, tmp_path):
+        """None removes a property and creates none, as null does in Cypher."""
+        db_path = tmp_path / "test.db"
+
+        with Database(db_path, create=True) as db:
+            with db.write() as txn:
+                a = txn.create_node(labels=["P"], properties={"name": "a", "x": None, "y": 1})
+                b = txn.create_node(labels=["P"], properties={"name": "b"})
+                edge = txn.create_edge(a.id, b.id, "R", properties={"w": None, "v": 1})
+                txn.commit()
+            # Up to 0.18.0 these held, and stored, x and w as None.
+            assert a.properties == {"name": "a", "y": 1}
+            assert edge.properties == {"v": 1}
+            after = db.changes(limit=1000)[-1].sequence
+
+            with db.write() as txn:
+                txn.set_property(a.id, "y", None)
+                txn.set_property(a.id, "absent", None)
+                txn.set_edge_property(edge.id, "v", None)
+                txn.set_edge_property(edge.id, "absent", None)
+                txn.commit()
+
+            rows = db.query(
+                "MATCH (n:P {name: 'a'})-[r:R]->() RETURN properties(n) AS n, properties(r) AS r"
+            )
+            assert [dict(row) for row in rows] == [{"n": {"name": "a"}, "r": {}}]
+            events = [
+                (record.kind, record.payload["key"])
+                for record in db.changes(after_sequence=after)
+                if "property" in record.kind
+            ]
+            assert events == [("node.property_remove", "y"), ("edge.property_remove", "v")]
+
+            with db.write() as txn:
+                with pytest.raises(LatticeNotFoundError):
+                    txn.set_property(999_999, "x", None)
+
     def test_cannot_write_in_read_transaction(self, tmp_path):
         """Test that write operations fail in read-only transaction."""
         db_path = tmp_path / "test.db"
@@ -408,6 +445,26 @@ class TestEdgeOperations:
                 assert edge.target_id == bob.id
                 assert edge.edge_type == "KNOWS"
                 txn.commit()
+
+    def test_edge_types_are_read_by_length(self, tmp_path):
+        """Edge types come back exactly, including ones that fill their
+        allocation and multibyte ones whose length is counted in bytes."""
+        db_path = tmp_path / "test.db"
+        types = ["KNOWS_AB", "LIKES_CD", "FOLLOWS_EFGHIJKL", "MÖGEN"]
+
+        with Database(db_path, create=True) as db:
+            with db.write() as txn:
+                alice = txn.create_node(labels=["Person"])
+                bob = txn.create_node(labels=["Person"])
+                for edge_type in types:
+                    for _ in range(4):
+                        txn.create_edge(alice.id, bob.id, edge_type)
+                txn.commit()
+
+            with db.read() as txn:
+                edges = txn.get_outgoing_edges(alice.id)
+                assert len(edges) == len(types) * 4
+                assert sorted({edge.edge_type for edge in edges}) == sorted(types)
 
     def test_edge_properties(self, tmp_path):
         """Test edge property CRUD by stable edge ID."""
@@ -757,7 +814,7 @@ class TestQueries:
 
         with Database(db_path, create=True) as db:
             with pytest.raises(LatticeQueryError) as exc_info:
-                db.query("MATCH (a)-[r:REL*1..2]->(b) RETURN r")
+                db.query("MATCH (a)-[:REL*3..1]->(b) RETURN b")
 
             err = exc_info.value
             assert err.stage == "semantic"
@@ -859,7 +916,7 @@ class TestBatchInsert:
                     dtype=np.float32,
                 )
                 with pytest.deprecated_call(
-                    match=r"Transaction\.batch_insert\(\.\.\.\) is deprecated; use batch_insert_vectors\(\.\.\.\)\. Earliest removal is v0\.6\.0\."
+                    match=r"Transaction\.batch_insert\(\.\.\.\) is deprecated; use batch_insert_vectors\(\.\.\.\)\."
                 ):
                     node_ids = txn.batch_insert("Document", vectors)
                 assert len(node_ids) == 2
@@ -877,7 +934,7 @@ class TestVectorOperations:
         db_path = tmp_path / "test.db"
 
         with pytest.deprecated_call(
-            match=r"Database\(\.\.\., enable_vector=\.\.\.\) is deprecated; use enable_vectors=\.\.\.\. Earliest removal is v0\.6\.0\."
+            match=r"Database\(\.\.\., enable_vector=\.\.\.\) is deprecated; use enable_vectors=\.\.\.\."
         ):
             db = Database(db_path, create=True, enable_vector=True, vector_dimensions=2)
 
@@ -901,6 +958,99 @@ class TestVectorOperations:
                 vector = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
                 txn.set_vector(node.id, "embedding", vector)
                 txn.commit()
+
+    def test_get_and_remove_vector(self, tmp_path):
+        """A node's vector reads back, and removing it takes it out of search."""
+        pytest.importorskip("numpy")
+        import numpy as np
+
+        db_path = tmp_path / "test.db"
+        with Database(db_path, create=True, enable_vectors=True, vector_dimensions=2) as db:
+            with db.write() as txn:
+                node = txn.create_node(labels=["Doc"])
+                other = txn.create_node(labels=["Doc"])
+                assert txn.get_vector(node.id) is None
+                txn.set_vector(node.id, "embedding", np.array([3.0, 4.0], dtype=np.float32))
+                txn.set_vector(other.id, "embedding", np.array([0.0, 1.0], dtype=np.float32))
+                # Uncommitted: as written.
+                np.testing.assert_allclose(txn.get_vector(node.id), [3.0, 4.0])
+                txn.commit()
+
+            with db.read() as txn:
+                # Committed, under the default cosine metric: normalised.
+                vector = txn.get_vector(node.id, "embedding")
+                assert vector is not None
+                assert vector.dtype == np.float32
+                np.testing.assert_allclose(vector, [0.6, 0.8], rtol=1e-6)
+                with pytest.raises(LatticeNotFoundError):
+                    txn.get_vector(node.id + 1000)
+                with pytest.raises(LatticeUnsupportedError):
+                    txn.get_vector(node.id, "title_vec")
+                with pytest.raises(RuntimeError):
+                    txn.remove_vector(node.id)
+
+            with db.write() as txn:
+                txn.remove_vector(node.id)
+                assert txn.get_vector(node.id) is None
+                # Removing a vector the node does not have does nothing.
+                txn.remove_vector(node.id, "embedding")
+                with pytest.raises(LatticeNotFoundError):
+                    txn.remove_vector(node.id + 1000)
+                txn.commit()
+
+            query = np.array([3.0, 4.0], dtype=np.float32)
+            assert [r.node_id for r in db.vector_search(query, k=10)] == [other.id]
+            with db.read() as txn:
+                assert txn.node_exists(node.id)
+                assert txn.get_vector(node.id) is None
+
+        # After reopening, the removal holds and the node can take a vector again.
+        with Database(db_path) as db:
+            with db.read() as txn:
+                assert txn.get_vector(node.id) is None
+            with db.write() as txn:
+                txn.set_vector(node.id, "embedding", np.array([1.0, 0.0], dtype=np.float32))
+                txn.commit()
+            with db.read() as txn:
+                np.testing.assert_allclose(txn.get_vector(node.id), [1.0, 0.0])
+
+    def test_vector_calls_without_a_vector_index(self, tmp_path):
+        """Without a vector index, writing or searching a vector is unsupported, not an I/O error."""
+        pytest.importorskip("numpy")
+        import numpy as np
+
+        vector = np.array([1.0, 0.0], dtype=np.float32)
+        db_path = tmp_path / "test.db"
+        with Database(db_path, create=True) as db:
+            with db.write() as txn:
+                node = txn.create_node(labels=["Doc"])
+                with pytest.raises(LatticeUnsupportedError, match="created without a vector index"):
+                    txn.set_vector(node.id, "embedding", vector)
+                with pytest.raises(LatticeUnsupportedError, match="created without a vector index"):
+                    txn.batch_insert_vectors("Doc", np.array([[1.0, 0.0]], dtype=np.float32))
+                # Another key is still refused for being another key.
+                with pytest.raises(LatticeUnsupportedError) as other_key:
+                    txn.set_vector(node.id, "title_vec", vector)
+                assert "vector index" not in str(other_key.value)
+                # Reading finds no vector and removing has nothing to remove.
+                assert txn.get_vector(node.id) is None
+                txn.remove_vector(node.id)
+                with pytest.raises(LatticeUnsupportedError, match="created without a vector index"):
+                    txn.vector_search(vector, k=1)
+                txn.commit()
+            with pytest.raises(LatticeUnsupportedError, match="created without a vector index") as err:
+                db.vector_search(vector, k=1)
+            assert err.value.code == -14
+            with db.read() as txn:
+                # The refused batch insert created nothing.
+                assert not txn.node_exists(node.id + 1)
+
+        # Opening it with vectors on adds the index.
+        with Database(db_path, enable_vectors=True, vector_dimensions=2) as db:
+            with db.write() as txn:
+                txn.set_vector(node.id, "embedding", vector)
+                txn.commit()
+            assert [r.node_id for r in db.vector_search(vector, k=1)] == [node.id]
 
     def test_vector_search(self, tmp_path):
         """Test vector similarity search."""
@@ -1354,13 +1504,15 @@ class TestStreams:
 
             assert [record.sequence for record in db.read_stream("events")] == [1]
 
-    def test_enable_wal_false_rejects_stream_writes(self, tmp_path):
+    def test_enable_wal_false_still_publishes_streams(self, tmp_path):
         db_path = tmp_path / "stream_no_wal.lattice"
 
         with Database(db_path, create=True, enable_wal=False) as db:
-            with pytest.raises(LatticeUnsupportedError):
-                with db.write() as txn:
-                    txn.publish_stream("events", "hidden")
+            with db.write() as txn:
+                txn.publish_stream("events", "visible")
+                txn.commit()
+
+            assert [record.payload for record in db.read_stream("events")] == ["visible"]
 
 
 class TestPropertyIndexes:
@@ -1460,6 +1612,62 @@ class TestQueryTransactionMode:
 
             after = db.query("MATCH (n) RETURN count(n)")._rows[0]["count(n)"]
             assert before == after
+
+    def test_failed_commit_rolls_back_and_frees_the_writer(self, tmp_path, monkeypatch):
+        from latticedb._bindings import LATTICE_ERROR_IO, get_lib
+
+        db_path = tmp_path / "test.db"
+        lib = get_lib()
+
+        with Database(db_path, create=True) as db:
+            # A commit that fails leaves the transaction open on the C side.
+            # Stand in for an I/O failure: report it without committing.
+            monkeypatch.setattr(lib._lib, "lattice_commit", lambda txn: LATTICE_ERROR_IO)
+            with pytest.raises(LatticeError):
+                db.query("CREATE (n:Lost)")
+            monkeypatch.undo()
+
+            # Had query() dropped that transaction, it would still hold the
+            # single writer slot and this would fail with LOCK_TIMEOUT.
+            db.query("CREATE (n:Kept)")
+            assert db.query("MATCH (n:Lost) RETURN count(n)")._rows[0]["count(n)"] == 0
+            assert db.query("MATCH (n:Kept) RETURN count(n)")._rows[0]["count(n)"] == 1
+
+
+    def test_get_node_frees_an_empty_label_string(self, tmp_path, monkeypatch):
+        from latticedb._bindings import get_lib
+
+        lib = get_lib()
+        real_free = lib._lib.lattice_free_string
+        freed = []
+
+        def counting_free(ptr):
+            freed.append(1)
+            real_free(ptr)
+
+        with Database(tmp_path / "test.db", create=True) as db:
+            with db.write() as txn:
+                node = txn.create_node(labels=[])
+                monkeypatch.setattr(lib._lib, "lattice_free_string", counting_free)
+                fetched = txn.get_node(node.id)
+                monkeypatch.undo()
+                txn.commit()
+            assert fetched is not None
+            assert fetched.labels == []
+            assert freed == [1]
+
+    def test_integers_outside_64_bits_are_rejected(self, tmp_path):
+        with Database(tmp_path / "test.db", create=True) as db:
+            for too_big in (2**63, -(2**63) - 1, 2**64):
+                with pytest.raises(OverflowError):
+                    db.query("CREATE (n:Big {v: $v})", parameters={"v": too_big})
+            # The edges of the range still go through unchanged.
+            assert db.query("MATCH (n:Big) RETURN count(n)")._rows[0]["count(n)"] == 0
+            for edge in (2**63 - 1, -(2**63)):
+                rows = db.query(
+                    "CREATE (n:Edge {v: $v}) RETURN n.v AS v", parameters={"v": edge}
+                )._rows
+                assert rows[0]["v"] == edge
 
 
 class TestEdgeFtsOperations:

@@ -12,7 +12,7 @@ If you are deciding whether LatticeDB fits your problem at all, start with [When
 | **Data model** | Property graph | Property graph | Relational | Property graph | Vectors + metadata |
 | **Query language** | Cypher subset | Cypher | SQL | Full Cypher | Python/SDK API |
 | **Graph traversal** | Native | Native | Recursive CTE | Native | No |
-| **Vector search** | Native HNSW | Native | Extension (sqlite-vec) | Plugin | Native |
+| **Vector search** | Native HNSW | Native | Extension (sqlite-vec) | Native vector index | Native |
 | **Full-text search** | Native BM25 | Native | FTS5 extension | Lucene index | Varies |
 | **Durable streams** | Native | No | No | No | No |
 | **Storage shape** | Row-oriented, OLTP | Columnar, analytical | Row-oriented | Row-oriented | Columnar / Lance |
@@ -29,7 +29,7 @@ If you are deciding whether LatticeDB fits your problem at all, start with [When
 
 Benchmark comparisons in this section come from two very different places, and it matters which is which.
 
-**Head-to-head measurements.** The SQLite comparison runs both engines on the same machine, over the same data, in the same benchmark harness (`zig build sqlite-benchmark`). Those numbers are directly comparable and you can reproduce them yourself.
+**Head-to-head measurements.** The SQLite comparison runs both engines on the same machine, over the same data, each through its own public C API with the same durability settings (a log fsynced on every commit), in one program (`zig build capi-benchmark`), and you can reproduce it yourself. [Competitive Analysis](../performance/competitive-analysis.md#measured-here-latticedb-and-sqlite) states the settings and the queries on both sides.
 
 **Published third-party figures.** Numbers for Kùzu, Neo4j, Weaviate, Qdrant, Chroma, and the rest are taken from their own documentation or from third-party blog posts, on hardware we do not control, with methodology we did not choose. They are useful for order-of-magnitude orientation and nothing more. Do not read a 2x difference between LatticeDB and a third-party figure as meaningful.
 

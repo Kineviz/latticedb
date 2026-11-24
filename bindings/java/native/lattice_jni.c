@@ -41,6 +41,12 @@ static jclass CLS_FLOAT = NULL;
 static jclass CLS_INTEGER = NULL;
 static jmethodID MID_INT_INIT = NULL;
 static jclass CLS_NUMBER = NULL;
+static jclass CLS_SHORT = NULL;
+static jclass CLS_BYTE = NULL;
+static jclass CLS_ATOMIC_INTEGER = NULL;
+static jclass CLS_ATOMIC_LONG = NULL;
+static jclass CLS_BIG_INTEGER = NULL;
+static jmethodID MID_BIG_INTEGER_LONG_VALUE_EXACT = NULL;
 static jmethodID MID_NUMBER_DOUBLE_VALUE = NULL;
 static jmethodID MID_NUMBER_LONG_VALUE = NULL;
 static jclass CLS_BYTE_ARRAY = NULL;
@@ -115,6 +121,11 @@ static void init_cache(JNIEnv *env) {
     } while (0)
     CACHE_CLASS(CLS_FLOAT, "java/lang/Float");
     CACHE_CLASS(CLS_NUMBER, "java/lang/Number");
+    CACHE_CLASS(CLS_SHORT, "java/lang/Short");
+    CACHE_CLASS(CLS_BYTE, "java/lang/Byte");
+    CACHE_CLASS(CLS_ATOMIC_INTEGER, "java/util/concurrent/atomic/AtomicInteger");
+    CACHE_CLASS(CLS_ATOMIC_LONG, "java/util/concurrent/atomic/AtomicLong");
+    CACHE_CLASS(CLS_BIG_INTEGER, "java/math/BigInteger");
     CACHE_CLASS(CLS_BYTE_ARRAY, "[B");
     CACHE_CLASS(CLS_FLOAT_ARRAY, "[F");
     CACHE_CLASS(CLS_LIST, "java/util/List");
@@ -130,6 +141,8 @@ static void init_cache(JNIEnv *env) {
         "doubleValue", "()D");
     MID_NUMBER_LONG_VALUE = (*env)->GetMethodID(env, CLS_NUMBER,
         "longValue", "()J");
+    MID_BIG_INTEGER_LONG_VALUE_EXACT = (*env)->GetMethodID(env, CLS_BIG_INTEGER,
+        "longValueExact", "()J");
     MID_COLLECTION_ITERATOR = (*env)->GetMethodID(env, CLS_COLLECTION,
         "iterator", "()Ljava/util/Iterator;");
     MID_ITERATOR_HAS_NEXT = (*env)->GetMethodID(env, CLS_ITERATOR,
@@ -176,18 +189,26 @@ static int check(JNIEnv *env, lattice_error code) {
     return 1;
 }
 
-/* Build and throw a QueryException from the prepared-query diagnostics. */
-static void throw_query_error(JNIEnv *env, lattice_query *q) {
+static jstring utf8_to_jstring(JNIEnv *env, const char *ptr, size_t len);
+
+/* Build and throw a QueryException from the prepared-query diagnostics.
+ * `rc` is the code the failing call returned. When the query carries no
+ * diagnostics (a finished transaction, say) the message falls back to the
+ * code's own text rather than an empty string. Text goes through
+ * utf8_to_jstring: NewStringUTF expects modified UTF-8 and mangles characters
+ * outside the BMP. */
+static void throw_query_error(JNIEnv *env, lattice_query *q, lattice_error rc) {
     jint stage = (jint)lattice_query_last_error_stage(q);
     const char *msg = lattice_query_last_error_message(q);
     const char *diag = lattice_query_last_error_code(q);
-    jint code = -1; /* generic */
+    if (msg == NULL || msg[0] == '\0') msg = lattice_error_message(rc);
+    jint code = (jint)rc;
     jboolean has_loc = lattice_query_last_error_has_location(q) ? JNI_TRUE : JNI_FALSE;
     jint line = (jint)lattice_query_last_error_line(q);
     jint column = (jint)lattice_query_last_error_column(q);
     jint length = (jint)lattice_query_last_error_length(q);
-    jstring jmsg = (*env)->NewStringUTF(env, msg ? msg : "");
-    jstring jdiag = diag ? (*env)->NewStringUTF(env, diag) : NULL;
+    jstring jmsg = utf8_to_jstring(env, msg ? msg : "", msg ? strlen(msg) : 0);
+    jstring jdiag = diag ? utf8_to_jstring(env, diag, strlen(diag)) : NULL;
     jobject ex = (*env)->NewObject(env, CLS_QUERY_EXCEPTION, MID_QUERY_EXCEPTION_INIT,
         code, stage, jmsg, jdiag, has_loc, line, column, length);
     if (ex != NULL) (*env)->Throw(env, ex);
@@ -326,15 +347,28 @@ static int fill_value_inner(JNIEnv *env, lattice_value *dst, jobject value) {
     /* Numbers: integral types -> INT, floating types -> FLOAT */
     if ((*env)->IsInstanceOf(env, value, CLS_NUMBER)) {
         memset(dst, 0, sizeof(*dst));
-        if ((*env)->IsInstanceOf(env, value, CLS_DOUBLE) ||
-            (*env)->IsInstanceOf(env, value, CLS_FLOAT)) {
-            dst->type = LATTICE_VALUE_FLOAT;
-            dst->data.float_val = (*env)->CallDoubleMethod(env, value,
-                                                            MID_NUMBER_DOUBLE_VALUE);
-        } else {
+        /* Only the fixed-width integer types are INT. Anything else, such
+         * as BigDecimal, goes through doubleValue(): longValue() would drop
+         * the fraction of 1.5. A BigInteger must fit in 64 bits. */
+        if ((*env)->IsInstanceOf(env, value, CLS_BIG_INTEGER)) {
+            dst->type = LATTICE_VALUE_INT;
+            dst->data.int_val = (*env)->CallLongMethod(env, value,
+                                                        MID_BIG_INTEGER_LONG_VALUE_EXACT);
+            return (*env)->ExceptionCheck(env) ? 0 : 1;
+        }
+        if ((*env)->IsInstanceOf(env, value, CLS_LONG) ||
+            (*env)->IsInstanceOf(env, value, CLS_INTEGER) ||
+            (*env)->IsInstanceOf(env, value, CLS_SHORT) ||
+            (*env)->IsInstanceOf(env, value, CLS_BYTE) ||
+            (*env)->IsInstanceOf(env, value, CLS_ATOMIC_INTEGER) ||
+            (*env)->IsInstanceOf(env, value, CLS_ATOMIC_LONG)) {
             dst->type = LATTICE_VALUE_INT;
             dst->data.int_val = (*env)->CallLongMethod(env, value,
                                                         MID_NUMBER_LONG_VALUE);
+        } else {
+            dst->type = LATTICE_VALUE_FLOAT;
+            dst->data.float_val = (*env)->CallDoubleMethod(env, value,
+                                                            MID_NUMBER_DOUBLE_VALUE);
         }
         return 1;
     }
@@ -597,32 +631,79 @@ Java_io_latticedb_Native_version(JNIEnv *env, jclass cls) {
     return (*env)->NewStringUTF(env, lattice_version());
 }
 
+/* Fill a lattice_open_options_v5 from the Java arguments, shared by open and
+ * deserialize so the same values mean the same thing to both. The v5 fields
+ * are 0 for "not set". A value that does not fit its C field is refused here
+ * (INVALID_ARG thrown, false returned) rather than truncated into a valid one;
+ * one that fits but is out of range is refused by the C API. */
+static bool fill_open_options_v5(JNIEnv *env, lattice_open_options_v5 *opts,
+        jboolean create, jboolean read_only, jint cache_size_mb, jint page_size,
+        jboolean enable_vector, jint vector_dimensions, jboolean enable_wal,
+        jboolean enable_adjacency_cache, jboolean lock, jint sync_mode,
+        jint full_fsync, jint vector_metric, jint vector_m,
+        jint vector_ef_construction, jint changefeed_retention,
+        jlong changefeed_retention_value) {
+    /* The v5 fields are 0 for "not set". A value that does not fit its C
+     * field is refused here rather than truncated into a valid one; one that
+     * fits but is out of range is refused by lattice_open_v5. */
+    if (vector_dimensions < 0 || vector_dimensions > 65535 ||
+        sync_mode < 0 || sync_mode > 255 || full_fsync < 0 || full_fsync > 255 ||
+        vector_metric < 0 || vector_metric > 255 || vector_m < 0 ||
+        vector_m > 65535 || vector_ef_construction < 0 ||
+        vector_ef_construction > 65535 || changefeed_retention < 0 ||
+        changefeed_retention > 255) {
+        throw_lattice(env, LATTICE_ERROR_INVALID_ARG);
+        return false;
+    }
+    memset(opts, 0, sizeof(*opts));
+    opts->struct_size = sizeof(*opts);
+    opts->create = create == JNI_TRUE;
+    opts->read_only = read_only == JNI_TRUE;
+    opts->cache_size_mb = cache_size_mb <= 0 ? 0 : (uint32_t)cache_size_mb;
+    opts->page_size = page_size <= 0 ? 4096 : (uint32_t)page_size;
+    opts->enable_vector = enable_vector == JNI_TRUE;
+    /* 0 means the file's dimensions, as in the C API; the Java default of
+     * 128 is OpenOptions' to apply, not this layer's. */
+    opts->vector_dimensions = (uint16_t)vector_dimensions;
+    opts->enable_wal = enable_wal == JNI_TRUE;
+    opts->enable_adjacency_cache = enable_adjacency_cache == JNI_TRUE;
+    opts->lock = lock == JNI_TRUE;
+    opts->sync_mode = (uint8_t)sync_mode;
+    opts->full_fsync = (uint8_t)full_fsync;
+    opts->vector_metric = (uint8_t)vector_metric;
+    opts->vector_m = (uint16_t)vector_m;
+    opts->vector_ef_construction = (uint16_t)vector_ef_construction;
+    opts->changefeed_retention = (uint8_t)changefeed_retention;
+    /* An unsigned 64-bit count or duration carried in a jlong. */
+    opts->changefeed_retention_value = (uint64_t)changefeed_retention_value;
+    return true;
+}
+
 JNIEXPORT jlong JNICALL
 Java_io_latticedb_Native_open(JNIEnv *env, jclass cls, jstring path,
         jboolean create, jboolean read_only, jint cache_size_mb, jint page_size,
         jboolean enable_vector, jint vector_dimensions, jboolean enable_wal,
-        jboolean enable_adjacency_cache, jboolean lock) {
+        jboolean enable_adjacency_cache, jboolean lock, jint sync_mode,
+        jint full_fsync, jint vector_metric, jint vector_m,
+        jint vector_ef_construction, jint changefeed_retention,
+        jlong changefeed_retention_value) {
     init_cache(env);
     (void)cls;
-    lattice_open_options_v4 opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.struct_size = sizeof(opts);
-    opts.create = create == JNI_TRUE;
-    opts.read_only = read_only == JNI_TRUE;
-    opts.cache_size_mb = cache_size_mb <= 0 ? 100 : (uint32_t)cache_size_mb;
-    opts.page_size = page_size <= 0 ? 4096 : (uint32_t)page_size;
-    opts.enable_vector = enable_vector == JNI_TRUE;
-    opts.vector_dimensions = vector_dimensions <= 0 ? 128 : (uint16_t)vector_dimensions;
-    opts.enable_wal = enable_wal == JNI_TRUE;
-    opts.enable_adjacency_cache = enable_adjacency_cache == JNI_TRUE;
-    opts.lock = lock == JNI_TRUE;
+    lattice_open_options_v5 opts;
+    if (!fill_open_options_v5(env, &opts, create, read_only, cache_size_mb,
+            page_size, enable_vector, vector_dimensions, enable_wal,
+            enable_adjacency_cache, lock, sync_mode, full_fsync, vector_metric,
+            vector_m, vector_ef_construction, changefeed_retention,
+            changefeed_retention_value)) {
+        return 0;
+    }
 
     size_t path_len = 0;
     char *path_buf = jstring_to_utf8(env, path, &path_len);
     if (path_buf == NULL && (*env)->ExceptionCheck(env)) return 0;
 
     lattice_database *db = NULL;
-    lattice_error rc = lattice_open_v4(path_buf, &opts, &db);
+    lattice_error rc = lattice_open_v5(path_buf, &opts, &db);
     free(path_buf);
     if (!check(env, rc)) return 0;
     return (jlong)(uintptr_t)db;
@@ -659,7 +740,10 @@ JNIEXPORT jlong JNICALL
 Java_io_latticedb_Native_deserialize(JNIEnv *env, jclass cls, jbyteArray bytes,
         jint cache_size_mb, jint page_size, jboolean enable_vector,
         jint vector_dimensions, jboolean enable_wal,
-        jboolean enable_adjacency_cache, jboolean lock) {
+        jboolean enable_adjacency_cache, jboolean lock, jint sync_mode,
+        jint full_fsync, jint vector_metric, jint vector_m,
+        jint vector_ef_construction, jint changefeed_retention,
+        jlong changefeed_retention_value) {
     init_cache(env);
     (void)cls;
     if (bytes == NULL) {
@@ -667,25 +751,22 @@ Java_io_latticedb_Native_deserialize(JNIEnv *env, jclass cls, jbyteArray bytes,
         return 0;
     }
 
-    lattice_open_options_v4 opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.struct_size = sizeof(opts);
-    opts.create = false;
-    opts.read_only = false;
-    opts.cache_size_mb = cache_size_mb <= 0 ? 100 : (uint32_t)cache_size_mb;
-    opts.page_size = page_size <= 0 ? 4096 : (uint32_t)page_size;
-    opts.enable_vector = enable_vector == JNI_TRUE;
-    opts.vector_dimensions = vector_dimensions <= 0 ? 128 : (uint16_t)vector_dimensions;
-    opts.enable_wal = enable_wal == JNI_TRUE;
-    opts.enable_adjacency_cache = enable_adjacency_cache == JNI_TRUE;
-    opts.lock = lock == JNI_TRUE;
+    /* create and read_only are ignored by lattice_deserialize_v5. */
+    lattice_open_options_v5 opts;
+    if (!fill_open_options_v5(env, &opts, JNI_FALSE, JNI_FALSE, cache_size_mb,
+            page_size, enable_vector, vector_dimensions, enable_wal,
+            enable_adjacency_cache, lock, sync_mode, full_fsync, vector_metric,
+            vector_m, vector_ef_construction, changefeed_retention,
+            changefeed_retention_value)) {
+        return 0;
+    }
 
     jsize len = (*env)->GetArrayLength(env, bytes);
     jbyte *data = len > 0 ? (*env)->GetByteArrayElements(env, bytes, NULL) : NULL;
     if (len > 0 && data == NULL) return 0;
 
     lattice_database *db = NULL;
-    lattice_error rc = lattice_deserialize(
+    lattice_error rc = lattice_deserialize_v5(
         (const uint8_t *)data, (size_t)len, &opts, &db);
     if (data != NULL) {
         (*env)->ReleaseByteArrayElements(env, bytes, data, JNI_ABORT);
@@ -784,6 +865,15 @@ Java_io_latticedb_Native_nodeDelete(JNIEnv *env, jclass cls, jlong txn_handle,
     (void)cls;
     check(env, lattice_node_delete((lattice_txn *)(uintptr_t)txn_handle,
                                    (lattice_node_id)node_id));
+}
+
+JNIEXPORT void JNICALL
+Java_io_latticedb_Native_nodeDetachDelete(JNIEnv *env, jclass cls, jlong txn_handle,
+                                          jlong node_id) {
+    init_cache(env);
+    (void)cls;
+    check(env, lattice_node_detach_delete((lattice_txn *)(uintptr_t)txn_handle,
+                                          (lattice_node_id)node_id));
 }
 
 JNIEXPORT void JNICALL
@@ -1004,6 +1094,41 @@ Java_io_latticedb_Native_nodeSetVector(JNIEnv *env, jclass cls, jlong txn_handle
     check(env, rc);
 }
 
+JNIEXPORT jfloatArray JNICALL
+Java_io_latticedb_Native_nodeGetVector(JNIEnv *env, jclass cls, jlong txn_handle,
+                                       jlong node_id, jstring key) {
+    init_cache(env);
+    (void)cls;
+    char *key_buf = key ? jstring_to_utf8(env, key, &(size_t){0}) : NULL;
+    if ((*env)->ExceptionCheck(env)) return NULL;
+    float *vector = NULL;
+    uint32_t dims = 0;
+    lattice_error rc = lattice_node_get_vector((lattice_txn *)(uintptr_t)txn_handle,
+        (lattice_node_id)node_id, key_buf, &vector, &dims);
+    free(key_buf);
+    if (!check(env, rc)) return NULL;
+    if (vector == NULL) return NULL;
+    jfloatArray arr = (*env)->NewFloatArray(env, (jsize)dims);
+    if (arr != NULL && dims > 0) {
+        (*env)->SetFloatArrayRegion(env, arr, 0, (jsize)dims, vector);
+    }
+    lattice_free_vector(vector, dims);
+    return arr;
+}
+
+JNIEXPORT void JNICALL
+Java_io_latticedb_Native_nodeRemoveVector(JNIEnv *env, jclass cls, jlong txn_handle,
+                                          jlong node_id, jstring key) {
+    init_cache(env);
+    (void)cls;
+    char *key_buf = key ? jstring_to_utf8(env, key, &(size_t){0}) : NULL;
+    if ((*env)->ExceptionCheck(env)) return;
+    lattice_error rc = lattice_node_remove_vector((lattice_txn *)(uintptr_t)txn_handle,
+        (lattice_node_id)node_id, key_buf);
+    free(key_buf);
+    check(env, rc);
+}
+
 /* ------------------------------------------------------------------ */
 /* Batch insert                                                        */
 /* ------------------------------------------------------------------ */
@@ -1016,7 +1141,17 @@ Java_io_latticedb_Native_batchInsert(JNIEnv *env, jclass cls, jlong txn_handle,
     size_t lb_len = 0;
     char *lb = jstring_to_utf8(env, label, &lb_len);
     if ((*env)->ExceptionCheck(env)) return NULL;
+    if (vectors == NULL) {
+        free(lb);
+        throw_lattice(env, LATTICE_ERROR_INVALID_ARG);
+        return NULL;
+    }
     jsize count = (*env)->GetArrayLength(env, vectors);
+    if (count == 0) {
+        /* Nothing to insert; the C call rejects an empty batch. */
+        free(lb);
+        return (*env)->NewLongArray(env, 0);
+    }
     lattice_node_with_vector *nodes = NULL;
     float **copies = NULL;
     if (count > 0) {
@@ -1741,6 +1876,31 @@ Java_io_latticedb_Native_streamGetLastSequence(JNIEnv *env, jclass cls,
     return (jlong)seq;
 }
 
+JNIEXPORT jlongArray JNICALL
+Java_io_latticedb_Native_changefeedStatus(JNIEnv *env, jclass cls, jlong db_handle) {
+    init_cache(env); (void)cls;
+    uint8_t mode = 0;
+    uint64_t value = 0, oldest = 0, last = 0;
+    lattice_error rc = lattice_changefeed_status(
+        (lattice_database *)(uintptr_t)db_handle, &mode, &value, &oldest, &last);
+    if (!check(env, rc)) return NULL;
+    jlong out[4] = {(jlong)mode, (jlong)value, (jlong)oldest, (jlong)last};
+    jlongArray arr = (*env)->NewLongArray(env, 4);
+    if (arr == NULL) return NULL;
+    (*env)->SetLongArrayRegion(env, arr, 0, 4, out);
+    return arr;
+}
+
+JNIEXPORT jlong JNICALL
+Java_io_latticedb_Native_changefeedTrim(JNIEnv *env, jclass cls, jlong db_handle) {
+    init_cache(env); (void)cls;
+    uint64_t removed = 0;
+    lattice_error rc = lattice_changefeed_trim(
+        (lattice_database *)(uintptr_t)db_handle, &removed);
+    if (!check(env, rc)) return 0;
+    return (jlong)removed;
+}
+
 JNIEXPORT void JNICALL
 Java_io_latticedb_Native_streamSetOffset(JNIEnv *env, jclass cls, jlong txn_handle,
                                          jstring stream, jstring consumer, jlong sequence) {
@@ -1830,7 +1990,7 @@ Java_io_latticedb_Native_queryExecute(JNIEnv *env, jclass cls, jlong query_handl
     lattice_error rc = lattice_query_execute((lattice_query *)(uintptr_t)query_handle,
         (lattice_txn *)(uintptr_t)txn_handle, &result);
     if (rc != LATTICE_OK) {
-        throw_query_error(env, (lattice_query *)(uintptr_t)query_handle);
+        throw_query_error(env, (lattice_query *)(uintptr_t)query_handle, rc);
         return 0;
     }
     return (jlong)(uintptr_t)result;
@@ -1873,7 +2033,7 @@ Java_io_latticedb_Native_resultColumnName(JNIEnv *env, jclass cls, jlong result_
     init_cache(env); (void)cls;
     const char *name = lattice_result_column_name(
         (lattice_result *)(uintptr_t)result_handle, (uint32_t)index);
-    return name ? (*env)->NewStringUTF(env, name) : NULL;
+    return name ? utf8_to_jstring(env, name, strlen(name)) : NULL;
 }
 
 JNIEXPORT jobject JNICALL
@@ -1928,6 +2088,44 @@ Java_io_latticedb_Native_cacheStats(JNIEnv *env, jclass cls, jlong db_handle) {
     (*env)->SetObjectArrayElement(env, out, 1, h);
     (*env)->SetObjectArrayElement(env, out, 2, m);
     return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Checkpoints                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Returns long[4] = { pages_flushed, duration_ns, checkpoint_lsn,
+ * wal_truncated (0 or 1) }. */
+JNIEXPORT jlongArray JNICALL
+Java_io_latticedb_Native_checkpoint(JNIEnv *env, jclass cls, jlong db_handle,
+                                    jint mode) {
+    init_cache(env); (void)cls;
+    lattice_checkpoint_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    lattice_error rc = lattice_checkpoint(
+        (lattice_database *)(uintptr_t)db_handle,
+        (lattice_checkpoint_mode)mode, &stats);
+    if (!check(env, rc)) return NULL;
+    jlong values[4];
+    values[0] = (jlong)stats.pages_flushed;
+    values[1] = (jlong)stats.duration_ns;
+    values[2] = (jlong)stats.checkpoint_lsn;
+    values[3] = stats.wal_truncated ? 1 : 0;
+    jlongArray out = (*env)->NewLongArray(env, 4);
+    if (out == NULL) return NULL;
+    (*env)->SetLongArrayRegion(env, out, 0, 4, values);
+    return out;
+}
+
+/* The Java side refuses negative arguments, so both convert as they are. */
+JNIEXPORT void JNICALL
+Java_io_latticedb_Native_setAutoCheckpoint(JNIEnv *env, jclass cls,
+                                           jlong db_handle, jlong max_wal_frames,
+                                           jlong min_interval_ms) {
+    init_cache(env); (void)cls;
+    check(env, lattice_set_auto_checkpoint(
+        (lattice_database *)(uintptr_t)db_handle,
+        (uint64_t)max_wal_frames, (uint64_t)min_interval_ms));
 }
 
 /* ------------------------------------------------------------------ */

@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const ast = @import("ast.zig");
+const procedures = @import("procedures.zig");
 const lexer_mod = @import("lexer.zig");
 const Lexer = lexer_mod.Lexer;
 
@@ -190,12 +191,20 @@ pub const TokenType = enum {
     kw_distinct,
     kw_asc,
     kw_desc,
+    kw_case,
+    kw_when,
+    kw_then,
+    kw_else,
+    kw_end,
+    kw_union,
     // Literals
     integer,
     float,
     string,
     // Identifiers
     identifier,
+    /// A backtick-quoted name: never a keyword. Its text keeps the backticks.
+    quoted_identifier,
     parameter,
     // Operators
     eq,
@@ -213,6 +222,7 @@ pub const TokenType = enum {
     caret,
     vector_distance, // <=>
     fts_match, // @@
+    regex_match, // =~
     // Punctuation
     lparen,
     rparen,
@@ -225,6 +235,8 @@ pub const TokenType = enum {
     dot,
     dotdot, // .. for range quantifiers
     pipe,
+    ampersand, // & in label expressions
+    bang, // ! in label expressions
     arrow_right,
     arrow_left,
     dash,
@@ -252,6 +264,19 @@ pub const Parser = struct {
     /// When false, the arena is owned externally (e.g., by the query cache)
     /// and deinit will not free it.
     owns_arena: bool = true,
+    /// Every pattern subquery parsed, in the arena.
+    subqueries: std.ArrayList(*ast.PatternSubquery) = .empty,
+    /// The variables the clauses parsed so far leave in scope, for
+    /// `RETURN *` and `WITH *`. Cypher's scoping is by syntax, so the
+    /// parser can follow it.
+    scope: std.ArrayList([]const u8) = .empty,
+    /// Set while reading an expression that a '|' ends: the list and WHERE
+    /// of a comprehension, reduce() and FOREACH. A label test there reads
+    /// `x:A | ...` as the end of the expression; `x:(A|B)` still works.
+    pipe_ends_expression: bool = false,
+    /// Set while a pattern is read inside an expression, where a '-' after
+    /// it can be a minus.
+    pattern_in_expression: bool = false,
 
     const Self = @This();
 
@@ -304,16 +329,28 @@ pub const Parser = struct {
         self.advance();
 
         var clauses: std.ArrayList(ast.Clause) = .empty;
+        var unions = UnionParts{};
 
         while (!self.check(.eof)) {
+            if (self.check(.kw_union)) {
+                self.parseUnion(&unions, &clauses);
+                continue;
+            }
             if (self.parseClause()) |clause| {
                 clauses.append(self.arena.allocator(), clause) catch {
                     self.errorAtCurrent("Out of memory");
                     break;
                 };
+                self.updateScope(clause);
             } else {
                 self.synchronize();
             }
+        }
+
+        if (unions.branches.items.len > 0) {
+            if (clauses.items.len == 0 and !self.had_error) self.errorAtCurrent("Expected a query after UNION");
+            unions.branches.items[unions.branches.items.len - 1].clauses = clauses.toOwnedSlice(self.arena.allocator()) catch &.{};
+            clauses = .fromOwnedSlice(unions.first);
         }
 
         // Fail if we had errors or if errors were dropped due to OOM
@@ -335,12 +372,57 @@ pub const Parser = struct {
         query.* = .{
             .clauses = clauses.toOwnedSlice(self.arena.allocator()) catch &[_]ast.Clause{},
             .allocator = self.arena.allocator(),
+            .unions = unions.branches.items,
+            .subqueries = self.subqueries.items,
         };
 
         return .{
             .query = query,
             .errors = self.errors.items,
             .errors_dropped = self.errors_dropped,
+        };
+    }
+
+    /// The single queries of a UNION seen so far.
+    const UnionParts = struct {
+        /// The clauses before the first UNION.
+        first: []ast.Clause = &.{},
+        /// Each UNION and the clauses after it; the last one's clauses are
+        /// still being parsed.
+        branches: std.ArrayList(ast.UnionBranch) = .empty,
+    };
+
+    /// A UNION or UNION ALL between two single queries. The clauses parsed
+    /// so far end the query before it.
+    fn parseUnion(self: *Self, unions: *UnionParts, clauses: *std.ArrayList(ast.Clause)) void {
+        const loc = self.currentLocation();
+        self.advance();
+        // ALL is not reserved, so it is read here by its spelling.
+        const all = self.checkWord("all");
+        if (all) self.advance();
+
+        // Each single query of a UNION has its own variables.
+        self.scope.clearRetainingCapacity();
+        if (clauses.items.len == 0) {
+            self.errorAt(loc, "UNION needs a query before it");
+            return;
+        }
+        const finished = clauses.toOwnedSlice(self.arena.allocator()) catch {
+            self.errorAt(loc, "Out of memory");
+            return;
+        };
+        if (unions.branches.items.len == 0) {
+            unions.first = finished;
+        } else {
+            const previous = &unions.branches.items[unions.branches.items.len - 1];
+            previous.clauses = finished;
+            if (previous.all != all) {
+                self.errorAt(loc, "UNION and UNION ALL cannot be mixed in one query");
+                return;
+            }
+        }
+        unions.branches.append(self.arena.allocator(), .{ .all = all, .clauses = &.{}, .location = loc }) catch {
+            self.errorAt(loc, "Out of memory");
         };
     }
 
@@ -351,6 +433,12 @@ pub const Parser = struct {
     fn parseClause(self: *Self) ?ast.Clause {
         if (self.match(.kw_match)) {
             return self.parseMatchClause();
+        } else if (self.checkWord("optional")) {
+            return self.parseOptionalMatchClause();
+        } else if (self.checkWord("call")) {
+            return self.parseCallClause();
+        } else if (self.checkWord("foreach")) {
+            return self.parseForeachClause();
         } else if (self.match(.kw_where)) {
             return self.parseWhereClause();
         } else if (self.match(.kw_return)) {
@@ -382,9 +470,46 @@ pub const Parser = struct {
         } else if (self.match(.kw_unwind)) {
             return self.parseUnwindClause();
         } else {
-            self.errorAtCurrent("Expected MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE, WITH, MERGE, UNWIND, ORDER BY, LIMIT, or SKIP");
+            self.errorAtCurrent(self.unsupportedAt() orelse
+                "Expected MATCH, OPTIONAL MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE, WITH, MERGE, UNWIND, CALL, FOREACH, UNION, ORDER BY, LIMIT, or SKIP");
             return null;
         }
+    }
+
+    /// Clauses of Cypher, GQL and Neo4j that are not supported, by the word
+    /// they start with, and what to say instead of "Expected MATCH, ...".
+    const unsupported_clauses = [_]struct { word: []const u8, message: []const u8 }{
+        .{ .word = "load", .message = "LOAD CSV is not supported; import files with the lattice CLI or the API" },
+        .{ .word = "use", .message = "USE is not supported: a query runs against the database it is sent to" },
+        .{ .word = "show", .message = "SHOW is not supported; CALL db.labels(), db.relationshipTypes(), db.propertyKeys() or db.indexes() lists the catalog" },
+        .{ .word = "explain", .message = "EXPLAIN is not supported" },
+        .{ .word = "profile", .message = "PROFILE is not supported" },
+        .{ .word = "drop", .message = "DROP is not supported" },
+        .{ .word = "alter", .message = "ALTER is not supported" },
+        .{ .word = "grant", .message = "GRANT is not supported" },
+        .{ .word = "revoke", .message = "REVOKE is not supported" },
+        .{ .word = "deny", .message = "DENY is not supported" },
+        .{ .word = "start", .message = "START is not supported; use MATCH" },
+        .{ .word = "finish", .message = "FINISH is not supported; a query without RETURN returns no columns to read" },
+        .{ .word = "filter", .message = "FILTER is not supported; use WHERE, or WITH ... WHERE" },
+        .{ .word = "let", .message = "LET is not supported; use WITH expression AS name" },
+        .{ .word = "insert", .message = "INSERT is not supported; use CREATE" },
+        .{ .word = "terminate", .message = "TERMINATE is not supported" },
+        .{ .word = "nodetach", .message = "NODETACH DELETE is not supported; DELETE already refuses a node that has relationships" },
+    };
+
+    /// The message for a construct this parser knows it does not support,
+    /// found where a clause should start, or null.
+    fn unsupportedAt(self: *Self) ?[]const u8 {
+        // `a || b` ends the expression before it at the first '|'.
+        if (self.check(.pipe) and self.peekType() == .pipe) {
+            return "'||' is not supported; use + to concatenate strings and lists";
+        }
+        if (!self.check(.identifier)) return null;
+        for (unsupported_clauses) |c| {
+            if (std.ascii.eqlIgnoreCase(self.current.text, c.word)) return c.message;
+        }
+        return null;
     }
 
     fn parseMatchClause(self: *Self) ?ast.Clause {
@@ -416,6 +541,213 @@ pub const Parser = struct {
         return .{ .match = clause };
     }
 
+    /// `OPTIONAL MATCH`. OPTIONAL is not reserved, so that it stays usable
+    /// as a name; it is read by its spelling where a clause starts.
+    fn parseOptionalMatchClause(self: *Self) ?ast.Clause {
+        self.advance();
+        if (self.checkWord("call")) {
+            self.errorAtCurrent("OPTIONAL CALL is not supported");
+            return null;
+        }
+        if (!self.consume(.kw_match, "Expected MATCH after OPTIONAL")) return null;
+        const clause = self.parseMatchClause() orelse return null;
+        clause.match.optional = true;
+        return clause;
+    }
+
+    /// `FOREACH (x IN list | clause ...)`. FOREACH is not reserved.
+    fn parseForeachClause(self: *Self) ?ast.Clause {
+        const loc = self.currentLocation();
+        self.advance();
+        if (!self.consume(.lparen, "Expected '(' after FOREACH")) return null;
+        if (!self.checkVariable()) {
+            self.errorAtCurrent("Expected a variable in FOREACH");
+            return null;
+        }
+        const variable = self.currentName();
+        self.advance();
+        if (!self.consume(.kw_in, "Expected IN after the variable")) return null;
+        const list = self.parseExpressionBeforePipe() orelse return null;
+        if (!self.consume(.pipe, "Expected '|' before FOREACH's clauses")) return null;
+        const a = self.arena.allocator();
+        var clauses: std.ArrayList(ast.Clause) = .empty;
+        while (!self.check(.rparen)) {
+            if (self.check(.eof)) {
+                self.errorAtCurrent("Expected ')' to close FOREACH");
+                return null;
+            }
+            const clause = self.parseClause() orelse return null;
+            switch (clause) {
+                .create, .merge, .set, .remove, .delete, .foreach => {},
+                else => {
+                    self.errorAt(loc, "FOREACH can only contain CREATE, MERGE, SET, REMOVE, DELETE and FOREACH");
+                    return null;
+                },
+            }
+            clauses.append(a, clause) catch return null;
+        }
+        if (clauses.items.len == 0) {
+            self.errorAtCurrent("Expected a clause in FOREACH");
+            return null;
+        }
+        self.advance();
+        const node = a.create(ast.ForeachClause) catch return null;
+        node.* = .{ .variable = variable, .list = list, .clauses = clauses.items, .location = loc };
+        return .{ .foreach = node };
+    }
+
+    /// `CALL name(args) [YIELD ...]`. CALL and YIELD are not reserved.
+    fn parseCallClause(self: *Self) ?ast.Clause {
+        const loc = self.currentLocation();
+        self.advance();
+        const a = self.arena.allocator();
+        if (self.check(.lbrace)) return self.parseCallSubquery(loc);
+        if (!self.checkName()) {
+            self.errorAtCurrent("Expected a procedure name after CALL");
+            return null;
+        }
+        var name: std.ArrayList(u8) = .empty;
+        name.appendSlice(a, self.currentName()) catch return null;
+        self.advance();
+        while (self.match(.dot)) {
+            if (!self.checkName()) {
+                self.errorAtCurrent("Expected a procedure name after '.'");
+                return null;
+            }
+            name.append(a, '.') catch return null;
+            name.appendSlice(a, self.currentName()) catch return null;
+            self.advance();
+        }
+        if (!self.consume(.lparen, "Expected '(' after the procedure name")) return null;
+        var args: std.ArrayList(*ast.Expression) = .empty;
+        if (!self.check(.rparen)) {
+            while (true) {
+                const arg = self.parseExpression() orelse return null;
+                args.append(a, arg) catch return null;
+                if (!self.match(.comma)) break;
+            }
+        }
+        if (!self.consume(.rparen, "Expected ')' after the procedure's arguments")) return null;
+
+        var yields: ?[]ast.YieldItem = null;
+        var yield_all = false;
+        if (self.checkWord("yield")) {
+            self.advance();
+            if (self.match(.star)) {
+                yield_all = true;
+            } else {
+                var items: std.ArrayList(ast.YieldItem) = .empty;
+                while (true) {
+                    if (!self.checkVariable()) {
+                        self.errorAtCurrent("Expected a column name after YIELD");
+                        return null;
+                    }
+                    const item_loc = self.currentLocation();
+                    const column = self.currentName();
+                    self.advance();
+                    var alias: ?[]const u8 = null;
+                    if (self.match(.kw_as)) {
+                        if (!self.checkVariable()) {
+                            self.errorAtCurrent("Expected a name after AS");
+                            return null;
+                        }
+                        alias = self.currentName();
+                        self.advance();
+                    }
+                    items.append(a, .{ .column = column, .alias = alias, .location = item_loc }) catch return null;
+                    if (!self.match(.comma)) break;
+                }
+                yields = items.items;
+            }
+        }
+
+        const clause = a.create(ast.CallClause) catch return null;
+        clause.* = .{
+            .procedure = name.items,
+            .arguments = args.items,
+            .yields = yields,
+            .yield_all = yield_all,
+            .location = loc,
+        };
+        return .{ .call = clause };
+    }
+
+    /// `CALL { query }`, at the '{'. The query has its own scope: what a
+    /// leading WITH imports from outside, or nothing.
+    fn parseCallSubquery(self: *Self, loc: ast.SourceLocation) ?ast.Clause {
+        const node = self.parseBracedQuery(loc, "CALL", false) orelse return null;
+        if (self.check(.kw_in)) {
+            self.errorAtCurrent("CALL { ... } IN TRANSACTIONS is not supported; run the batches as separate queries");
+            return null;
+        }
+        return .{ .call_subquery = node };
+    }
+
+    /// `{ query [UNION query ...] }`, at the '{', for CALL (`what`), EXISTS,
+    /// COUNT or COLLECT. The query has a scope of its own: CALL's starts
+    /// with what a leading WITH imports, the others' with every variable
+    /// around them (`sees_outer`). The scope around comes back after it.
+    fn parseBracedQuery(self: *Self, loc: ast.SourceLocation, comptime what: []const u8, sees_outer: bool) ?*ast.CallSubquery {
+        const a = self.arena.allocator();
+        self.advance();
+        const outer = a.dupe([]const u8, self.scope.items) catch return null;
+        defer {
+            self.scope.clearRetainingCapacity();
+            self.scope.appendSlice(a, outer) catch {
+                self.errors_dropped = true;
+            };
+        }
+        self.enterSubqueryScope(outer, sees_outer);
+
+        var clauses: std.ArrayList(ast.Clause) = .empty;
+        var unions = UnionParts{};
+        while (!self.check(.rbrace)) {
+            if (self.check(.eof)) {
+                self.errorAtCurrent("Expected '}' to close " ++ what ++ " { ... }");
+                return null;
+            }
+            if (self.check(.kw_union)) {
+                self.parseUnion(&unions, &clauses);
+                if (self.had_error) return null;
+                self.enterSubqueryScope(outer, sees_outer);
+                continue;
+            }
+            const clause = self.parseClause() orelse return null;
+            clauses.append(a, clause) catch return null;
+            self.updateScope(clause);
+        }
+        self.advance();
+        if (clauses.items.len == 0) {
+            self.errorAt(loc, if (unions.branches.items.len > 0) "Expected a query after UNION" else what ++ " { } needs a query inside the braces");
+            return null;
+        }
+
+        var first = clauses.items;
+        if (unions.branches.items.len > 0) {
+            unions.branches.items[unions.branches.items.len - 1].clauses = clauses.items;
+            first = unions.first;
+        }
+        const node = a.create(ast.CallSubquery) catch return null;
+        node.* = .{ .clauses = first, .unions = unions.branches.items, .location = loc };
+        return node;
+    }
+
+    /// The scope a query inside braces starts with: the outer one, for a
+    /// leading WITH to import from or for a subquery that sees it, or none.
+    fn enterSubqueryScope(self: *Self, outer: []const []const u8, sees_outer: bool) void {
+        self.scope.clearRetainingCapacity();
+        if (sees_outer or self.check(.kw_with)) self.scope.appendSlice(self.arena.allocator(), outer) catch {
+            self.errors_dropped = true;
+        };
+    }
+
+    /// Whether the current token is an identifier spelled `word`, in any
+    /// case: a word that means something only in one place, and so is not
+    /// reserved.
+    fn checkWord(self: *Self, word: []const u8) bool {
+        return self.check(.identifier) and std.ascii.eqlIgnoreCase(self.current.text, word);
+    }
+
     fn parseWhereClause(self: *Self) ?ast.Clause {
         const loc = self.previousLocation();
 
@@ -435,51 +767,149 @@ pub const Parser = struct {
         const loc = self.previousLocation();
         const distinct = self.match(.kw_distinct);
 
-        var items: std.ArrayList(ast.ReturnItem) = .empty;
-
-        // Parse first return item
-        if (self.parseReturnItem()) |item| {
-            items.append(self.arena.allocator(), item) catch return null;
-        } else {
-            return null;
-        }
-
-        // Parse additional comma-separated items
-        while (self.match(.comma)) {
-            if (self.parseReturnItem()) |item| {
-                items.append(self.arena.allocator(), item) catch return null;
-            } else {
-                return null;
-            }
-        }
+        const items = self.parseProjectionItems("RETURN") orelse return null;
 
         const clause = self.arena.allocator().create(ast.ReturnClause) catch return null;
         clause.* = .{
             .distinct = distinct,
-            .items = items.toOwnedSlice(self.arena.allocator()) catch return null,
+            .items = items,
             .location = loc,
         };
 
         return .{ .return_ = clause };
     }
 
+    /// The items of a RETURN or WITH. A leading `*` stands for every
+    /// variable in scope, in alphabetical order, each named after itself;
+    /// more items may follow it.
+    fn parseProjectionItems(self: *Self, keyword: []const u8) ?[]ast.ReturnItem {
+        const a = self.arena.allocator();
+        var items: std.ArrayList(ast.ReturnItem) = .empty;
+        var more = true;
+        if (self.check(.star)) {
+            const star = self.currentLocation();
+            self.advance();
+            const names = a.dupe([]const u8, self.scope.items) catch return null;
+            std.mem.sort([]const u8, names, {}, struct {
+                fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lessThan);
+            for (names) |name| {
+                const expr = a.create(ast.Expression) catch return null;
+                expr.* = .{ .variable = .{ .name = name, .location = star } };
+                items.append(a, .{ .expression = expr, .alias = null, .text = name }) catch return null;
+            }
+            more = self.match(.comma);
+            if (!more and names.len == 0) {
+                self.errorAt(star, if (std.mem.eql(u8, keyword, "RETURN"))
+                    "RETURN * is not allowed when there are no variables in scope"
+                else
+                    "WITH * is not allowed when there are no variables in scope");
+                return null;
+            }
+        }
+        while (more) {
+            if (self.check(.star)) {
+                self.errorAtCurrent("* must come first in RETURN or WITH");
+                return null;
+            }
+            const item = self.parseReturnItem() orelse return null;
+            items.append(a, item) catch return null;
+            more = self.match(.comma);
+        }
+        return items.toOwnedSlice(a) catch null;
+    }
+
+    /// Follow the variables a top-level clause leaves in scope.
+    fn updateScope(self: *Self, clause: ast.Clause) void {
+        switch (clause) {
+            .match => |m| for (m.patterns) |pattern| self.scopePattern(pattern),
+            .create => |c| for (c.patterns) |pattern| self.scopePattern(pattern),
+            .merge => |m| self.scopePattern(m.pattern),
+            .unwind => |u| self.addToScope(u.variable),
+            .with => |w| {
+                // WITH keeps only what it projects.
+                self.scope.clearRetainingCapacity();
+                for (w.items) |item| {
+                    if (item.alias) |alias| {
+                        self.addToScope(alias);
+                    } else if (item.expression.* == .variable) {
+                        self.addToScope(item.expression.variable.name);
+                    }
+                }
+            },
+            .call => |c| if (c.yields) |yields| {
+                for (yields) |y| self.addToScope(y.alias orelse y.column);
+            } else if (c.yield_all) {
+                if (procedures.Procedure.find(c.procedure)) |p| for (p.columns()) |column| self.addToScope(column);
+            },
+            // What the subquery returns joins the scope.
+            .call_subquery => |sq| {
+                var last = sq.clauses.len;
+                while (last > 0 and (sq.clauses[last - 1] == .order_by or sq.clauses[last - 1] == .skip or sq.clauses[last - 1] == .limit)) last -= 1;
+                if (last > 0 and sq.clauses[last - 1] == .return_) {
+                    for (sq.clauses[last - 1].return_.items) |item| {
+                        if (item.alias) |alias| {
+                            self.addToScope(alias);
+                        } else if (item.expression.* == .variable) {
+                            self.addToScope(item.expression.variable.name);
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn scopePattern(self: *Self, pattern: ast.Pattern) void {
+        if (pattern.path_variable) |name| self.addToScope(name);
+        for (pattern.elements) |element| switch (element) {
+            .node => |n| if (n.variable) |name| self.addToScope(name),
+            .edge => |e| if (e.variable) |name| self.addToScope(name),
+        };
+    }
+
+    fn addToScope(self: *Self, name: []const u8) void {
+        for (self.scope.items) |known| {
+            if (std.mem.eql(u8, known, name)) return;
+        }
+        self.scope.append(self.arena.allocator(), name) catch {
+            self.errors_dropped = true;
+        };
+    }
+
     fn parseReturnItem(self: *Self) ?ast.ReturnItem {
+        const first = self.current.text;
         const expr = self.parseExpression() orelse return null;
+        const text = sourceSpan(first, self.previous.text);
         var alias: ?[]const u8 = null;
 
         if (self.match(.kw_as)) {
-            if (!self.check(.identifier)) {
+            if (!self.checkVariable()) {
                 self.errorAtCurrent("Expected identifier after AS");
                 return null;
             }
-            alias = self.current.text;
+            alias = self.currentName();
             self.advance();
         }
 
         return .{
             .expression = expr,
             .alias = alias,
+            .text = text,
         };
+    }
+
+    /// The source text from the start of `first` to the end of `last`.
+    ///
+    /// Token text is a slice of the query source, so two tokens in order
+    /// bound the source between them.
+    fn sourceSpan(first: []const u8, last: []const u8) []const u8 {
+        const start = @intFromPtr(first.ptr);
+        const end = @intFromPtr(last.ptr) + last.len;
+        if (end < start) return first;
+        return first.ptr[0 .. end - start];
     }
 
     fn parseOrderByClause(self: *Self) ?ast.Clause {
@@ -526,9 +956,26 @@ pub const Parser = struct {
             _ = self.match(.kw_asc); // optional ASC
         }
 
+        // `NULLS FIRST` / `NULLS LAST`: NULLS is not reserved, and no name
+        // can follow an ORDER BY item.
+        var nulls: ?ast.NullsOrder = null;
+        if (self.checkWord("nulls")) {
+            self.advance();
+            if (self.checkWord("first")) {
+                nulls = .first;
+            } else if (self.checkWord("last")) {
+                nulls = .last;
+            } else {
+                self.errorAtCurrent("Expected FIRST or LAST after NULLS");
+                return null;
+            }
+            self.advance();
+        }
+
         return .{
             .expression = expr,
             .descending = descending,
+            .nulls = nulls,
         };
     }
 
@@ -562,8 +1009,18 @@ pub const Parser = struct {
         const loc = self.previousLocation();
         var patterns: std.ArrayList(ast.Pattern) = .empty;
 
+        // Schema statements: CREATE INDEX, CREATE CONSTRAINT and the like.
+        // A pattern starts with '(' or a path variable and '='.
+        if (self.check(.identifier) and self.peekType() != .eq) {
+            if (self.checkWord("index") or self.checkWord("constraint") or self.peekType() == .identifier) {
+                self.errorAtCurrent("Schema statements (CREATE INDEX, CREATE CONSTRAINT, ...) are not supported; indexes are created through the API");
+                return null;
+            }
+        }
+
         // Parse first pattern (reuse same pattern parsing as MATCH)
         if (self.parsePattern()) |pattern| {
+            if (self.refuseNamedPath(pattern, "CREATE")) return null;
             patterns.append(self.arena.allocator(), pattern) catch return null;
         } else {
             return null;
@@ -572,6 +1029,7 @@ pub const Parser = struct {
         // Parse additional comma-separated patterns
         while (self.match(.comma)) {
             if (self.parsePattern()) |pattern| {
+                if (self.refuseNamedPath(pattern, "CREATE")) return null;
                 patterns.append(self.arena.allocator(), pattern) catch return null;
             } else {
                 return null;
@@ -648,11 +1106,11 @@ pub const Parser = struct {
 
     fn parseSetItem(self: *Self) ?ast.SetItem {
         // Parse variable name first
-        if (!self.check(.identifier)) {
+        if (!self.checkVariable()) {
             self.errorAtCurrent("Expected variable name in SET");
             return null;
         }
-        const var_name = self.current.text;
+        const var_name = self.currentName();
         const var_loc = self.currentLocation();
         self.advance();
 
@@ -672,11 +1130,11 @@ pub const Parser = struct {
             return self.parseSetReplace(var_expr);
         } else if (self.match(.dot)) {
             // SET n.prop = value - property assignment
-            if (!self.check(.identifier)) {
+            if (!self.checkName()) {
                 self.errorAtCurrent("Expected property name after '.'");
                 return null;
             }
-            const prop_name = self.current.text;
+            const prop_name = self.currentName();
             self.advance();
 
             if (!self.consume(.eq, "Expected '=' after property name in SET")) {
@@ -700,20 +1158,20 @@ pub const Parser = struct {
         var labels: std.ArrayList([]const u8) = .empty;
 
         // First label
-        if (!self.check(.identifier)) {
+        if (!self.checkName()) {
             self.errorAtCurrent("Expected label name after ':'");
             return null;
         }
-        labels.append(self.arena.allocator(), self.current.text) catch return null;
+        labels.append(self.arena.allocator(), self.currentName()) catch return null;
         self.advance();
 
         // Additional labels (SET n:Label1:Label2)
         while (self.match(.colon)) {
-            if (!self.check(.identifier)) {
+            if (!self.checkName()) {
                 self.errorAtCurrent("Expected label name after ':'");
                 return null;
             }
-            labels.append(self.arena.allocator(), self.current.text) catch return null;
+            labels.append(self.arena.allocator(), self.currentName()) catch return null;
             self.advance();
         }
 
@@ -772,11 +1230,11 @@ pub const Parser = struct {
 
     fn parseRemoveItem(self: *Self) ?ast.RemoveItem {
         // Parse variable name first
-        if (!self.check(.identifier)) {
+        if (!self.checkVariable()) {
             self.errorAtCurrent("Expected variable name in REMOVE");
             return null;
         }
-        const var_name = self.current.text;
+        const var_name = self.currentName();
         const var_loc = self.currentLocation();
         self.advance();
 
@@ -790,11 +1248,11 @@ pub const Parser = struct {
             return self.parseRemoveLabels(var_expr);
         } else if (self.match(.dot)) {
             // REMOVE n.prop - property removal
-            if (!self.check(.identifier)) {
+            if (!self.checkName()) {
                 self.errorAtCurrent("Expected property name after '.'");
                 return null;
             }
-            const prop_name = self.current.text;
+            const prop_name = self.currentName();
             self.advance();
 
             return .{ .property = .{
@@ -812,20 +1270,20 @@ pub const Parser = struct {
         var labels: std.ArrayList([]const u8) = .empty;
 
         // First label
-        if (!self.check(.identifier)) {
+        if (!self.checkName()) {
             self.errorAtCurrent("Expected label name after ':'");
             return null;
         }
-        labels.append(self.arena.allocator(), self.current.text) catch return null;
+        labels.append(self.arena.allocator(), self.currentName()) catch return null;
         self.advance();
 
         // Additional labels (REMOVE n:Label1:Label2)
         while (self.match(.colon)) {
-            if (!self.check(.identifier)) {
+            if (!self.checkName()) {
                 self.errorAtCurrent("Expected label name after ':'");
                 return null;
             }
-            labels.append(self.arena.allocator(), self.current.text) catch return null;
+            labels.append(self.arena.allocator(), self.currentName()) catch return null;
             self.advance();
         }
 
@@ -843,23 +1301,7 @@ pub const Parser = struct {
         const loc = self.previousLocation();
         const distinct = self.match(.kw_distinct);
 
-        var items: std.ArrayList(ast.ReturnItem) = .empty;
-
-        // Parse first WITH item (same syntax as RETURN items)
-        if (self.parseReturnItem()) |item| {
-            items.append(self.arena.allocator(), item) catch return null;
-        } else {
-            return null;
-        }
-
-        // Parse additional comma-separated items
-        while (self.match(.comma)) {
-            if (self.parseReturnItem()) |item| {
-                items.append(self.arena.allocator(), item) catch return null;
-            } else {
-                return null;
-            }
-        }
+        const items = self.parseProjectionItems("WITH") orelse return null;
 
         // Optional WHERE after WITH
         var where_expr: ?*ast.Expression = null;
@@ -871,7 +1313,7 @@ pub const Parser = struct {
         const clause = self.arena.allocator().create(ast.WithClause) catch return null;
         clause.* = .{
             .distinct = distinct,
-            .items = items.toOwnedSlice(self.arena.allocator()) catch return null,
+            .items = items,
             .where = where_expr,
             .location = loc,
         };
@@ -884,6 +1326,7 @@ pub const Parser = struct {
 
         // Parse a single pattern (MERGE takes exactly one pattern)
         const pattern = self.parsePattern() orelse return null;
+        if (self.refuseNamedPath(pattern, "MERGE")) return null;
 
         // Parse optional ON CREATE SET / ON MATCH SET
         var on_create: ?[]ast.SetItem = null;
@@ -945,11 +1388,11 @@ pub const Parser = struct {
         // Expect AS variable
         if (!self.consume(.kw_as, "Expected AS after UNWIND expression")) return null;
 
-        if (!self.check(.identifier)) {
+        if (!self.checkVariable()) {
             self.errorAtCurrent("Expected variable name after AS");
             return null;
         }
-        const variable = self.current.text;
+        const variable = self.currentName();
         self.advance();
 
         const clause = self.arena.allocator().create(ast.UnwindClause) catch return null;
@@ -968,6 +1411,23 @@ pub const Parser = struct {
 
     fn parsePattern(self: *Self) ?ast.Pattern {
         var elements: std.ArrayList(ast.PatternElement) = .empty;
+
+        // `p = (a)-->(b)`: a pattern starts with a node, so a name here
+        // names the path.
+        var path_variable: ?[]const u8 = null;
+        const path_location = self.currentLocation();
+        if (self.checkVariable() and self.shortestKind() == .none) {
+            path_variable = self.currentName();
+            self.advance();
+            if (!self.consume(.eq, "Expected '=' after a path variable")) return null;
+        }
+
+        // shortestPath(pattern) and allShortestPaths(pattern).
+        const shortest = self.shortestKind();
+        if (shortest != .none) {
+            self.advance();
+            self.advance();
+        }
 
         // Pattern must start with a node
         if (self.parseNodePattern()) |node| {
@@ -988,6 +1448,12 @@ pub const Parser = struct {
                 return null;
             }
 
+            // GQL's quantified relationship, -[:R]->{1,3} or -->+.
+            if (self.check(.lbrace) or self.check(.plus)) {
+                self.errorAtCurrent("Quantified relationships, such as -[:R]->{1,3} or -[:R]->+, are not supported; write -[:R*1..3]-> or -[:R*]->");
+                return null;
+            }
+
             // Edge must be followed by a node
             if (self.parseNodePattern()) |node| {
                 const node_ptr = self.arena.allocator().create(ast.NodePattern) catch return null;
@@ -999,17 +1465,63 @@ pub const Parser = struct {
             }
         }
 
+        // GQL's quantified path pattern after a node, (x) ((a)-->(b)){1,3}.
+        // Nothing else lets a '(' follow a pattern in a clause.
+        if (!self.pattern_in_expression and shortest == .none and self.check(.lparen)) {
+            self.errorAtCurrent("A '(' after a pattern starts a quantified path pattern, such as (x) ((a)-->(b)){1,3}, which is not supported; separate two patterns with a comma, or use a variable-length relationship -[*1..3]->");
+            return null;
+        }
+
+        if (shortest != .none and !self.consume(.rparen, "Expected ')' to close shortestPath()")) return null;
+
         return .{
             .elements = elements.toOwnedSlice(self.arena.allocator()) catch return null,
+            .path_variable = path_variable,
+            .path_location = path_location,
+            .shortest = shortest,
         };
     }
 
+    /// Whether the current token starts shortestPath( or allShortestPaths(.
+    fn shortestKind(self: *Self) ast.Pattern.Shortest {
+        if (self.peekType() != .lparen) return .none;
+        if (self.checkWord("shortestpath")) return .one;
+        if (self.checkWord("allshortestpaths")) return .all;
+        return .none;
+    }
+
+    /// CREATE and MERGE do not bind a named path.
+    fn refuseNamedPath(self: *Self, pattern: ast.Pattern, comptime clause: []const u8) bool {
+        if (pattern.path_variable == null) return false;
+        self.errorAt(pattern.path_location, "A named path in " ++ clause ++ " is not supported");
+        return true;
+    }
+
+    /// Whether a relationship starts here. In an expression, a '-' not
+    /// followed by '[', '-' or '->' is a minus after a pattern, as in
+    /// `(n)-->() - 1`.
     fn checkEdgeStart(self: *Self) bool {
-        return self.check(.dash) or self.check(.arrow_left);
+        if (self.check(.arrow_left)) return true;
+        if (!self.check(.dash)) return false;
+        if (!self.pattern_in_expression) return true;
+        return switch (self.peekType()) {
+            .lbracket, .dash, .arrow_right => true,
+            else => false,
+        };
     }
 
     fn parseNodePattern(self: *Self) ?ast.NodePattern {
+        if (self.peekType() == .lparen) {
+            if (self.shortestKind() != .none) {
+                self.errorAtCurrent("shortestPath() and allShortestPaths() take a whole pattern, as in MATCH p = shortestPath((a)-[*]->(b))");
+                return null;
+            }
+        }
         if (!self.consume(.lparen, "Expected '(' to start node pattern")) {
+            return null;
+        }
+        if (self.check(.lparen)) {
+            self.errorAtCurrent("Parenthesised path patterns, such as the quantified ((a)-->(b)){1,3}, are not supported; use a variable-length relationship -[*1..3]->");
             return null;
         }
 
@@ -1019,19 +1531,37 @@ pub const Parser = struct {
         var properties: ?[]ast.PropertyEntry = null;
 
         // Optional variable
-        if (self.check(.identifier)) {
-            variable = self.current.text;
+        if (self.checkVariable()) {
+            variable = self.currentName();
             self.advance();
         }
 
-        // Optional labels
-        while (self.match(.colon)) {
-            if (!self.check(.identifier)) {
-                self.errorAtCurrent("Expected label after ':'");
-                return null;
+        // Optional labels: `:A:B`, or one label expression `:A|B`, `:A&!B`.
+        // The labels every match must have go in `labels`, where the planner
+        // can scan for them; the rest is checked on each node.
+        var label_expr: ?*ast.LabelExpr = null;
+        if (self.match(.colon)) {
+            const first = self.parseLabelExpr(true) orelse return null;
+            if (first.* == .label and self.check(.colon)) {
+                labels.append(self.arena.allocator(), first.label) catch return null;
+                while (self.match(.colon)) {
+                    if (!self.checkName()) {
+                        self.errorAtCurrent(if (self.check(.bang) or self.check(.percent) or self.check(.lparen))
+                            "A label expression cannot follow :A:B; write it with &, as in :A&!B"
+                        else
+                            "Expected label after ':'");
+                        return null;
+                    }
+                    labels.append(self.arena.allocator(), self.currentName()) catch return null;
+                    self.advance();
+                }
+                if (self.check(.pipe) or self.check(.ampersand)) {
+                    self.errorAtCurrent("A label expression cannot follow :A:B; write it with &, as in :A&B|C");
+                    return null;
+                }
+            } else {
+                label_expr = self.splitLabels(first, &labels) catch return null;
             }
-            labels.append(self.arena.allocator(), self.current.text) catch return null;
-            self.advance();
         }
 
         // Optional properties
@@ -1039,6 +1569,10 @@ pub const Parser = struct {
             properties = self.parsePropertyMap();
         }
 
+        if (self.check(.kw_where)) {
+            self.errorAtCurrent("WHERE inside a node pattern is not supported; put the condition in a WHERE after the pattern");
+            return null;
+        }
         if (!self.consume(.rparen, "Expected ')' to end node pattern")) {
             return null;
         }
@@ -1048,7 +1582,95 @@ pub const Parser = struct {
             .labels = labels.toOwnedSlice(self.arena.allocator()) catch return null,
             .properties = properties,
             .location = loc,
+            .label_expr = label_expr,
         };
+    }
+
+    /// Move the plain labels of `e`'s top-level `&` into `labels`, and
+    /// return what is left: null when nothing is.
+    fn splitLabels(self: *Self, e: *ast.LabelExpr, labels: *std.ArrayList([]const u8)) Allocator.Error!?*ast.LabelExpr {
+        switch (e.*) {
+            .label => |name| {
+                try labels.append(self.arena.allocator(), name);
+                return null;
+            },
+            .and_ => |pair| {
+                const left = try self.splitLabels(pair[0], labels) orelse return self.splitLabels(pair[1], labels);
+                const right = try self.splitLabels(pair[1], labels) orelse return left;
+                const both = try self.arena.allocator().create(ast.LabelExpr);
+                both.* = .{ .and_ = .{ left, right } };
+                return both;
+            },
+            else => return e,
+        }
+    }
+
+    /// A label expression, after the ':': `A`, `%`, `!e`, `e&e`, `e|e`
+    /// (also `e|:B`), and parentheses. In a pattern, '|' always continues
+    /// it; in an expression, not where `pipe_ends_expression` says a '|'
+    /// ends the expression.
+    fn parseLabelExpr(self: *Self, in_pattern: bool) ?*ast.LabelExpr {
+        var left = self.parseLabelTerm() orelse return null;
+        while (self.check(.pipe) and self.peekType() != .pipe and (in_pattern or !self.pipe_ends_expression)) {
+            self.advance();
+            _ = self.match(.colon);
+            const right = self.parseLabelTerm() orelse return null;
+            const both = self.arena.allocator().create(ast.LabelExpr) catch return null;
+            both.* = .{ .or_ = .{ left, right } };
+            left = both;
+        }
+        return left;
+    }
+
+    fn parseLabelTerm(self: *Self) ?*ast.LabelExpr {
+        var left = self.parseLabelFactor() orelse return null;
+        while (self.match(.ampersand)) {
+            const right = self.parseLabelFactor() orelse return null;
+            const both = self.arena.allocator().create(ast.LabelExpr) catch return null;
+            both.* = .{ .and_ = .{ left, right } };
+            left = both;
+        }
+        return left;
+    }
+
+    fn parseLabelFactor(self: *Self) ?*ast.LabelExpr {
+        const a = self.arena.allocator();
+        const e = a.create(ast.LabelExpr) catch return null;
+        if (self.match(.bang)) {
+            e.* = .{ .not_ = self.parseLabelFactor() orelse return null };
+        } else if (self.match(.percent)) {
+            e.* = .wildcard;
+        } else if (self.match(.lparen)) {
+            const saved = self.pipe_ends_expression;
+            self.pipe_ends_expression = false;
+            defer self.pipe_ends_expression = saved;
+            const inner = self.parseLabelExpr(true) orelse return null;
+            if (!self.consume(.rparen, "Expected ')' to close the label expression")) return null;
+            return inner;
+        } else if (self.checkName()) {
+            e.* = .{ .label = self.currentName() };
+            self.advance();
+        } else {
+            self.errorAtCurrent("Expected a label after ':'");
+            return null;
+        }
+        return e;
+    }
+
+    /// An expression a '|' ends, for a label test inside it.
+    fn parseExpressionBeforePipe(self: *Self) ?*ast.Expression {
+        const saved = self.pipe_ends_expression;
+        self.pipe_ends_expression = true;
+        defer self.pipe_ends_expression = saved;
+        return self.parseExpression();
+    }
+
+    const relationship_type_expression = "A relationship's types take only '|', as in -[:A|B]->; type expressions with '&', '!', '%' or parentheses are not supported, but a WHERE can test the type, as in WHERE NOT r:A";
+
+    /// Whether the token after a relationship pattern's ':' or '|' starts a
+    /// type expression other than a name.
+    fn relTypeExpressionAhead(self: *Self) bool {
+        return self.check(.bang) or self.check(.percent) or self.check(.lparen) or self.check(.ampersand);
     }
 
     fn parseEdgePattern(self: *Self) ?ast.EdgePattern {
@@ -1073,28 +1695,45 @@ pub const Parser = struct {
 
         if (self.match(.lbracket)) {
             // Optional variable
-            if (self.check(.identifier)) {
-                variable = self.current.text;
+            if (self.checkVariable()) {
+                variable = self.currentName();
                 self.advance();
             }
 
-            // Optional types
+            // Optional types: `:A`, or alternatives `:A|B` (also `:A|:B`).
+            // A relationship has exactly one type, so `:A:B` could match
+            // nothing; it is rejected rather than read as alternation.
             while (self.match(.colon)) {
-                if (!self.check(.identifier)) {
-                    self.errorAtCurrent("Expected relationship type after ':'");
+                if (types_list.items.len > 0) {
+                    self.errorAtCurrent("A relationship has one type; use '|' to match any of several");
                     return null;
                 }
-                types_list.append(self.arena.allocator(), self.current.text) catch return null;
+                if (!self.checkName()) {
+                    self.errorAtCurrent(if (self.relTypeExpressionAhead())
+                        relationship_type_expression
+                    else
+                        "Expected relationship type after ':'");
+                    return null;
+                }
+                types_list.append(self.arena.allocator(), self.currentName()) catch return null;
                 self.advance();
 
                 // Handle multiple types with |
                 while (self.match(.pipe)) {
-                    if (!self.check(.identifier)) {
-                        self.errorAtCurrent("Expected relationship type after '|'");
+                    _ = self.match(.colon);
+                    if (!self.checkName()) {
+                        self.errorAtCurrent(if (self.relTypeExpressionAhead())
+                            relationship_type_expression
+                        else
+                            "Expected relationship type after '|'");
                         return null;
                     }
-                    types_list.append(self.arena.allocator(), self.current.text) catch return null;
+                    types_list.append(self.arena.allocator(), self.currentName()) catch return null;
                     self.advance();
+                }
+                if (self.check(.ampersand)) {
+                    self.errorAtCurrent(relationship_type_expression);
+                    return null;
                 }
             }
 
@@ -1108,6 +1747,10 @@ pub const Parser = struct {
                 properties = self.parsePropertyMap();
             }
 
+            if (self.check(.kw_where)) {
+                self.errorAtCurrent("WHERE inside a relationship pattern is not supported; put the condition in a WHERE after the pattern");
+                return null;
+            }
             if (!self.consume(.rbracket, "Expected ']' to end relationship")) {
                 return null;
             }
@@ -1216,11 +1859,11 @@ pub const Parser = struct {
     }
 
     fn parsePropertyEntry(self: *Self) ?ast.PropertyEntry {
-        if (!self.check(.identifier)) {
+        if (!self.checkName()) {
             self.errorAtCurrent("Expected property name");
             return null;
         }
-        const key = self.current.text;
+        const key = self.currentName();
         self.advance();
 
         if (!self.consume(.colon, "Expected ':' after property name")) {
@@ -1276,6 +1919,16 @@ pub const Parser = struct {
 
     fn parsePrefixExpr(self: *Self) ?*ast.Expression {
         const loc = self.currentLocation();
+        // Inside brackets, braces, parentheses, a call or CASE, a '|' no
+        // longer ends the enclosing comprehension's expression.
+        const saved_pipe = self.pipe_ends_expression;
+        defer self.pipe_ends_expression = saved_pipe;
+        switch (self.current.token_type) {
+            .lparen, .lbracket, .lbrace, .kw_case => self.pipe_ends_expression = false,
+            else => if (self.peekType() == .lparen or self.peekType() == .lbrace) {
+                self.pipe_ends_expression = false;
+            },
+        }
 
         if (self.match(.kw_not)) {
             const operand = self.parsePrecedence(.not) orelse return null;
@@ -1285,6 +1938,14 @@ pub const Parser = struct {
         // The lexer emits .dash for '-'. Relationship patterns consume it
         // directly; in an expression it is negation or subtraction.
         if (self.match(.dash)) {
+            // The smallest integer is written as a negated literal whose
+            // digits alone, 9223372036854775808, do not fit in an i64.
+            if (self.check(.integer) and std.mem.eql(u8, self.current.text, "9223372036854775808")) {
+                self.advance();
+                const expr = self.arena.allocator().create(ast.Expression) catch return null;
+                expr.* = .{ .literal = .{ .value = .{ .integer = std.math.minInt(i64) }, .location = loc } };
+                return expr;
+            }
             const operand = self.parsePrecedence(.unary) orelse return null;
             return self.makeUnary(.neg, operand, loc);
         }
@@ -1340,6 +2001,13 @@ pub const Parser = struct {
             return self.parseMapLiteral(loc);
         }
 
+        // A pattern as a predicate: `(a)-->(b)` is true when it matches.
+        if (self.check(.lparen)) {
+            if (self.tryPattern(false)) |pattern| {
+                return self.makeSubquery(.exists, &.{pattern}, null, null, loc);
+            }
+        }
+
         // Grouped expression
         if (self.match(.lparen)) {
             const expr = self.parseExpression() orelse return null;
@@ -1349,12 +2017,52 @@ pub const Parser = struct {
             return expr;
         }
 
+        if (self.match(.kw_case)) {
+            return self.parseCase(loc);
+        }
+
         // Identifier (variable or function call)
-        if (self.match(.identifier)) {
-            const name = self.previous.text;
+        if (self.checkVariable()) {
+            self.advance();
+            const name = self.tokenName(self.previous);
+
+            // A quoted name is never one of the forms below, only a variable
+            // or a function's name.
+            if (self.previous.token_type == .quoted_identifier) {
+                if (self.match(.lparen)) return self.parseFunctionCall(name, loc);
+                if (self.check(.lbrace)) return self.parseMapProjection(name, loc);
+                return self.makeVariable(name, loc);
+            }
+
+            // EXISTS { ... } and COUNT { ... }
+            if (self.check(.lbrace)) {
+                if (std.ascii.eqlIgnoreCase(name, "exists")) return self.parseSubqueryBlock(.exists, loc);
+                if (std.ascii.eqlIgnoreCase(name, "count")) return self.parseSubqueryBlock(.count, loc);
+                if (std.ascii.eqlIgnoreCase(name, "collect")) return self.parseSubqueryBlock(.collect, loc);
+                return self.parseMapProjection(name, loc);
+            }
 
             // Check for function call
+            if (self.check(.lparen) and (std.ascii.eqlIgnoreCase(name, "shortestpath") or std.ascii.eqlIgnoreCase(name, "allshortestpaths"))) {
+                self.errorAt(loc, "shortestPath() and allShortestPaths() are only supported as a pattern in MATCH, as in MATCH p = shortestPath((a)-[*]->(b))");
+                return null;
+            }
             if (self.match(.lparen)) {
+                // exists((a)-->(b)) is the pattern predicate itself.
+                if (std.ascii.eqlIgnoreCase(name, "exists") and self.check(.lparen)) {
+                    if (self.tryPattern(false)) |pattern| {
+                        if (!self.consume(.rparen, "Expected ')' after the pattern")) return null;
+                        return self.makeSubquery(.exists, &.{pattern}, null, null, loc);
+                    }
+                }
+                if (self.checkVariable()) {
+                    if (quantifierKind(name)) |kind| {
+                        if (self.peekType() == .kw_in) return self.parseIteration(kind, loc, .rparen);
+                    }
+                    if (std.ascii.eqlIgnoreCase(name, "reduce") and self.peekType() == .eq) {
+                        return self.parseReduce(loc);
+                    }
+                }
                 return self.parseFunctionCall(name, loc);
             }
 
@@ -1365,8 +2073,53 @@ pub const Parser = struct {
         return null;
     }
 
+    /// `CASE [subject] WHEN a THEN b [WHEN ...] [ELSE c] END`, after CASE.
+    fn parseCase(self: *Self, loc: ast.SourceLocation) ?*ast.Expression {
+        var subject: ?*ast.Expression = null;
+        if (!self.check(.kw_when)) {
+            subject = self.parseExpression() orelse return null;
+        }
+        var branches: std.ArrayList(ast.CaseBranch) = .empty;
+        while (self.match(.kw_when)) {
+            const when = self.parseExpression() orelse return null;
+            if (!self.consume(.kw_then, "Expected THEN after WHEN condition")) return null;
+            const then = self.parseExpression() orelse return null;
+            branches.append(self.arena.allocator(), .{ .when = when, .then = then }) catch return null;
+        }
+        if (branches.items.len == 0) {
+            self.errorAtCurrent("Expected WHEN in CASE");
+            return null;
+        }
+        var else_expr: ?*ast.Expression = null;
+        if (self.match(.kw_else)) {
+            else_expr = self.parseExpression() orelse return null;
+        }
+        if (!self.consume(.kw_end, "Expected END to close CASE")) return null;
+
+        const case_expr = self.arena.allocator().create(ast.CaseExpr) catch return null;
+        case_expr.* = .{
+            .subject = subject,
+            .branches = branches.toOwnedSlice(self.arena.allocator()) catch return null,
+            .else_expr = else_expr,
+            .location = loc,
+        };
+        const expr = self.arena.allocator().create(ast.Expression) catch return null;
+        expr.* = .{ .case_expr = case_expr };
+        return expr;
+    }
+
     fn parseListLiteral(self: *Self, loc: ast.SourceLocation) ?*ast.Expression {
         var elements: std.ArrayList(*ast.Expression) = .empty;
+
+        // `[x IN list ...]` is a list comprehension, as openCypher reads it.
+        if (self.checkVariable() and self.peekType() == .kw_in) {
+            return self.parseIteration(.list, loc, .rbracket);
+        }
+
+        // `[(a)-->(b) WHERE cond | value]` is a pattern comprehension.
+        if (self.check(.lparen) or (self.checkVariable() and self.peekType() == .eq)) {
+            if (self.tryPattern(true)) |pattern| return self.parsePatternComprehension(pattern, loc);
+        }
 
         if (!self.check(.rbracket)) {
             const first = self.parseExpression() orelse return null;
@@ -1390,6 +2143,213 @@ pub const Parser = struct {
 
         const expr = self.arena.allocator().create(ast.Expression) catch return null;
         expr.* = .{ .list = list };
+        return expr;
+    }
+
+    const Checkpoint = struct {
+        lexer: Lexer,
+        current: Token,
+        previous: Token,
+        errors: usize,
+        had_error: bool,
+        panic_mode: bool,
+        errors_dropped: bool,
+    };
+
+    fn checkpoint(self: *const Self) Checkpoint {
+        return .{
+            .lexer = self.lexer,
+            .current = self.current,
+            .previous = self.previous,
+            .errors = self.errors.items.len,
+            .had_error = self.had_error,
+            .panic_mode = self.panic_mode,
+            .errors_dropped = self.errors_dropped,
+        };
+    }
+
+    fn restore(self: *Self, saved: Checkpoint) void {
+        self.lexer = saved.lexer;
+        self.current = saved.current;
+        self.previous = saved.previous;
+        self.errors.shrinkRetainingCapacity(saved.errors);
+        self.had_error = saved.had_error;
+        self.panic_mode = saved.panic_mode;
+        self.errors_dropped = saved.errors_dropped;
+    }
+
+    /// A pattern with at least one relationship where an expression starts,
+    /// or null (with nothing consumed) when what follows is not one: then it
+    /// is a parenthesised expression, or a list. In a list (`comprehension`)
+    /// the pattern also has to be followed by WHERE or `|`.
+    fn tryPattern(self: *Self, comprehension: bool) ?ast.Pattern {
+        const saved = self.checkpoint();
+        const saved_flag = self.pattern_in_expression;
+        self.pattern_in_expression = true;
+        defer self.pattern_in_expression = saved_flag;
+        if (self.parsePattern()) |pattern| {
+            const follows = !comprehension or self.check(.kw_where) or self.check(.pipe);
+            if (!self.had_error and pattern.elements.len > 1 and follows) return pattern;
+        }
+        self.restore(saved);
+        return null;
+    }
+
+    fn makeSubquery(
+        self: *Self,
+        kind: ast.PatternSubquery.Kind,
+        patterns: []const ast.Pattern,
+        where: ?*ast.Expression,
+        map: ?*ast.Expression,
+        loc: ast.SourceLocation,
+    ) ?*ast.Expression {
+        const a = self.arena.allocator();
+        const node = a.create(ast.PatternSubquery) catch return null;
+        node.* = .{
+            .kind = kind,
+            .patterns = a.dupe(ast.Pattern, patterns) catch return null,
+            .where = where,
+            .map = map,
+            .location = loc,
+        };
+        self.subqueries.append(a, node) catch return null;
+        const expr = a.create(ast.Expression) catch return null;
+        expr.* = .{ .subquery = node };
+        return expr;
+    }
+
+    /// `[pattern WHERE cond | value]`, after the pattern.
+    fn parsePatternComprehension(self: *Self, pattern: ast.Pattern, loc: ast.SourceLocation) ?*ast.Expression {
+        var where: ?*ast.Expression = null;
+        if (self.match(.kw_where)) where = self.parseExpressionBeforePipe() orelse return null;
+        if (!self.consume(.pipe, "Expected '|' in the pattern comprehension")) return null;
+        const map = self.parseExpression() orelse return null;
+        if (!self.consume(.rbracket, "Expected ']' to close the pattern comprehension")) return null;
+        return self.makeSubquery(.comprehension, &.{pattern}, where, map, loc);
+    }
+
+    /// `{ patterns [WHERE cond] }` or `{ query }` after EXISTS, COUNT or
+    /// COLLECT. A query that is only `MATCH patterns [WHERE cond]` is kept
+    /// in the short form, which is planned as a pattern predicate is.
+    fn parseSubqueryBlock(self: *Self, kind: ast.PatternSubquery.Kind, loc: ast.SourceLocation) ?*ast.Expression {
+        const a = self.arena.allocator();
+        // The short form starts with a pattern: `(`, or a path variable and `=`.
+        const short_form = switch (self.peekType()) {
+            .lparen => true,
+            .identifier, .quoted_identifier => self.peekSecondType() == .eq,
+            else => false,
+        };
+        if (kind == .collect or !short_form) {
+            const body = switch (kind) {
+                .exists => self.parseBracedQuery(loc, "EXISTS", true),
+                .count => self.parseBracedQuery(loc, "COUNT", true),
+                else => self.parseBracedQuery(loc, "COLLECT", true),
+            } orelse return null;
+            if (kind != .collect and body.unions.len == 0) {
+                const c = body.clauses;
+                const short = c.len >= 1 and c[0] == .match and (c.len == 1 or (c.len == 2 and c[1] == .where));
+                if (short) return self.makeSubquery(kind, c[0].match.patterns, if (c.len == 2) c[1].where.condition else null, null, loc);
+            }
+            const expr = self.makeSubquery(kind, &.{}, null, null, loc) orelse return null;
+            expr.subquery.body = body;
+            return expr;
+        }
+        self.advance();
+        var patterns: std.ArrayList(ast.Pattern) = .empty;
+        while (true) {
+            const pattern = self.parsePattern() orelse return null;
+            patterns.append(a, pattern) catch return null;
+            if (!self.match(.comma)) break;
+        }
+        var where: ?*ast.Expression = null;
+        if (self.match(.kw_where)) where = self.parseExpression() orelse return null;
+        if (!self.check(.rbrace)) {
+            self.errorAtCurrent("Expected '}' after the pattern; a subquery with more clauses starts with MATCH, as in EXISTS { MATCH (n)-->(m) WITH m ... }");
+            return null;
+        }
+        self.advance();
+        return self.makeSubquery(kind, patterns.items, where, null, loc);
+    }
+
+    /// The type of the token after the current one.
+    fn peekType(self: *const Self) TokenType {
+        var lexer = self.lexer;
+        return lexer.nextToken().token_type;
+    }
+
+    /// The type of the token two after the current one.
+    fn peekSecondType(self: *const Self) TokenType {
+        var lexer = self.lexer;
+        _ = lexer.nextToken();
+        return lexer.nextToken().token_type;
+    }
+
+    fn quantifierKind(name: []const u8) ?ast.ListComprehension.Kind {
+        if (std.ascii.eqlIgnoreCase(name, "all")) return .all;
+        if (std.ascii.eqlIgnoreCase(name, "any")) return .any;
+        if (std.ascii.eqlIgnoreCase(name, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(name, "single")) return .single;
+        return null;
+    }
+
+    /// `x IN list [WHERE cond] [| value]` up to `close`: the inside of a list
+    /// comprehension, or of a quantifier, whose WHERE is required and which
+    /// takes no `| value`.
+    fn parseIteration(self: *Self, kind: ast.ListComprehension.Kind, loc: ast.SourceLocation, close: TokenType) ?*ast.Expression {
+        const variable = self.currentName();
+        self.advance();
+        if (!self.consume(.kw_in, "Expected IN after the variable")) return null;
+        const list = self.parseExpressionBeforePipe() orelse return null;
+        var where: ?*ast.Expression = null;
+        if (self.match(.kw_where)) {
+            where = self.parseExpressionBeforePipe() orelse return null;
+        } else if (kind != .list) {
+            self.errorAtCurrent("Expected WHERE in all(), any(), none() or single()");
+            return null;
+        }
+        var map: ?*ast.Expression = null;
+        if (kind == .list and self.match(.pipe)) {
+            map = self.parseExpression() orelse return null;
+        }
+        if (!self.consume(close, if (close == .rbracket) "Expected ']' to close the list comprehension" else "Expected ')' after the condition")) return null;
+
+        const node = self.arena.allocator().create(ast.ListComprehension) catch return null;
+        node.* = .{ .kind = kind, .variable = variable, .list = list, .where = where, .map = map, .location = loc };
+        const expr = self.arena.allocator().create(ast.Expression) catch return null;
+        expr.* = .{ .comprehension = node };
+        return expr;
+    }
+
+    /// `acc = initial, x IN list | expression)`, after `reduce(`.
+    fn parseReduce(self: *Self, loc: ast.SourceLocation) ?*ast.Expression {
+        const accumulator = self.currentName();
+        self.advance();
+        if (!self.consume(.eq, "Expected '=' after the accumulator in reduce()")) return null;
+        const initial = self.parseExpression() orelse return null;
+        if (!self.consume(.comma, "Expected ',' after the initial value in reduce()")) return null;
+        if (!self.checkVariable()) {
+            self.errorAtCurrent("Expected a variable in reduce()");
+            return null;
+        }
+        const variable = self.currentName();
+        self.advance();
+        if (!self.consume(.kw_in, "Expected IN after the variable")) return null;
+        const list = self.parseExpressionBeforePipe() orelse return null;
+        if (!self.consume(.pipe, "Expected '|' before the expression in reduce()")) return null;
+        const expression = self.parseExpression() orelse return null;
+        if (!self.consume(.rparen, "Expected ')' to close reduce()")) return null;
+
+        const node = self.arena.allocator().create(ast.ReduceExpr) catch return null;
+        node.* = .{
+            .accumulator = accumulator,
+            .initial = initial,
+            .variable = variable,
+            .list = list,
+            .expression = expression,
+            .location = loc,
+        };
+        const expr = self.arena.allocator().create(ast.Expression) catch return null;
+        expr.* = .{ .reduce = node };
         return expr;
     }
 
@@ -1421,11 +2381,72 @@ pub const Parser = struct {
         return expr;
     }
 
+    /// `name {.key, .*, key: value, variable}`, at the '{'.
+    fn parseMapProjection(self: *Self, name: []const u8, loc: ast.SourceLocation) ?*ast.Expression {
+        const a = self.arena.allocator();
+        self.advance();
+        var entries: std.ArrayList(ast.MapProjection.Entry) = .empty;
+        if (!self.check(.rbrace)) {
+            while (true) {
+                const entry_loc = self.currentLocation();
+                if (self.match(.dot)) {
+                    if (self.match(.star)) {
+                        entries.append(a, .{ .key = "", .value = null }) catch return null;
+                    } else if (self.checkName()) {
+                        const key = self.currentName();
+                        self.advance();
+                        const access = a.create(ast.PropertyAccess) catch return null;
+                        access.* = .{ .object = self.makeVariable(name, entry_loc) orelse return null, .property = key, .location = entry_loc };
+                        const value = a.create(ast.Expression) catch return null;
+                        value.* = .{ .property_access = access };
+                        entries.append(a, .{ .key = key, .value = value }) catch return null;
+                    } else {
+                        self.errorAtCurrent("Expected a property name or * after '.' in a map projection");
+                        return null;
+                    }
+                } else if (self.checkName()) {
+                    const key = self.currentName();
+                    const key_token = self.current.token_type;
+                    self.advance();
+                    if (self.match(.colon)) {
+                        const value = self.parseExpression() orelse return null;
+                        entries.append(a, .{ .key = key, .value = value }) catch return null;
+                    } else if (key_token == .identifier or key_token == .quoted_identifier) {
+                        // A variable stands for `variable: variable`.
+                        entries.append(a, .{ .key = key, .value = self.makeVariable(key, entry_loc) orelse return null }) catch return null;
+                    } else {
+                        self.errorAtCurrent("Expected ':' after a key in a map projection");
+                        return null;
+                    }
+                } else {
+                    self.errorAtCurrent("Expected .property, .*, key: value or a variable in a map projection");
+                    return null;
+                }
+                if (!self.match(.comma)) break;
+            }
+        }
+        if (!self.consume(.rbrace, "Expected '}' to close the map projection")) return null;
+        const projection = a.create(ast.MapProjection) catch return null;
+        projection.* = .{
+            .subject = self.makeVariable(name, loc) orelse return null,
+            .entries = entries.toOwnedSlice(a) catch return null,
+            .location = loc,
+        };
+        const expr = a.create(ast.Expression) catch return null;
+        expr.* = .{ .map_projection = projection };
+        return expr;
+    }
+
     fn parseFunctionCall(self: *Self, name: []const u8, loc: ast.SourceLocation) ?*ast.Expression {
         var args: std.ArrayList(*ast.Expression) = .empty;
         const has_distinct = self.match(.kw_distinct);
 
-        if (!self.check(.rparen)) {
+        // `count(*)` is the one call that takes `*`, and it counts rows. That
+        // is what an argument-less count already does, so it parses to one.
+        var star = false;
+        if (!has_distinct and std.ascii.eqlIgnoreCase(name, "count") and self.match(.star)) {
+            star = true;
+        } else if (!self.check(.rparen)) {
             const first = self.parseExpression() orelse return null;
             args.append(self.arena.allocator(), first) catch return null;
 
@@ -1444,6 +2465,7 @@ pub const Parser = struct {
             .name = name,
             .arguments = args.toOwnedSlice(self.arena.allocator()) catch return null,
             .distinct = has_distinct,
+            .star = star,
             .location = loc,
         };
 
@@ -1452,18 +2474,53 @@ pub const Parser = struct {
         return expr;
     }
 
+    /// `n:A:B`, `n:A|B`, `r:KNOWS`: a label test, at the ':'. A node
+    /// passes when it has the labels the expression asks for, a relationship
+    /// when its type does; null gives null, and any other value a type error.
+    fn parseLabelPredicate(self: *Self, left: *ast.Expression, loc: ast.SourceLocation) ?*ast.Expression {
+        const a = self.arena.allocator();
+        self.advance();
+        var labels = self.parseLabelExpr(false) orelse return null;
+        if (labels.* == .label and self.check(.colon)) {
+            while (self.match(.colon)) {
+                if (!self.checkName()) {
+                    self.errorAtCurrent(if (self.check(.bang) or self.check(.percent) or self.check(.lparen))
+                        "A label expression cannot follow :A:B; write it with &, as in :A&!B"
+                    else
+                        "Expected a label after ':'");
+                    return null;
+                }
+                const next = a.create(ast.LabelExpr) catch return null;
+                next.* = .{ .label = self.currentName() };
+                self.advance();
+                const both = a.create(ast.LabelExpr) catch return null;
+                both.* = .{ .and_ = .{ labels, next } };
+                labels = both;
+            }
+            if (self.check(.ampersand) or (self.check(.pipe) and self.peekType() != .pipe and !self.pipe_ends_expression)) {
+                self.errorAtCurrent("A label expression cannot follow :A:B; write it with &, as in :A&B|C");
+                return null;
+            }
+        }
+        const t = a.create(ast.LabelTest) catch return null;
+        t.* = .{ .subject = left, .labels = labels, .location = loc };
+        const expr = a.create(ast.Expression) catch return null;
+        expr.* = .{ .label_test = t };
+        return expr;
+    }
+
     fn getInfixPrecedence(self: *Self) Precedence {
         return switch (self.current.token_type) {
             .kw_or => .or_,
             .kw_xor => .xor,
             .kw_and => .and_,
-            .eq, .neq, .kw_in, .kw_contains => .equality,
+            .eq, .neq, .kw_in, .kw_contains, .regex_match => .equality,
             .kw_starts, .kw_ends => .equality,
             .lt, .lte, .gt, .gte, .vector_distance, .fts_match => .comparison,
             .plus, .dash => .term,
             .star, .slash, .percent => .factor,
             .caret => .power,
-            .dot => .primary,
+            .dot, .lbracket, .colon => .primary,
             .kw_is => .equality,
             else => .none,
         };
@@ -1476,19 +2533,33 @@ pub const Parser = struct {
         // Property access
         if (token == .dot) {
             self.advance();
-            if (!self.check(.identifier)) {
+            if (!self.checkName()) {
                 self.errorAtCurrent("Expected property name after '.'");
                 return null;
             }
-            const prop_name = self.current.text;
+            const prop_name = self.currentName();
             self.advance();
             return self.makePropertyAccess(left, prop_name, loc);
         }
 
+        // Subscript: list[i], list[a..b], map['key']
+        if (token == .lbracket) {
+            self.advance();
+            return self.parseSubscript(left, loc);
+        }
+
+        // Label predicate: n:A:B
+        if (token == .colon) return self.parseLabelPredicate(left, loc);
+
         // IS NULL / IS NOT NULL
         if (token == .kw_is) {
             self.advance();
-            if (self.match(.kw_not)) {
+            _ = self.match(.kw_not);
+            if (self.check(.colon) or self.checkWord("typed")) {
+                self.errorAtCurrent("Type predicates (IS :: TYPE) are not supported");
+                return null;
+            }
+            if (self.previous.token_type == .kw_not) {
                 if (!self.consume(.kw_null, "Expected NULL after IS NOT")) {
                     return null;
                 }
@@ -1530,6 +2601,33 @@ pub const Parser = struct {
         return self.makeBinary(left, op, right, loc);
     }
 
+    /// The rest of `object[...]` after the `[`: an index (`[i]`, `['key']`)
+    /// or a slice (`[a..b]`, `[a..]`, `[..b]`, `[..]`).
+    fn parseSubscript(self: *Self, object: *ast.Expression, loc: ast.SourceLocation) ?*ast.Expression {
+        var from: ?*ast.Expression = null;
+        if (!self.check(.dotdot)) {
+            from = self.parseExpression() orelse return null;
+        }
+        if (self.match(.dotdot)) {
+            var to: ?*ast.Expression = null;
+            if (!self.check(.rbracket)) {
+                to = self.parseExpression() orelse return null;
+            }
+            if (!self.consume(.rbracket, "Expected ']' after slice")) return null;
+            const slice = self.arena.allocator().create(ast.SliceExpr) catch return null;
+            slice.* = .{ .object = object, .from = from, .to = to, .location = loc };
+            const expr = self.arena.allocator().create(ast.Expression) catch return null;
+            expr.* = .{ .slice = slice };
+            return expr;
+        }
+        if (!self.consume(.rbracket, "Expected ']' after index")) return null;
+        const index = self.arena.allocator().create(ast.IndexExpr) catch return null;
+        index.* = .{ .object = object, .index = from.?, .location = loc };
+        const expr = self.arena.allocator().create(ast.Expression) catch return null;
+        expr.* = .{ .index = index };
+        return expr;
+    }
+
     fn getNextPrecedence(self: *Self, prec: Precedence) Precedence {
         _ = self;
         // Right-associative for power, left-associative for others
@@ -1563,6 +2661,7 @@ pub const Parser = struct {
             .caret => .pow,
             .vector_distance => .vector_distance,
             .fts_match => .fts_match,
+            .regex_match => .regex_match,
             else => null,
         };
     }
@@ -1572,8 +2671,21 @@ pub const Parser = struct {
     // ========================================================================
 
     fn makeIntegerLiteral(self: *Self, text: []const u8, loc: ast.SourceLocation) ?*ast.Expression {
-        const value = std.fmt.parseInt(i64, text, 10) catch {
-            self.errorAt(loc, "Invalid integer literal");
+        // 0x1F is hexadecimal and 0o17 octal. A bare leading zero, 017, was
+        // octal in openCypher 9 and is decimal elsewhere, so it is refused
+        // rather than read one way when the writer meant the other.
+        const prefixed = text.len > 2 and text[0] == '0' and std.ascii.isAlphabetic(text[1]);
+        const base: u8 = if (!prefixed) 10 else if (text[1] == 'x' or text[1] == 'X') 16 else 8;
+        if (!prefixed and text.len > 1 and text[0] == '0') {
+            self.leadingZeroError(text, loc);
+            return null;
+        }
+        const value = std.fmt.parseInt(i64, if (prefixed) text[2..] else text, base) catch |err| {
+            if (base == 8 and err == error.InvalidCharacter) {
+                self.errorAt(loc, "An octal integer takes only the digits 0 to 7");
+            } else {
+                self.errorAt(loc, "Invalid integer literal");
+            }
             return null;
         };
         const expr = self.arena.allocator().create(ast.Expression) catch return null;
@@ -1584,6 +2696,21 @@ pub const Parser = struct {
             },
         };
         return expr;
+    }
+
+    /// `012`: say how to write each number it could have meant.
+    fn leadingZeroError(self: *Self, text: []const u8, loc: ast.SourceLocation) void {
+        const digits = std.mem.trimStart(u8, text, "0");
+        const decimal = if (digits.len == 0) "0" else digits;
+        const octal = digits.len > 0 and for (digits) |c| {
+            if (c > '7') break false;
+        } else true;
+        const a = self.arena.allocator();
+        const message = if (octal)
+            std.fmt.allocPrint(a, "An integer cannot start with 0, as in {s}: write {s} for the decimal number, or 0o{s} for the octal one", .{ text, decimal, decimal })
+        else
+            std.fmt.allocPrint(a, "An integer cannot start with 0, as in {s}: write {s}", .{ text, decimal });
+        self.errorAt(loc, message catch "An integer cannot start with 0; write 0o17 for an octal number");
     }
 
     fn makeFloatLiteral(self: *Self, text: []const u8, loc: ast.SourceLocation) ?*ast.Expression {
@@ -1761,8 +2888,64 @@ pub const Parser = struct {
         self.current = self.lexer.nextToken();
 
         if (self.current.token_type == .invalid) {
-            self.errorAtCurrent("Invalid token");
+            const text = self.current.text;
+            if (text.len > 0 and text[0] == '`') {
+                self.errorAtCurrent(if (std.mem.eql(u8, text, "``"))
+                    "A backtick-quoted name cannot be empty"
+                else
+                    "Expected '`' to close the name before the end of the line");
+            } else {
+                self.errorAtCurrent("Invalid token");
+            }
         }
+    }
+
+    /// Whether the current token can be a property, label, type or map key
+    /// name. Keywords can: `n.order`, `(:Set)` and `{limit: 1}` name things
+    /// that happen to be spelled like a clause.
+    fn checkName(self: *const Self) bool {
+        if (self.current.token_type == .identifier or self.current.token_type == .quoted_identifier) return true;
+        return std.mem.startsWith(u8, @tagName(self.current.token_type), "kw_");
+    }
+
+    /// Whether the current token can name a variable.
+    ///
+    /// Keywords added after 0.16 (WHEN, THEN, ELSE, END) only mean
+    /// something inside a CASE, where a variable cannot stand in their
+    /// place, so they stay usable as variable names: `MATCH (a)-->(end)`
+    /// kept working. UNION only means something where a clause starts.
+    /// CASE itself starts an expression and cannot.
+    fn checkVariable(self: *const Self) bool {
+        return switch (self.current.token_type) {
+            .identifier, .quoted_identifier, .kw_when, .kw_then, .kw_else, .kw_end, .kw_union => true,
+            else => false,
+        };
+    }
+
+    /// The name the current token spells (see `tokenName`).
+    fn currentName(self: *Self) []const u8 {
+        return self.tokenName(self.current);
+    }
+
+    /// The name a token spells: its text, or for a backtick-quoted name the
+    /// text between the backticks, with each doubled backtick made one.
+    fn tokenName(self: *Self, token: Token) []const u8 {
+        if (token.token_type != .quoted_identifier) return token.text;
+        const inner = token.text[1 .. token.text.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, '`') == null) return inner;
+        const name = self.arena.allocator().alloc(u8, inner.len) catch {
+            self.errorAtCurrent("Out of memory");
+            return inner;
+        };
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            name[len] = inner[i];
+            len += 1;
+            // The lexer only lets backticks through in pairs.
+            if (inner[i] == '`') i += 1;
+        }
+        return name[0..len];
     }
 
     fn check(self: *Self, token_type: TokenType) bool {
@@ -1829,7 +3012,7 @@ pub const Parser = struct {
         while (!self.check(.eof)) {
             // Synchronize at clause boundaries
             switch (self.current.token_type) {
-                .kw_match, .kw_where, .kw_return, .kw_order, .kw_limit, .kw_skip, .kw_create, .kw_delete, .kw_detach, .kw_set, .kw_remove => return,
+                .kw_match, .kw_where, .kw_return, .kw_order, .kw_limit, .kw_skip, .kw_create, .kw_delete, .kw_detach, .kw_set, .kw_remove, .kw_union => return,
                 else => self.advance(),
             }
         }

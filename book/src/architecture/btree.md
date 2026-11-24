@@ -35,33 +35,42 @@ With 100 keys per node: log100(1M) ≈ 3 levels.
 B+Trees store all data in leaf nodes. Internal nodes only contain keys for routing:
 
 <img class="diagram" src="../assets/diagrams/btree-structure.svg"
-     alt="A B+Tree: one internal node holding the keys 30, 60 and 90 routes to three leaf nodes holding key-value pairs, and the leaves are linked to each other left to right for range scans">
+     alt="A B+Tree: one internal node holding the keys 30, 60 and 90 routes to four leaf nodes holding key-value pairs (below 30, 30 to 59, 60 to 89, and 90 and above), and the leaves are linked to each other left to right for range scans">
 
 ## Our Implementation: Direct Page Manipulation
 
 We don't create "node objects" in memory. Instead, we read/write bytes directly in page buffers. The "node" is just a lens over page bytes.
 
 <img class="diagram" src="../assets/diagrams/btree-page-access.svg"
-     alt="Two approaches side by side. Traditional: page bytes are deserialised into a node struct and serialised back. LatticeDB: page bytes are read and written directly at calculated offsets, with no intermediate struct">
+     alt="Two approaches side by side. Traditional: page bytes are deserialised into a node struct and serialised back. LatticeDB: searches, inserts and deletes read and write page bytes directly at calculated offsets, with no intermediate struct; get returns a copy of the value, getBorrowed lends it instead, and splits, merges and redistribution rebuild pages from a temporary entry list">
 
-No intermediate objects. No serialization overhead.
+Searches, in-place inserts and leaf deletes need no intermediate node object. Two
+places still copy: `get` returns an owned copy of the value (the caller frees it with
+`freeValue`), and splits, merges and redistribution copy the entries into a
+temporary list and rebuild the pages from it, in one pass. `getBorrowed` avoids the
+first copy: it returns the value as a slice of its leaf, which stays pinned with a
+shared latch until the caller calls `release()` (an overflow value is materialised
+and freed by `release()`). The node, edge and symbol lookups use it, since they only
+decode the value. A caller must release before writing to the same tree, or the
+write waits on the latch for ever.
 
 ## Page Layout
 
 ### Leaf Node
 
 Leaf pages are slotted pages. The header and slot array grow forward from byte 0;
-entry bytes grow backward from byte 4095; free space is whatever remains in the middle.
+entry bytes grow backward from the end of the page; free space is whatever remains
+in the middle. (The tables show offsets; the page size is 4096 bytes by default.)
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0–7 | 8 B | Page header — checksum, type (leaf), flags |
+| 0–7 | 8 B | Page header — type (leaf), flags, reserved, checksum |
 | 8–9 | 2 B | Entry count (u16) |
 | 10–11 | 2 B | Flags (u16) |
 | 12–15 | 4 B | Next leaf page (u32) |
 | 16–19 | 4 B | Previous leaf page (u32) |
 | 20 → | 2 B each | Slot array — one `entry_offset` (u16) per entry, growing forward |
-| ← 4095 | variable | Entries, growing backward: `[key_len][value_len][key][value or overflow descriptor]` |
+| ← end of page | variable | Entries, growing backward: `[key_len][value_len][key][value or overflow descriptor]` |
 
 **Variable-length entries**: Keys and values are stored at the end of the page,
 growing downward from high offsets. Slots at the front point to the entry
@@ -74,7 +83,17 @@ a small local prefix. Point reads and range scans materialize the full value
 transparently, and deletes free the overflow chain.
 
 Values up to `64 MiB` are accepted by the B+Tree layer when the key and overflow
-descriptor can fit in an empty leaf. Inline-capable values may still be stored
+descriptor can fit in an empty leaf. Keys are unique: inserting a key that is
+already present fails with `DuplicateKey`.
+
+Keys are capped at `BTree.maxKeySize(page_size)`, a quarter of an internal page's
+payload less one slot: **1012 bytes at 4 KB pages**. Any key can become a separator
+in an internal node, and the cap guarantees that an overflowing internal node can
+always split by bytes into two non-empty halves that fit. `insert`, `replace`, `put`
+and `canFitLeafEntry` reject a longer key with `PageFull`. Longer keys already in a
+file written by an earlier release can still be read and deleted. Symbol names
+(labels, edge types, property keys) are stored as keys, so this also caps their
+length. Inline-capable values may still be stored
 as overflow records when keeping them inline would make future 4 KiB leaf splits
 impossible to divide into two valid ordered pages.
 
@@ -82,19 +101,24 @@ impossible to divide into two valid ordered pages.
 
 Internal pages use the same slotted layout, but each slot carries a child pointer
 alongside the key offset, and the values are separator keys rather than user data.
+A node with `n` keys has `n + 1` children: slot `i`'s child holds keys that sort
+below key `i`, and the rightmost child holds keys greater than or equal to the last
+key.
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0–7 | 8 B | Page header — checksum, type (internal), flags |
+| 0–7 | 8 B | Page header — type (internal), flags, reserved, checksum |
 | 8–9 | 2 B | Key count (u16) |
-| 10–11 | 2 B | Level (u16; 0 = parent of leaves) |
+| 10–11 | 2 B | Level (u16; 1 = parent of leaves, increasing toward the root) |
 | 12–15 | 4 B | Rightmost child (u32) |
 | 16 → | 6 B each | Slot array — `key_offset` (u16) plus `child_page` (u32), growing forward |
-| ← 4095 | variable | Separator keys, growing backward |
+| ← end of page | variable | Separator keys, growing backward |
 
 ## Point Lookup
 
 Finding a value by key:
+
+Simplified from `src/storage/btree.zig` (error mapping left out):
 
 ```zig
 pub fn get(self: *Self, key: []const u8) !?[]const u8 {
@@ -106,48 +130,65 @@ pub fn get(self: *Self, key: []const u8) !?[]const u8 {
         const frame = try self.bp.fetchPage(page_id, .shared);
         defer self.bp.unpinPage(frame, false);
 
-        const page_type = getPageType(frame.data);
+        const header: *const PageHeader = @ptrCast(@alignCast(frame.data.ptr));
 
-        if (page_type == .btree_leaf) {
-            // 3. Binary search in leaf
-            return LeafNode.search(frame.data, key, self.comparator);
-        } else {
-            // 4. Binary search for child pointer, descend
-            page_id = InternalNode.findChild(frame.data, key, self.comparator);
+        if (header.page_type == .btree_leaf) {
+            // 3. Binary search in leaf; return an owned copy of the value
+            const result = LeafNode.searchSlot(frame.data, key, self.comparator);
+            if (!result.found) return null;
+            const stored = LeafNode.getStoredValue(frame.data, result.slot);
+            return try self.materializeStoredValue(stored); // follows overflow chains
         }
+
+        // 4. Binary-search the separators for the child, descend
+        page_id = self.findChild(frame.data, key);
     }
 }
 ```
 
+Both searches are binary. In an internal node `findChildIndex` finds the first
+separator greater than the key (an upper bound), or the rightmost child if there is
+none.
+
 **Example lookup for key "dog":**
 
 <img class="diagram" src="../assets/diagrams/btree-lookup.svg"
-     alt="Looking up the key dog. From the root holding separators cat and fish, the search follows the middle branch because dog sorts after cat and before fish, reaching the leaf containing cow and dog">
+     alt="Looking up the key dog. From the root holding separators cat and fish, the search follows the middle branch because dog sorts after cat and before fish, reaching the middle leaf containing cow and dog">
 
 ## Insertion
 
 ### Simple Case: Space in Leaf
 
+An insert either succeeds or returns an error with no page of the tree changed.
+Simplified from `insert` (pin bookkeeping and error cleanup left out):
+
 ```zig
 pub fn insert(self: *Self, key: []const u8, value: []const u8) !void {
-    // 1. Find the leaf
-    const leaf_page = try self.findLeaf(key);
+    if (key.len > maxKeySize(self.page_size)) return error.PageFull;
 
-    // 2. Fetch with exclusive latch
-    const frame = try self.bp.fetchPage(leaf_page, .exclusive);
-    defer self.bp.unpinPage(frame, true);
+    // 1. Descend from the root, pinning every page on the path exclusively and
+    //    remembering which child was taken at each level
+    var path = InsertPath{};
+    defer path.release(self.bp);
+    try self.descendForInsert(key, &path);
+
+    // 2. Reject duplicates
+    const leaf = path.frames[path.len - 1];
+    const search = LeafNode.searchSlot(leaf.data, key, self.comparator);
+    if (search.found) return error.DuplicateKey;
 
     // 3. Prepare either inline bytes or an overflow descriptor
-    const prepared = try self.prepareStoredValue(key, value);
+    var prepared = try self.prepareStoredValue(key, value);
 
-    // 4. Check if the prepared entry fits
-    if (LeafNode.hasSpace(frame.data, key.len, prepared.value.len)) {
-        // 5. Insert directly
-        LeafNode.insert(frame.data, key, prepared.value, self.comparator);
-    } else {
-        // 6. Need to split
-        try self.splitLeafAndInsert(frame, key, prepared);
-    }
+    // 4. Insert in place; one scan of the slot array finds the free space and
+    //    reports PageFull if the entry does not fit
+    if (self.insertLeafEntryStored(leaf.data, search.slot, key, prepared.value, prepared.overflow)) |_| {
+        self.noteInsert(leaf.page_id, search.slot); // remembered for splits, below
+        return;
+    } else |err| if (err != error.PageFull) return err;
+
+    // 5. Does not fit: plan and apply a split
+    try self.splitAndInsert(&path, search.slot, false, prepared.entry(key), ...);
 }
 ```
 
@@ -156,40 +197,68 @@ pub fn insert(self: *Self, key: []const u8, value: []const u8) !void {
 When a leaf is full:
 
 <img class="diagram" src="../assets/diagrams/btree-leaf-split.svg"
-     alt="A full leaf holding a through e splits when f is inserted. The entries divide into two linked leaves holding a-b-c and d-e-f, and the key d is promoted to the parent as a separator">
+     alt="A full leaf holding a, b, d, e and f splits when c is inserted among them. The entries divide down the middle into two linked leaves holding a-b-c and d-e-f, and the key d is promoted to the parent as a separator">
 
-```zig
-fn splitLeaf(self: *Self, frame: *BufferFrame, key: []const u8, value: []const u8) !void {
-    // 1. Allocate new page
-    const new_page = try self.pm.allocatePage();
-    const new_frame = try self.bp.fetchPage(new_page, .exclusive);
+`splitAndInsert` plans the whole split before it changes anything:
 
-    // 2. Find a byte-balanced split point that keeps both leaves valid.
-    const split_point = try self.chooseLeafSplitPoint(frame.data, key, value);
+1. Build the leaf's entries plus the new one, in order, and choose the split point
+   (`chooseInsertSplit`): beside the new entry when inserts are arriving in key
+   order (below), otherwise byte-balanced so that both halves fit a page
+   (`chooseLeafSplitPoint`).
+2. Walk up the pinned path while the separator does not fit the parent. For each
+   ancestor that overflows, build its combined key/child image and choose the
+   promoted key: after a leaf split at an edge, when the new separator lands at the
+   same edge of this node, the key next to it (`edgeInternalPromotion`), so the node
+   keeps all but one of its keys; otherwise by bytes (`chooseInternalPromotion`).
+3. Reserve every new page the split needs, one per splitting level plus a new root
+   if the root splits, by allocating and pinning it, and find the right sibling
+   whose `prev` link must change.
 
-    // 3. Move upper half to new page
-    LeafNode.moveEntries(frame.data, new_frame.data, split_point, entry_count);
+If any of that fails (an I/O error or a full disk allocating a page, no buffer frame,
+no memory for an image), the reserved pages go back to the freelist and the error is
+returned with the tree untouched. Only then is the plan applied, which rewrites
+pinned pages and cannot fail: both leaves are written, the sibling links fixed (old →
+new → the old leaf's former next leaf), and each separator inserted into its parent
+or carried up into the next split.
 
-    // 4. Insert new key into appropriate page
-    if (compare(key, split_key) < 0) {
-        LeafNode.insert(frame.data, key, value);
-    } else {
-        LeafNode.insert(new_frame.data, key, value);
-    }
+A split down the middle is chosen by serialized byte size, not just entry count.
+This matters when a leaf mixes small keys with large values: both halves must fit
+in the configured page size after the new entry is included. Internal nodes are
+split by bytes too; with the key-size cap that always yields two halves that fit.
 
-    // 5. Update sibling pointers
-    LeafNode.setNext(frame.data, new_page);
-    LeafNode.setPrev(new_frame.data, frame.page_id);
+The middle is the wrong place when keys arrive in order. A tree filled in key order
+(node ids, a label's members, an ordered property index being built) inserts past
+the last entry every time; split down the middle, each leaf is left half empty for
+good, because nothing is inserted into its left half again. So the tree remembers,
+for a few leaves (`recent_inserts`, 16 of them, in memory only), the slot the last
+insert into each took (`noteInsert`). An insert counts as in order when it lands
+right after the previous insert into the same leaf, or past the last entry of the
+rightmost leaf, which needs no history. Then:
 
-    // 6. Get separator key and insert into parent
-    const separator = LeafNode.getFirstKey(new_frame.data);
-    try self.insertIntoParent(frame.page_id, separator, new_page);
-}
-```
+- past the last entry, every existing entry stays and the new one starts the new
+  leaf alone;
+- in front of keys already there, the new entry ends this leaf and the keys after it
+  move to the new one, so the ordered run goes on filling this leaf.
 
-The split point is chosen by serialized byte size, not just entry count. This
-matters when a leaf mixes small keys with large values: both halves must fit in
-the configured page size after the new entry is included.
+Descending order, right before the previous insert or before the first entry of the
+leftmost leaf, is the mirror image. Random inserts meet these conditions about once
+per leaf's worth of inserts, and a leaf split that way splits by bytes the next
+time. A side that would not fit a page falls back to the other side of the new
+entry, then to a split by bytes. An ordered run therefore fills its pages full
+instead of half full.
+
+### Replacing a Value
+
+`replace(key, value)` changes the value of an existing key and returns
+`KeyNotFound` otherwise; `put(key, value)` inserts or replaces. Both make one
+descent over the same pinned path and are all or nothing like `insert`. The new
+value, including any overflow chain, is prepared before the leaf changes. A value of
+the same stored size is overwritten in place; otherwise, if the leaf has room once
+the old entry is gone, the old entry is removed and the new one written into the
+same leaf; otherwise the leaf splits through the planned split, with the old entry
+left out of the leaf image. The old overflow chain is freed only after no leaf
+points at it. The node store's update uses `replace`, so a node update can no longer
+fail half way and leave the node deleted.
 
 ### Growing the Tree
 
@@ -204,22 +273,43 @@ The tree grows at the top, not the bottom. All leaves stay at the same depth.
 
 Thanks to linked leaves, range scans are efficient:
 
+Simplified from `src/storage/btree.zig`:
+
 ```zig
-pub fn range(self: *Self, start: ?[]const u8, end: ?[]const u8) !Iterator {
+pub fn range(self: *Self, start_key: ?[]const u8, end_key: ?[]const u8) !Iterator {
     // 1. Find starting leaf
-    const start_page = if (start) |k|
-        try self.findLeaf(k)
+    const leaf_page = if (start_key) |key|
+        try self.findLeafForKey(key)
     else
-        try self.findLeftmostLeaf();
+        try self.findFirstLeaf();
+
+    // 2. Keep it pinned and position at the first entry >= start_key
+    const frame = try self.bp.fetchPage(leaf_page, .shared);
+    const start_slot: u16 = if (start_key) |key|
+        LeafNode.searchSlot(frame.data, key, self.comparator).slot
+    else
+        0;
 
     return Iterator{
-        .btree = self,
-        .current_page = start_page,
-        .current_slot = 0,
-        .end_key = end,
+        .tree = self,
+        .current_frame = frame,
+        .current_slot = start_slot,
+        .end_key = end_key,
+        .scratch_value = null,
     };
 }
 ```
+
+The range is half-open: `start_key` is inclusive and `end_key` is exclusive, so
+the iterator stops at the first key that is greater than or equal to `end_key`.
+Call `deinit` on the iterator if you stop early, to unpin the current leaf.
+
+`rangeBackward(start_key, end_key)` reads the same half-open range from its last key
+down. It descends once to the leaf `end_key` leads to, starts below `end_key`'s
+slot, and follows the link each leaf keeps to the one before it, stopping below
+`start_key` (or at the first leaf when `start_key` is null). An ordered property
+index uses it to answer `ORDER BY ... DESC` with a `LIMIT` without reading the
+range forward first.
 
 **Iterator walks the leaf chain:**
 
@@ -230,24 +320,16 @@ No need to traverse internal nodes for each entry - just follow the links.
 
 ## Concurrency
 
-We use **latch crabbing** (simplified):
+The B+Tree does not do latch crabbing. A lookup latches one page at a time through
+the buffer pool: it unpins (and so unlatches) a node before it fetches the child. An
+insert, `replace` or `put` pins and exclusively latches the whole root-to-leaf path on
+the way down and releases it in one place when it is done, so a split can update the
+parents it already holds.
 
-```
-Lookup (read-only):
-    1. Latch root (shared)
-    2. Latch child (shared)
-    3. Unlatch root
-    4. Latch grandchild (shared)
-    5. Unlatch child
-    ... continue to leaf
-
-Insert (may modify):
-    1. Latch root (exclusive)
-    2. If child is safe (won't split), latch child and unlatch root
-    3. Continue down
-```
-
-A "safe" node is one with enough space that it won't split (for insert) or won't underflow (for delete).
+That is only safe because nothing modifies a tree concurrently with another
+operation on it. A database has a single writer, and the C API serialises the
+calls on a handle behind one mutex. The per-frame latches protect individual
+pages, not the shape of the tree.
 
 ## The BTree Struct
 
@@ -258,12 +340,20 @@ pub const BTree = struct {
     comparator: KeyComparator, // For ordering
     page_size: u32,            // Usually 4096
     allocator: Allocator,
+    // The slot the last insert into each of a few leaves took, so a split
+    // can tell that inserts arrive in key order. Memory only.
+    recent_inserts: [16]RecentInsert,
 
     // ...methods
 };
 ```
 
-This is just ~40 bytes of metadata. The actual data lives in pages on disk.
+This is 168 bytes of metadata, 128 of them the remembered inserts. The actual data
+lives in pages on disk.
+
+The operations: `get` (owned copy), `getBorrowed` (lent value, `release()` it),
+`contains`, `insert`, `replace`, `put`, `delete`, `range` (an iterator) and
+`rangeBackward` (an iterator from the last key down).
 
 ## Key Design Decisions
 
@@ -271,19 +361,24 @@ This is just ~40 bytes of metadata. The actual data lives in pages on disk.
 
 We store the actual bytes, not fixed-size slots. This supports:
 - Short keys efficiently (no wasted space)
-- Long keys (up to page size)
+- Long keys, up to `maxKeySize` (1012 bytes at 4 KB pages)
 - Any binary data
 
 ### Separator Keys in Internal Nodes
 
 Internal nodes store separator keys, not full key-value pairs. This maximizes fanout (keys per internal node).
 
-### Delete Compaction and Leaf Merging
+### In-Place Delete and Leaf Merging
 
-Deletes remove the slot, rebuild the surviving leaf entries contiguously, and
-free any overflow chain owned by the removed entry. Afterward, adjacent leaves
-under the same parent are merged whenever their combined payload fits on one
-page. The redundant leaf is unlinked and returned to the freelist, and a root
+A delete removes the entry inside the leaf: whatever lies below it in the entry heap
+moves up by its size and its slot is removed, so the heap stays contiguous, with no
+allocation and one pass. Any overflow chain owned by the removed entry is freed
+afterwards, once the leaf no longer points at it; if freeing fails part way, the
+rest of the chain is leaked rather than left referenced by a live entry.
+
+Siblings are looked at only when the leaf has fallen below a third of a page. Then
+adjacent leaves under the same parent are merged whenever their combined payload
+fits on one page. The redundant leaf is unlinked and returned to the freelist, and a root
 with only that leaf remaining is collapsed. Space within a surviving leaf is
 reusable immediately by later inserts or updates, while reclaimed pages are
 reused by any later database allocation.

@@ -52,9 +52,15 @@ class GraphOperationsTest {
 
                 tx.commit();
 
-                // delete after commit boundary in a fresh write txn
+                // delete after commit boundary in a fresh write txn. Alice has
+                // a SELF edge, so a plain delete is refused and leaves her be;
+                // a detach delete takes the edge with her.
                 try (Transaction tx2 = db.beginWrite()) {
-                    tx2.deleteNode(alice.id());
+                    LatticeException refused = assertThrows(LatticeException.class,
+                            () -> tx2.deleteNode(alice.id()));
+                    assertEquals(ErrorCode.HAS_RELATIONSHIPS, refused.getErrorCode());
+                    assertTrue(tx2.nodeExists(alice.id()));
+                    tx2.detachDeleteNode(alice.id());
                     tx2.commit();
                 }
                 try (Transaction tx3 = db.beginRead()) {
@@ -127,6 +133,60 @@ class GraphOperationsTest {
                 assertTrue(tx.scanEdges(null, 0).size() >= 2);
 
                 tx.commit();
+            }
+        }
+    }
+
+    /** A null value stores no property, as null does in Cypher. Up to 0.18.0
+     * setProperty, setEdgeProperty and the create calls stored it. */
+    @Test
+    void nullStoresNoProperty() {
+        try (Database db = Database.open(dir.resolve("null.db").toString(),
+                OpenOptions.defaults().create(true))) {
+            Map<String, Object> nodeProps = new java.util.LinkedHashMap<>();
+            nodeProps.put("name", "a");
+            nodeProps.put("x", null);
+            nodeProps.put("y", 1L);
+            Map<String, Object> edgeProps = new java.util.LinkedHashMap<>();
+            edgeProps.put("w", null);
+            edgeProps.put("v", 1L);
+            Node a;
+            Edge edge;
+            try (Transaction tx = db.beginWrite()) {
+                a = tx.createNode(List.of("P"), nodeProps);
+                Node b = tx.createNode(List.of("P"), Map.of("name", "b"));
+                edge = tx.createEdge(a.id(), b.id(), "R", edgeProps);
+                tx.commit();
+            }
+            assertEquals(Map.of("name", "a", "y", 1L), a.properties());
+            assertEquals(Map.of("v", 1L), edge.properties());
+            List<StreamRecord> before = db.changes(0, 1000, 0);
+            long after = before.get(before.size() - 1).sequence();
+
+            try (Transaction tx = db.beginWrite()) {
+                tx.setProperty(a.id(), "y", null);
+                tx.setProperty(a.id(), "absent", null);
+                tx.setEdgeProperty(edge.id(), "v", null);
+                tx.setEdgeProperty(edge.id(), "absent", null);
+                tx.commit();
+            }
+
+            QueryResult result = db.query(
+                    "MATCH (n:P {name: 'a'})-[r:R]->() RETURN properties(n) AS n, properties(r) AS r");
+            assertEquals(List.of(Map.of("n", Map.of("name", "a"), "r", Map.of())), result.rows());
+            List<String> events = new java.util.ArrayList<>();
+            for (StreamRecord record : db.changes(after, 1000, 0)) {
+                Object key = ((Map<?, ?>) record.payload()).get("key");
+                if (key != null) {
+                    events.add(record.kind() + " " + key);
+                }
+            }
+            assertEquals(List.of("node.property_remove y", "edge.property_remove v"), events);
+
+            try (Transaction tx = db.beginWrite()) {
+                LatticeException missing = assertThrows(LatticeException.class,
+                        () -> tx.setProperty(999_999L, "x", null));
+                assertEquals(ErrorCode.NOT_FOUND, missing.getErrorCode());
             }
         }
     }

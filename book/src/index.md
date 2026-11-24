@@ -7,10 +7,10 @@ LatticeDB is a single-file local database for connected, semantic, and textual d
 - **One file.** Your entire database is a single portable file. No server, no configuration.
 - **One query layer.** Graph traversal, HNSW vector similarity, and BM25 full-text — in one query.
 - **One event log.** Durable named streams and the built-in graph changefeed share the same transaction/WAL path as graph writes.
-- **Sub-millisecond.** 0.13 us node lookups. 0.83 ms vector search at 1M vectors with 100% recall.
+- **Fast in process.** 0.2 us reads by node id and 2.3 us Cypher lookups through the C API; top-10 vector search over 100K vectors in 0.12 ms. See [Benchmarks](./performance/benchmarks.md).
 
 ```cypher
--- Find chunks similar to a query, traverse to their document, then to the author
+// Find chunks similar to a query, traverse to their document, then to the author
 MATCH (chunk:Chunk)-[:PART_OF]->(doc:Document)-[:AUTHORED_BY]->(author:Person)
 WHERE chunk.embedding <=> $query_vector < 0.3
   AND doc.content @@ "neural networks"
@@ -25,29 +25,33 @@ LIMIT 10
 - Nodes and edges with labels and arbitrary properties
 - Multi-hop traversal, variable-length paths (`*1..3`)
 - ACID transactions with snapshot isolation
+- Property indexes on nodes and relationships, for equality, ranges, prefixes and sorting
 - MERGE, WITH, UNWIND, aggregations (`count`, `sum`, `avg`, `min`, `max`, `collect`)
 
 **Vector Search**
-- HNSW approximate nearest neighbor with configurable M, ef
+- HNSW approximate nearest neighbor, with `ef_search` tunable per query
 - Built-in hash embeddings or HTTP client for Ollama/OpenAI
 - Batch insert for bulk loading
 
 **Full-Text Search**
-- BM25-ranked inverted index with tokenization and stemming
+- BM25-ranked inverted index; words split by Unicode, lowercased and accent-folded, with English stop words dropped
+- One query language everywhere: `OR`, `-exclusions`, `"phrases"`, `prefix*` and `fuzzy~`
 - Fuzzy search with configurable Levenshtein distance
 
 **Cypher Query Language**
-- MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE
-- ORDER BY, LIMIT, SKIP, DETACH DELETE
+- MATCH, OPTIONAL MATCH, WHERE, RETURN, CREATE, DELETE, SET, REMOVE, FOREACH
+- ORDER BY, LIMIT, SKIP, DETACH DELETE, UNION, CASE, `CALL { }` subqueries
+- Named paths, `shortestPath`, list and pattern comprehensions, `EXISTS`, `COUNT` and `COLLECT` subqueries
 - Vector distance operator: `<=>`
 - Full-text search operator: `@@`
 - Parameters: `$name`
 
 **Operations**
 - Single-file storage with write-ahead log for crash recovery
-- Durable streams and semantic graph changefeeds
+- Durable streams and semantic graph changefeeds, with a retention policy for the changefeed
+- Import and export JSON, JSONL, CSV and RDF (Turtle, N-Triples)
 - Zero configuration — open a file and start working
-- Clean C API; Python, TypeScript, and Go bindings wrap it
+- Clean C API; Python, TypeScript, Go, and Java bindings wrap it
 
 ## Use Cases
 

@@ -15,11 +15,10 @@ A vector database answers one question well: which chunks are semantically neare
 The usual response is to run a vector store plus a relational database plus a search index, and keep three systems consistent. LatticeDB's argument is that these are one question and should be one query.
 
 ```cypher
-MATCH (chunk:Chunk)
-WHERE chunk.embedding <=> $query_vector < 0.3
-   OR chunk.text @@ 'connection pool exhausted'
-MATCH (chunk)-[:PART_OF]->(doc:Document)-[:AUTHORED_BY]->(author:Person)
-WHERE doc.version = $current_version
+MATCH (chunk:Chunk)-[:PART_OF]->(doc:Document)-[:AUTHORED_BY]->(author:Person)
+WHERE (chunk.embedding <=> $query_vector < 0.3
+       OR chunk.text @@ 'connection pool exhausted')
+  AND doc.version = $current_version
 RETURN doc.title, author.name, chunk.text
 ORDER BY chunk.embedding <=> $query_vector
 LIMIT 10
@@ -33,7 +32,7 @@ Vector similarity, lexical matching, graph traversal, and a metadata filter, res
 |---|---|---|---|---|---|
 | Deployment | Embedded | Embedded / server | Embedded | Postgres extension | SQLite extension |
 | Vector index | HNSW | HNSW | IVF / HNSW | HNSW / IVFFlat | Brute force |
-| Full-text search | Native BM25 | Limited | Native | `tsvector` | FTS5, separate |
+| Full-text search | Native BM25 | BM25 and sparse vectors | Native | `tsvector` | FTS5, separate |
 | Graph traversal | Native Cypher | No | No | Recursive CTE | Recursive CTE |
 | Metadata filtering | Cypher `WHERE` | Dict filters | SQL-like | Full SQL | Full SQL |
 | Durable streams | Native | No | No | Logical decoding | No |
@@ -42,11 +41,10 @@ Vector similarity, lexical matching, graph traversal, and a metadata filter, res
 
 ## Published latency figures
 
-Every number below except the LatticeDB row comes from the vendor's own documentation or a third-party benchmark, on hardware and with methodology we did not control. They are order-of-magnitude orientation, not a head-to-head result — see [how to read the numbers](./overview.md#how-to-read-the-numbers).
+Every number below comes from the vendor's own documentation or a third-party benchmark, on hardware, data and settings we did not control, and none was measured here. They are order-of-magnitude orientation, not a head-to-head result — see [how to read the numbers](./overview.md#how-to-read-the-numbers).
 
-| System | 10-NN latency at 1M vectors | Type |
+| System | Published 10-NN latency at 1M vectors | Type |
 |--------|----------------------------|------|
-| LatticeDB | 0.83 ms mean, 100% recall@10 | Embedded |
 | FAISS HNSW (single thread) | 0.5–3 ms | Library |
 | Weaviate | 1.4 ms mean, 3.1 ms p99 | Server |
 | Qdrant | ~1–2 ms | Server |
@@ -57,7 +55,7 @@ Every number below except the LatticeDB row comes from the vendor's own document
 | Pinecone P2 | ~15 ms including network | Cloud |
 | sqlite-vec | 17 ms (brute force) | Extension |
 
-Sources for each row are in [Competitive Analysis](../performance/competitive-analysis.md). LatticeDB's own measurements, including recall and memory at every scale, are in [Benchmarks](../performance/benchmarks.md).
+Sources for each row are in [Competitive Analysis](../performance/competitive-analysis.md#cited-from-others). LatticeDB's own measurements, on synthetic clustered vectors, are in [Benchmarks](../performance/benchmarks.md#vector-search): at 1M vectors, 1.34 ms at p50 with 95.6% recall@10 and the default 100 MB cache, 0.21 ms with a 2 GB cache.
 
 ## When a vector database is still the better choice
 
@@ -69,7 +67,7 @@ Sources for each row are in [Competitive Analysis](../performance/competitive-an
 
 **You need the ecosystem.** LangChain and LlamaIndex integrations, managed hosting, hybrid-search tuning knobs, and reranking pipelines are mature in the dedicated vector stores and thin here.
 
-**Billions of vectors.** LatticeDB is benchmarked to 1M vectors using roughly 1 GB of memory. Beyond that scale you want a purpose-built distributed system.
+**Billions of vectors.** LatticeDB is benchmarked to 1M vectors; its index estimates about 1 GB of pages for them, and the benchmark ran with a 4 GB buffer pool. Beyond that scale you want a purpose-built distributed system.
 
 ## When LatticeDB fits
 

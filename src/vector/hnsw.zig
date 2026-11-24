@@ -13,6 +13,7 @@ const lattice = @import("lattice");
 const Allocator = std.mem.Allocator;
 
 const types = lattice.core.types;
+const IdKeyOrder = lattice.core.id_key.IdKeyOrder;
 const page = lattice.storage.page;
 const buffer_pool = lattice.storage.buffer_pool;
 const vec_storage = lattice.vector.storage;
@@ -85,6 +86,112 @@ pub const HnswLayerInfo = struct {
 pub const SearchResult = struct {
     node_id: NodeId,
     distance: f32,
+};
+
+/// Which nodes a filtered search may return. Nodes it rules out are still
+/// walked through, since the graph's paths run through them; they are only
+/// kept out of the results.
+pub const Filter = struct {
+    context: *const anyopaque,
+    allowsFn: *const fn (context: *const anyopaque, node_id: NodeId) bool,
+
+    pub fn allows(self: Filter, node_id: NodeId) bool {
+        return self.allowsFn(self.context, node_id);
+    }
+};
+
+/// A binary heap of search results, nearest first or furthest first, over
+/// a list kept between searches.
+fn ResultHeap(comptime furthest_first: bool) type {
+    return struct {
+        items: std.ArrayListUnmanaged(SearchResult) = .empty,
+
+        const Heap = @This();
+
+        fn above(a: SearchResult, b: SearchResult) bool {
+            return if (furthest_first) a.distance > b.distance else a.distance < b.distance;
+        }
+
+        fn count(self: *const Heap) usize {
+            return self.items.items.len;
+        }
+
+        fn top(self: *const Heap) ?SearchResult {
+            return if (self.items.items.len == 0) null else self.items.items[0];
+        }
+
+        fn push(self: *Heap, allocator: Allocator, item: SearchResult) Allocator.Error!void {
+            try self.items.append(allocator, item);
+            const xs = self.items.items;
+            var i = xs.len - 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!above(xs[i], xs[parent])) break;
+                std.mem.swap(SearchResult, &xs[i], &xs[parent]);
+                i = parent;
+            }
+        }
+
+        fn pop(self: *Heap) ?SearchResult {
+            const xs = self.items.items;
+            if (xs.len == 0) return null;
+            const out = xs[0];
+            xs[0] = xs[xs.len - 1];
+            self.items.items.len -= 1;
+            const ys = self.items.items;
+            var i: usize = 0;
+            while (true) {
+                const l = 2 * i + 1;
+                if (l >= ys.len) break;
+                var best = l;
+                if (l + 1 < ys.len and above(ys[l + 1], ys[l])) best = l + 1;
+                if (!above(ys[best], ys[i])) break;
+                std.mem.swap(SearchResult, &ys[i], &ys[best]);
+                i = best;
+            }
+            return out;
+        }
+
+        fn clear(self: *Heap) void {
+            self.items.clearRetainingCapacity();
+        }
+
+        fn deinit(self: *Heap, allocator: Allocator) void {
+            self.items.deinit(allocator);
+        }
+    };
+}
+
+/// What one layer search works in: kept by the index between searches so a
+/// search allocates nothing once these have grown to its beam.
+const SearchScratch = struct {
+    candidates: ResultHeap(false) = .{},
+    results: ResultHeap(true) = .{},
+    visited: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// A search that visits more than this many nodes (one that a filter
+    /// made walk much of the graph) gives the visited set back afterwards
+    /// rather than keep it for every later search.
+    const KEEP_VISITED: u32 = 1 << 14;
+
+    fn reset(self: *SearchScratch) void {
+        self.candidates.clear();
+        self.results.clear();
+        self.visited.clearRetainingCapacity();
+    }
+
+    fn trim(self: *SearchScratch, allocator: Allocator) void {
+        if (self.visited.capacity() > KEEP_VISITED) {
+            self.visited.deinit(allocator);
+            self.visited = .empty;
+        }
+    }
+
+    fn deinit(self: *SearchScratch, allocator: Allocator) void {
+        self.candidates.deinit(allocator);
+        self.results.deinit(allocator);
+        self.visited.deinit(allocator);
+    }
 };
 
 /// HNSW index statistics
@@ -258,6 +365,7 @@ const ConnectionPool = struct {
     total_pages: u64,
 
     const Self = @This();
+    /// The part of a page laid out here; see `PAGE_SIZE` in vector/storage.zig.
     const PAGE_SIZE: usize = 4096;
 
     fn init(allocator: Allocator, bp: *BufferPool, m: u16, m_max0: u16) Self {
@@ -347,6 +455,35 @@ const ConnectionPool = struct {
         if (loc.slot_index >= hdr.slot_count) return HnswError.StorageError;
         const slot_offset = POOL_DATA_OFFSET + @as(usize, loc.slot_index) * @as(usize, hdr.slot_size);
         if (frame.data[slot_offset] == FREE_CONNECTION_SLOT) return HnswError.StorageError;
+    }
+
+    /// Free every page of every pool and forget the pools.
+    ///
+    /// Each chain is followed only as far as its pages check out as this
+    /// pool's pages. This runs when a saved graph is being thrown away,
+    /// usually because it failed to load, and a page that does not look like
+    /// one of ours is not ours to free; the rest of that chain is left
+    /// allocated rather than risk freeing another structure's page.
+    fn releaseAllPages(self: *Self) void {
+        var heads = self.pool_heads.iterator();
+        while (heads.next()) |head| {
+            var page_id = head.value_ptr.*;
+            var visited: u32 = 0;
+            while (page_id != NULL_PAGE) : (visited += 1) {
+                if (visited >= self.bp.pm.pageCount() or !self.bp.pm.isValidPage(page_id)) break;
+                const frame = self.bp.fetchPage(page_id, .shared) catch break;
+                const hdr = self.readPageHeader(frame, head.key_ptr.*) catch {
+                    self.bp.unpinPage(frame, false);
+                    break;
+                };
+                self.bp.unpinPage(frame, false);
+                // Refused for a page already freed, which ends a looping chain.
+                self.bp.freePage(page_id) catch break;
+                page_id = hdr.next_page;
+            }
+        }
+        self.pool_heads.clearRetainingCapacity();
+        self.total_pages = 0;
     }
 
     /// Allocate a slot for a node with the given max_layer.
@@ -684,8 +821,48 @@ pub const HnswIndex = struct {
     // Dirty flag for persistence
     dirty: bool,
 
+    /// Prior contents of every neighbour list a mutation in progress has
+    /// rewritten, so a mutation that fails part way can put them back.
+    journal: std.ArrayListUnmanaged(JournalEntry) = .empty,
+    journaling: bool = false,
+
+    /// Ids whose node-map entry was added, changed or removed since the node
+    /// map was last written to its tree, so a save writes only those.
+    unsaved: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The tree may not match the node map apart from `unsaved`: it has never
+    /// been written, the map was rebuilt, or tracking an id failed. The next
+    /// save rewrites the whole map.
+    needs_full_save: bool = true,
+
+    /// Removed ids that some list may still name; see `detach`.
+    dangling: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// Layer-search working space, reused by one search at a time; a search
+    /// that finds it taken (a nested or concurrent one) uses its own.
+    scratch: SearchScratch = .{},
+    scratch_taken: std.atomic.Value(bool) = .init(false),
+
     const Self = @This();
+    /// The part of a page laid out here; see `PAGE_SIZE` in vector/storage.zig.
     const PAGE_SIZE: usize = 4096;
+
+    /// The most neighbours one list can hold; the stack buffers that read a
+    /// list are this size.
+    const MAX_NEIGHBORS: usize = 64;
+
+    const JournalEntry = struct {
+        loc: ConnectionLocation,
+        layer: u8,
+        count: u8,
+        ids: [MAX_NEIGHBORS]u64,
+    };
+
+    /// What a mutation has to restore besides neighbour lists.
+    const Snapshot = struct {
+        entry_point: ?u64,
+        max_layer: u8,
+        vector_count: u64,
+    };
 
     /// Initialize a new HNSW index
     pub fn init(
@@ -694,16 +871,21 @@ pub const HnswIndex = struct {
         vector_storage: *VectorStorage,
         config: HnswConfig,
     ) Self {
+        // A neighbour list is read into fixed buffers of MAX_NEIGHBORS ids,
+        // so larger list sizes would make every read of a full list fail.
+        var bounded = config;
+        bounded.m = @min(config.m, MAX_NEIGHBORS);
+        bounded.m_max0 = @min(config.m_max0, MAX_NEIGHBORS);
         return Self{
             .allocator = allocator,
             .bp = bp,
-            .config = config,
+            .config = bounded,
             .entry_point = null,
             .max_layer = 0,
             .vector_count = 0,
             .vector_storage = vector_storage,
             .nodes = std.AutoHashMap(u64, HnswNodeEntry).init(allocator),
-            .connection_pool = ConnectionPool.init(allocator, bp, config.m, config.m_max0),
+            .connection_pool = ConnectionPool.init(allocator, bp, bounded.m, bounded.m_max0),
             .distance_fn = getDistanceFn(config.metric),
             .rng = std.Random.DefaultPrng.init(@intCast(@import("compat").timestamp())),
             .dirty = false,
@@ -712,8 +894,71 @@ pub const HnswIndex = struct {
 
     /// Deinitialize the index
     pub fn deinit(self: *Self) void {
+        self.scratch.deinit(self.allocator);
+        self.dangling.deinit(self.allocator);
+        self.unsaved.deinit(self.allocator);
+        self.journal.deinit(self.allocator);
         self.connection_pool.deinit();
         self.nodes.deinit();
+    }
+
+    // ========================================================================
+    // Mutation journal
+    // ========================================================================
+
+    fn beginMutation(self: *Self) Snapshot {
+        self.journal.clearRetainingCapacity();
+        self.journaling = true;
+        return .{
+            .entry_point = self.entry_point,
+            .max_layer = self.max_layer,
+            .vector_count = self.vector_count,
+        };
+    }
+
+    fn endMutation(self: *Self) void {
+        self.journaling = false;
+        self.journal.clearRetainingCapacity();
+    }
+
+    /// Note that an id's node-map entry no longer matches the tree.
+    fn markUnsaved(self: *Self, vector_id: u64) void {
+        if (self.needs_full_save) return;
+        self.unsaved.put(self.allocator, vector_id, {}) catch {
+            // Without the id the next save cannot know to write it.
+            self.needs_full_save = true;
+        };
+    }
+
+    /// Remember a list's contents before it is rewritten. Fails before
+    /// anything is written, so a failure here leaves nothing to undo.
+    fn journalList(self: *Self, loc: ConnectionLocation, layer: u8, old: []const u64) HnswError!void {
+        if (!self.journaling) return;
+        if (old.len > MAX_NEIGHBORS) return HnswError.StorageError;
+        var entry = JournalEntry{ .loc = loc, .layer = layer, .count = @intCast(old.len), .ids = undefined };
+        @memcpy(entry.ids[0..old.len], old);
+        self.journal.append(self.allocator, entry) catch return HnswError.OutOfMemory;
+    }
+
+    /// Put back every list the current mutation rewrote, newest first, and
+    /// the index-wide state captured when it began.
+    fn rollback(self: *Self, snapshot: Snapshot) void {
+        var i = self.journal.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = &self.journal.items[i];
+            self.connection_pool.setConnections(entry.loc, 0, entry.layer, entry.ids[0..entry.count]) catch {};
+        }
+        self.journal.clearRetainingCapacity();
+        self.entry_point = snapshot.entry_point;
+        self.max_layer = snapshot.max_layer;
+        self.vector_count = snapshot.vector_count;
+    }
+
+    /// Rewrite a neighbour list, journaling what it held.
+    fn writeList(self: *Self, loc: ConnectionLocation, layer: u8, old: []const u64, new: []const u64) HnswError!void {
+        try self.journalList(loc, layer, old);
+        try self.connection_pool.setConnections(loc, 0, layer, new);
     }
 
     /// Get a node entry by ID
@@ -730,6 +975,25 @@ pub const HnswIndex = struct {
         const max_level = self.connection_pool.maxSupportedLevel();
         const level: u8 = @intFromFloat(@min(level_f, @as(f32, @floatFromInt(max_level))));
         return level;
+    }
+
+    /// The distance `search` would report between `query` and a vector stored
+    /// as `candidate`, for vectors that are not in the index (such as a
+    /// transaction's pending writes). Under cosine the index compares unit
+    /// vectors, so both sides are normalised first, exactly as `insert` and
+    /// `search` normalise them.
+    pub fn distanceForSearch(self: *const Self, query: []const f32, candidate: []const f32) f32 {
+        std.debug.assert(query.len == candidate.len and query.len <= types.MAX_VECTOR_DIMENSIONS);
+        if (self.config.metric != .cosine) return self.distance_fn(query, candidate);
+        var query_buf: [types.MAX_VECTOR_DIMENSIONS]f32 = undefined;
+        var candidate_buf: [types.MAX_VECTOR_DIMENSIONS]f32 = undefined;
+        const q = query_buf[0..query.len];
+        const c = candidate_buf[0..candidate.len];
+        @memcpy(q, query);
+        @memcpy(c, candidate);
+        simd_distance.normalize(q);
+        simd_distance.normalize(c);
+        return normalizedCosineDistance(q, c);
     }
 
     /// Calculate distance between query and a stored vector
@@ -760,14 +1024,23 @@ pub const HnswIndex = struct {
         borrowed: VectorStorage.BorrowedVector,
     };
 
-    /// Borrow vectors for a batch of neighbor IDs, skipping failures.
-    /// Returns the number of entries actually filled into buf.
-    fn borrowNeighborVectors(self: *Self, neighbor_ids: []const u64, buf: []BatchEntry) usize {
+    /// Borrow vectors for a batch of neighbor IDs, skipping ids no longer in
+    /// the index. Returns the number of entries filled into buf.
+    ///
+    /// A vector that cannot be read is an error, not a neighbour to skip:
+    /// skipping it would turn an I/O or corruption error into silently
+    /// missing results.
+    fn borrowNeighborVectors(self: *Self, neighbor_ids: []const u64, buf: []BatchEntry) HnswError!usize {
         var count: usize = 0;
+        errdefer releaseBatch(buf[0..count]);
         for (neighbor_ids) |nid| {
             if (count >= buf.len) break;
             const node = self.getNode(nid) orelse continue;
-            const borrowed = self.vector_storage.borrowByLocation(node.vector_loc) catch continue;
+            const borrowed = self.vector_storage.borrowByLocation(node.vector_loc) catch |err| return switch (err) {
+                error.OutOfMemory => HnswError.OutOfMemory,
+                error.BufferPoolError => HnswError.BufferPoolError,
+                else => HnswError.StorageError,
+            };
             buf[count] = .{ .neighbor_id = nid, .borrowed = borrowed };
             count += 1;
         }
@@ -858,7 +1131,15 @@ pub const HnswIndex = struct {
             }
 
             const cand_node = self.getNode(candidate.node_id) orelse continue;
-            const cand_vec = self.vector_storage.borrowByLocation(cand_node.vector_loc) catch continue;
+            // As in `borrowNeighborVectors`: an id no longer in the index is
+            // skipped, but a vector that cannot be read is an error. Skipping
+            // it would let the backfill below take the candidate unchecked
+            // and report the insert as a success.
+            const cand_vec = self.vector_storage.borrowByLocation(cand_node.vector_loc) catch |err| return switch (err) {
+                error.OutOfMemory => HnswError.OutOfMemory,
+                error.BufferPoolError => HnswError.BufferPoolError,
+                else => HnswError.StorageError,
+            };
 
             var is_diverse = true;
             for (selected_vecs.items) |sel_vec| {
@@ -890,6 +1171,8 @@ pub const HnswIndex = struct {
                 if (selected.items.len >= max_neighbors) break;
                 if (used[idx]) continue;
                 if (candidate.node_id == target_id) continue;
+                // A link to an id no longer in the index is no neighbour.
+                if (!self.nodes.contains(candidate.node_id)) continue;
                 selected.append(candidate.node_id) catch return HnswError.OutOfMemory;
             }
         }
@@ -932,7 +1215,7 @@ pub const HnswIndex = struct {
         neighbor: u64,
         max_connections: u16,
     ) HnswError!void {
-        var ac_conn_buf: [64]u64 = undefined;
+        var ac_conn_buf: [MAX_NEIGHBORS]u64 = undefined;
         const neighbors = try self.connection_pool.getConnectionsInto(loc, layer, &ac_conn_buf);
 
         // Check if already connected
@@ -948,7 +1231,7 @@ pub const HnswIndex = struct {
             @memcpy(new_neighbors[0..neighbors.len], neighbors);
             new_neighbors[neighbors.len] = neighbor;
 
-            try self.setConnections(loc, node_id, layer, new_neighbors);
+            try self.writeList(loc, layer, neighbors, new_neighbors);
         } else {
             // At capacity — use heuristic pruning to select diverse neighbors
             const node_entry = self.getNode(node_id) orelse return;
@@ -986,7 +1269,7 @@ pub const HnswIndex = struct {
             const selected = try self.selectNeighborsHeuristic(node_id, candidates, max_connections);
             defer self.allocator.free(selected);
 
-            try self.setConnections(loc, node_id, layer, selected);
+            try self.writeList(loc, layer, neighbors, selected);
         }
     }
 
@@ -1031,6 +1314,16 @@ pub const HnswIndex = struct {
 
     /// Search for k nearest neighbors
     pub fn search(self: *Self, query: []const f32, k: u32, ef_override: ?u16) HnswError![]SearchResult {
+        return self.searchFiltered(query, k, ef_override, null);
+    }
+
+    /// The k nearest neighbours that `filter` allows, through the graph.
+    ///
+    /// The layer-0 beam keeps only allowed nodes as results and walks through
+    /// the others, so it runs until it holds `ef` allowed nodes or runs out of
+    /// graph. The fewer nodes the filter allows, the more of the graph that
+    /// takes; for a small allowed set `searchExact` costs less.
+    pub fn searchFiltered(self: *Self, query: []const f32, k: u32, ef_override: ?u16, filter: ?Filter) HnswError![]SearchResult {
         if (!types.isValidVectorDimensions(self.config.dimensions) or query.len != self.config.dimensions) {
             return HnswError.DimensionMismatch;
         }
@@ -1039,7 +1332,12 @@ pub const HnswIndex = struct {
             return self.allocator.alloc(SearchResult, 0) catch return HnswError.OutOfMemory;
         }
 
-        const ef = ef_override orelse self.config.ef_search;
+        // The results are the best k of the layer-0 beam, so a beam narrower
+        // than k can never return k of them. Widen it to k, as far as a u16
+        // beam allows.
+        const requested_ef = ef_override orelse self.config.ef_search;
+        const k_ef: u16 = @intCast(@min(k, std.math.maxInt(u16)));
+        const ef = @max(requested_ef, k_ef);
 
         // For cosine metric, normalize query to match stored normalized vectors
         var norm_buf: [4096]f32 = undefined;
@@ -1058,8 +1356,11 @@ pub const HnswIndex = struct {
         }
 
         // Phase 2: Search layer 0 with beam width ef
-        const candidates = try self.searchLayer(search_query, current, 0, ef);
-        defer self.allocator.free(candidates);
+        var local: SearchScratch = .{};
+        defer local.deinit(self.allocator);
+        const scratch = self.takeScratch(&local);
+        defer self.giveScratch(scratch);
+        const candidates = try self.searchLayerInto(scratch, search_query, current, 0, ef, filter);
 
         // Return top k results
         const result_count = @min(k, candidates.len);
@@ -1067,6 +1368,66 @@ pub const HnswIndex = struct {
         @memcpy(results, candidates[0..result_count]);
 
         return results;
+    }
+
+    /// The k nearest of `ids` by measuring each, nearest first. Ids not in
+    /// the index are skipped; each id should appear once.
+    pub fn searchExact(self: *Self, query: []const f32, k: u32, ids: []const u64) HnswError![]SearchResult {
+        if (!types.isValidVectorDimensions(self.config.dimensions) or query.len != self.config.dimensions) {
+            return HnswError.DimensionMismatch;
+        }
+        var norm_buf: [4096]f32 = undefined;
+        const search_query = if (self.config.metric == .cosine) blk: {
+            @memcpy(norm_buf[0..query.len], query);
+            simd_distance.normalize(norm_buf[0..query.len]);
+            break :blk @as([]const f32, norm_buf[0..query.len]);
+        } else query;
+
+        var local: SearchScratch = .{};
+        defer local.deinit(self.allocator);
+        const scratch = self.takeScratch(&local);
+        defer self.giveScratch(scratch);
+        scratch.reset();
+        const best = &scratch.results;
+
+        var batch_buf: [MAX_NEIGHBORS]BatchEntry = undefined;
+        var dist_buf: [MAX_NEIGHBORS]f32 = undefined;
+        var start: usize = 0;
+        while (start < ids.len and k > 0) {
+            const chunk = ids[start..@min(ids.len, start + MAX_NEIGHBORS)];
+            start += chunk.len;
+            const count = try self.borrowNeighborVectors(chunk, &batch_buf);
+            self.batchComputeDistances(search_query, batch_buf[0..count], dist_buf[0..count]);
+            releaseBatch(batch_buf[0..count]);
+            for (batch_buf[0..count], dist_buf[0..count]) |be, dist| {
+                if (best.count() < k) {
+                    best.push(self.allocator, .{ .node_id = be.neighbor_id, .distance = dist }) catch return HnswError.OutOfMemory;
+                } else if (dist < best.top().?.distance) {
+                    _ = best.pop();
+                    best.push(self.allocator, .{ .node_id = be.neighbor_id, .distance = dist }) catch return HnswError.OutOfMemory;
+                }
+            }
+        }
+
+        const out = self.allocator.alloc(SearchResult, best.count()) catch return HnswError.OutOfMemory;
+        var i = out.len;
+        while (best.pop()) |r| {
+            i -= 1;
+            out[i] = r;
+        }
+        return out;
+    }
+
+    /// The index's scratch space, or `local` when another search holds it.
+    fn takeScratch(self: *Self, local: *SearchScratch) *SearchScratch {
+        if (self.scratch_taken.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return &self.scratch;
+        return local;
+    }
+
+    fn giveScratch(self: *Self, scratch: *SearchScratch) void {
+        if (scratch != &self.scratch) return;
+        scratch.trim(self.allocator);
+        self.scratch_taken.store(false, .release);
     }
 
     /// Greedy search within a single layer (returns closest node)
@@ -1078,9 +1439,9 @@ pub const HnswIndex = struct {
         var current_node = entry_node;
         var current_dist = try self.distanceTo(query, current_node.vector_loc);
 
-        var conn_buf: [64]u64 = undefined;
-        var batch_buf: [64]BatchEntry = undefined;
-        var dist_buf: [64]f32 = undefined;
+        var conn_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var batch_buf: [MAX_NEIGHBORS]BatchEntry = undefined;
+        var dist_buf: [MAX_NEIGHBORS]f32 = undefined;
 
         var improved = true;
         while (improved) {
@@ -1088,7 +1449,7 @@ pub const HnswIndex = struct {
             const neighbors = try self.connection_pool.getConnectionsInto(current_node.connections_loc, layer, &conn_buf);
 
             // Batch borrow all neighbor vectors
-            const count = self.borrowNeighborVectors(neighbors, &batch_buf);
+            const count = try self.borrowNeighborVectors(neighbors, &batch_buf);
 
             // Batch compute all distances
             self.batchComputeDistances(query, batch_buf[0..count], dist_buf[0..count]);
@@ -1097,8 +1458,10 @@ pub const HnswIndex = struct {
             // Find minimum
             for (batch_buf[0..count], dist_buf[0..count]) |be, dist| {
                 if (dist < current_dist) {
+                    const next_node = self.getNode(be.neighbor_id) orelse continue;
+                    if (layer > next_node.max_layer) continue;
                     current = be.neighbor_id;
-                    current_node = self.getNode(be.neighbor_id) orelse continue;
+                    current_node = next_node;
                     current_dist = dist;
                     improved = true;
                 }
@@ -1107,95 +1470,70 @@ pub const HnswIndex = struct {
         return current;
     }
 
-    fn compareSearchResults(_: void, a: SearchResult, b: SearchResult) std.math.Order {
-        return std.math.order(a.distance, b.distance);
+    /// Search layer with beam width (returns sorted candidates, owned by
+    /// the caller).
+    fn searchLayer(self: *Self, query: []const f32, entry: u64, layer: u8, ef: u16) HnswError![]SearchResult {
+        var local: SearchScratch = .{};
+        defer local.deinit(self.allocator);
+        const scratch = self.takeScratch(&local);
+        defer self.giveScratch(scratch);
+        const found = try self.searchLayerInto(scratch, query, entry, layer, ef, null);
+        return self.allocator.dupe(SearchResult, found) catch return HnswError.OutOfMemory;
     }
 
-    /// Search layer with beam width (returns sorted candidates).
+    /// Beam search of one layer, in `scratch`. Returns the results nearest
+    /// first, in `scratch`'s memory, valid until it is next used. With a
+    /// filter, only the nodes it allows are results.
     /// Uses batch borrow/compute/release to amortize pin/unpin overhead.
-    fn searchLayer(self: *Self, query: []const f32, entry: u64, layer: u8, ef: u16) HnswError![]SearchResult {
+    fn searchLayerInto(
+        self: *Self,
+        scratch: *SearchScratch,
+        query: []const f32,
+        entry: u64,
+        layer: u8,
+        ef: u16,
+        filter: ?Filter,
+    ) HnswError![]const SearchResult {
         const entry_node = self.getNode(entry) orelse return HnswError.NotFound;
-
-        const CandidateQueue = std.PriorityQueue(SearchResult, void, compareSearchResults);
-        var candidates = if (@hasDecl(CandidateQueue, "initContext"))
-            CandidateQueue.initContext({})
-        else
-            CandidateQueue.init(self.allocator, {});
-        defer if (@hasDecl(CandidateQueue, "initContext"))
-            candidates.deinit(self.allocator)
-        else
-            candidates.deinit();
-        if (@hasDecl(CandidateQueue, "initContext")) {
-            candidates.ensureTotalCapacity(self.allocator, ef) catch return HnswError.OutOfMemory;
-        } else if (@hasDecl(CandidateQueue, "ensureTotalCapacity")) {
-            candidates.ensureTotalCapacity(ef) catch return HnswError.OutOfMemory;
-        } else {
-            candidates.ensureCapacity(ef) catch return HnswError.OutOfMemory;
-        }
-
-        const ResultQueue = std.PriorityDequeue(SearchResult, void, compareSearchResults);
-        var results = if (@hasDecl(ResultQueue, "initContext"))
-            ResultQueue.initContext({})
-        else
-            ResultQueue.init(self.allocator, {});
-        defer if (@hasDecl(ResultQueue, "initContext"))
-            results.deinit(self.allocator)
-        else
-            results.deinit();
-        if (@hasDecl(ResultQueue, "initContext")) {
-            results.ensureTotalCapacity(self.allocator, ef) catch return HnswError.OutOfMemory;
-        } else if (@hasDecl(ResultQueue, "ensureTotalCapacity")) {
-            results.ensureTotalCapacity(ef) catch return HnswError.OutOfMemory;
-        } else {
-            results.ensureCapacity(ef) catch return HnswError.OutOfMemory;
-        }
-
-        var visited = std.AutoHashMap(u64, void).init(self.allocator);
-        defer visited.deinit();
-        visited.ensureTotalCapacity(@as(u32, @intCast(ef)) * 2) catch return HnswError.OutOfMemory;
+        const allocator = self.allocator;
+        scratch.reset();
+        const candidates = &scratch.candidates;
+        const results = &scratch.results;
+        const visited = &scratch.visited;
+        visited.ensureTotalCapacity(allocator, @as(u32, @intCast(ef)) * 2) catch return HnswError.OutOfMemory;
 
         // Initialize with entry point
         const entry_dist = try self.distanceTo(query, entry_node.vector_loc);
         const entry_result = SearchResult{ .node_id = entry, .distance = entry_dist };
-        if (@hasDecl(CandidateQueue, "push")) {
-            candidates.push(self.allocator, entry_result) catch return HnswError.OutOfMemory;
-        } else {
-            candidates.add(entry_result) catch return HnswError.OutOfMemory;
+        candidates.push(allocator, entry_result) catch return HnswError.OutOfMemory;
+        if (filter == null or filter.?.allows(entry)) {
+            results.push(allocator, entry_result) catch return HnswError.OutOfMemory;
         }
-        if (@hasDecl(ResultQueue, "push")) {
-            results.push(self.allocator, entry_result) catch return HnswError.OutOfMemory;
-        } else {
-            results.add(entry_result) catch return HnswError.OutOfMemory;
-        }
-        visited.put(entry, {}) catch return HnswError.OutOfMemory;
+        visited.put(allocator, entry, {}) catch return HnswError.OutOfMemory;
 
         // Stack buffers for batch processing
-        var sl_conn_buf: [64]u64 = undefined;
-        var unvisited_buf: [64]u64 = undefined;
-        var batch_buf: [64]BatchEntry = undefined;
-        var dist_buf: [64]f32 = undefined;
+        var sl_conn_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var unvisited_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var batch_buf: [MAX_NEIGHBORS]BatchEntry = undefined;
+        var dist_buf: [MAX_NEIGHBORS]f32 = undefined;
 
-        while (candidates.count() > 0) {
-            const closest = if (@hasDecl(CandidateQueue, "pop"))
-                candidates.pop() orelse break
-            else
-                candidates.removeOrNull() orelse break;
-
+        while (candidates.pop()) |closest| {
             // Stop if closest candidate is worse than worst result
-            const furthest_dist = if (results.peekMax()) |r| r.distance else 0;
+            const furthest_dist = if (results.top()) |r| r.distance else 0;
             if (results.count() >= ef and closest.distance > furthest_dist) {
                 break;
             }
 
             // Explore neighbors
             const node = self.getNode(closest.node_id) orelse continue;
+            if (layer > node.max_layer) continue;
             const neighbors = try self.connection_pool.getConnectionsInto(node.connections_loc, layer, &sl_conn_buf);
 
             // Phase 1: Filter — collect unvisited neighbor IDs, mark visited
             var unvisited_count: usize = 0;
             for (neighbors) |neighbor| {
-                if (visited.contains(neighbor)) continue;
-                visited.put(neighbor, {}) catch return HnswError.OutOfMemory;
+                const gop = visited.getOrPut(allocator, neighbor) catch return HnswError.OutOfMemory;
+                if (gop.found_existing) continue;
                 unvisited_buf[unvisited_count] = neighbor;
                 unvisited_count += 1;
             }
@@ -1203,7 +1541,7 @@ pub const HnswIndex = struct {
             if (unvisited_count == 0) continue;
 
             // Phase 2: Borrow — pin all pages at once
-            const batch_count = self.borrowNeighborVectors(unvisited_buf[0..unvisited_count], &batch_buf);
+            const batch_count = try self.borrowNeighborVectors(unvisited_buf[0..unvisited_count], &batch_buf);
 
             // Phase 3: Compute — batch SIMD distances
             self.batchComputeDistances(query, batch_buf[0..batch_count], dist_buf[0..batch_count]);
@@ -1211,48 +1549,65 @@ pub const HnswIndex = struct {
 
             // Phase 4: Process — insert into priority queues
             for (batch_buf[0..batch_count], dist_buf[0..batch_count]) |be, dist| {
-                const current_furthest = if (results.peekMax()) |r| r.distance else 0;
+                const current_furthest = if (results.top()) |r| r.distance else 0;
                 if (results.count() < ef or dist < current_furthest) {
                     const result = SearchResult{ .node_id = be.neighbor_id, .distance = dist };
-                    if (@hasDecl(CandidateQueue, "push")) {
-                        candidates.push(self.allocator, result) catch return HnswError.OutOfMemory;
-                    } else {
-                        candidates.add(result) catch return HnswError.OutOfMemory;
-                    }
-                    if (@hasDecl(ResultQueue, "push")) {
-                        results.push(self.allocator, result) catch return HnswError.OutOfMemory;
-                    } else {
-                        results.add(result) catch return HnswError.OutOfMemory;
-                    }
-
-                    if (results.count() > ef) {
-                        if (@hasDecl(ResultQueue, "popMax")) {
-                            _ = results.popMax();
-                        } else {
-                            _ = results.removeMaxOrNull();
-                        }
+                    candidates.push(allocator, result) catch return HnswError.OutOfMemory;
+                    if (filter == null or filter.?.allows(be.neighbor_id)) {
+                        results.push(allocator, result) catch return HnswError.OutOfMemory;
+                        if (results.count() > ef) _ = results.pop();
                     }
                 }
             }
         }
 
-        // Drain results in min-order
-        const result_count = results.count();
-        const output = self.allocator.alloc(SearchResult, result_count) catch return HnswError.OutOfMemory;
-        for (0..result_count) |i| {
-            output[i] = if (@hasDecl(ResultQueue, "popMin"))
-                results.popMin().?
-            else
-                results.removeMinOrNull().?;
+        // The results heap is furthest first; laid out nearest first, it is
+        // the answer. The candidates heap is done with, so it holds them.
+        const out = &candidates.items;
+        out.clearRetainingCapacity();
+        out.ensureTotalCapacity(allocator, results.count()) catch return HnswError.OutOfMemory;
+        out.items.len = results.count();
+        var i = out.items.len;
+        while (results.pop()) |r| {
+            i -= 1;
+            out.items[i] = r;
         }
-        return output;
+        return out.items;
     }
 
     // ========================================================================
     // Insert Algorithm
     // ========================================================================
 
-    /// Insert a vector into the index
+    /// Whether the index already holds exactly this vector for this node.
+    ///
+    /// Recovery replays every vector write since the last checkpoint, and
+    /// most of them are already in the file. Inserting one of those again
+    /// would go down the replacement path, which unlinks the node from its
+    /// neighbours and links it afresh. Doing that for every node in the log
+    /// leaves the graph worse connected than the one that was saved.
+    pub fn holdsVector(self: *Self, vector_id: u64, vector: []const f32) bool {
+        if (vector.len != self.config.dimensions) return false;
+        const existing = self.nodes.get(vector_id) orelse return false;
+
+        var norm_buf: [4096]f32 = undefined;
+        const stored_form = if (self.config.metric == .cosine) blk: {
+            @memcpy(norm_buf[0..vector.len], vector);
+            simd_distance.normalize(norm_buf[0..vector.len]);
+            break :blk norm_buf[0..vector.len];
+        } else vector;
+
+        const borrowed = self.vector_storage.borrowByLocation(existing.vector_loc) catch return false;
+        defer borrowed.release();
+        return std.mem.eql(u8, std.mem.sliceAsBytes(borrowed.data), std.mem.sliceAsBytes(stored_form));
+    }
+
+    /// Insert a vector into the index, or replace the vector of an id it
+    /// already holds.
+    ///
+    /// All or nothing: if it fails, the index is as it was before the call.
+    /// A new id is not left half-linked into the graph, and a replacement keeps
+    /// its old vector and neighbours.
     pub fn insert(self: *Self, vector_id: u64, vector: []const f32) HnswError!void {
         if (!types.isValidVectorDimensions(self.config.dimensions) or vector.len != self.config.dimensions) {
             return HnswError.DimensionMismatch;
@@ -1267,37 +1622,68 @@ pub const HnswIndex = struct {
             break :blk norm_buf[0..vector.len];
         } else vector;
 
-        var recycled_entry: ?HnswNodeEntry = null;
-        if (self.nodes.get(vector_id)) |existing| {
-            self.vector_storage.update(existing.vector_loc, vector_id, store_vector) catch return HnswError.StorageError;
-            recycled_entry = (try self.detach(vector_id)) orelse return HnswError.NotFound;
-            try self.connection_pool.resetSlot(existing.connections_loc);
+        // Links to a removed id that `detach` could not reach would point at
+        // this id again, possibly on layers it no longer reaches. Clear them
+        // first; this is the rare case of an id removed and then re-added
+        // before the next save.
+        if (self.dangling.contains(vector_id) and !self.nodes.contains(vector_id)) {
+            try self.unlinkDangling();
         }
 
-        var owns_new_vector = false;
-        const vector_loc = if (recycled_entry) |entry|
-            entry.vector_loc
-        else blk: {
-            const loc = self.vector_storage.store(vector_id, store_vector) catch return HnswError.StorageError;
-            owns_new_vector = true;
-            break :blk loc;
-        };
-        errdefer if (owns_new_vector) self.vector_storage.delete(vector_loc, vector_id) catch {};
+        const snapshot = self.beginMutation();
+        defer self.endMutation();
 
-        // Replacements retain their original level and connection slot. This avoids
-        // unbounded page growth while preserving the index's sampled level distribution.
-        const level = if (recycled_entry) |entry| entry.max_layer else self.randomLevel();
-        var owns_new_connections = false;
-        const connections_loc = if (recycled_entry) |entry|
-            entry.connections_loc
-        else blk: {
-            const loc = try self.connection_pool.allocateSlot(level);
-            owns_new_connections = true;
-            break :blk loc;
-        };
-        errdefer if (owns_new_connections) self.connection_pool.freeSlot(connections_loc) catch {};
+        if (self.nodes.get(vector_id)) |existing| {
+            return self.replace(existing, store_vector, snapshot);
+        }
 
+        const vector_loc = self.vector_storage.store(vector_id, store_vector) catch return HnswError.StorageError;
+        errdefer self.vector_storage.delete(vector_loc, vector_id) catch {};
+
+        const level = self.randomLevel();
+        const connections_loc = try self.connection_pool.allocateSlot(level);
+        errdefer self.connection_pool.freeSlot(connections_loc) catch {};
+
+        errdefer {
+            self.rollback(snapshot);
+            _ = self.nodes.remove(vector_id);
+        }
         try self.insertGraph(vector_id, vector_loc, connections_loc, level, store_vector);
+    }
+
+    /// Replace the vector of an indexed id in place. It keeps its level and
+    /// connection slot, which avoids unbounded page growth while preserving
+    /// the index's sampled level distribution.
+    fn replace(self: *Self, existing: HnswNodeEntry, store_vector: []const f32, snapshot: Snapshot) HnswError!void {
+        const vector_id = existing.vector_id;
+
+        // What a failure has to put back: the old vector and the node's own
+        // lists, which are journaled before the slot is cleared.
+        const old_vector = blk: {
+            const borrowed = self.vector_storage.borrowByLocation(existing.vector_loc) catch return HnswError.StorageError;
+            defer borrowed.release();
+            break :blk self.allocator.dupe(f32, borrowed.data) catch return HnswError.OutOfMemory;
+        };
+        defer self.allocator.free(old_vector);
+
+        var conn_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var layer: u16 = 0;
+        while (layer <= existing.max_layer) : (layer += 1) {
+            const own = try self.connection_pool.getConnectionsInto(existing.connections_loc, @intCast(layer), &conn_buf);
+            try self.journalList(existing.connections_loc, @intCast(layer), own);
+        }
+
+        self.vector_storage.update(existing.vector_loc, vector_id, store_vector) catch return HnswError.StorageError;
+        errdefer self.vector_storage.update(existing.vector_loc, vector_id, old_vector) catch {};
+
+        errdefer {
+            self.rollback(snapshot);
+            self.nodes.put(vector_id, existing) catch {};
+            self.markUnsaved(vector_id);
+        }
+        _ = (try self.detach(vector_id, .replace)) orelse return HnswError.NotFound;
+        try self.connection_pool.resetSlot(existing.connections_loc);
+        try self.insertGraph(vector_id, existing.vector_loc, existing.connections_loc, existing.max_layer, store_vector);
     }
 
     /// Add an already-persisted vector to a freshly rebuilt graph without
@@ -1322,9 +1708,16 @@ pub const HnswIndex = struct {
             break :blk norm_buf[0..vector.len];
         } else vector;
 
+        const snapshot = self.beginMutation();
+        defer self.endMutation();
+
         const level = self.randomLevel();
         const connections_loc = try self.connection_pool.allocateSlot(level);
         errdefer self.connection_pool.freeSlot(connections_loc) catch {};
+        errdefer {
+            self.rollback(snapshot);
+            _ = self.nodes.remove(vector_id);
+        }
         try self.insertGraph(vector_id, vector_loc, connections_loc, level, search_vector);
     }
 
@@ -1345,6 +1738,7 @@ pub const HnswIndex = struct {
 
         // Register node
         self.nodes.put(vector_id, entry) catch return HnswError.OutOfMemory;
+        self.markUnsaved(vector_id);
 
         // First vector becomes entry point
         if (self.entry_point == null) {
@@ -1393,9 +1787,16 @@ pub const HnswIndex = struct {
                 );
             }
 
-            // Use best candidate as entry for next layer
-            if (candidates.len > 0) {
-                current = candidates[0].node_id;
+            // Use the best candidate other than this node as the entry for the
+            // next layer. When a vector is replaced, nodes its old vector did
+            // not link back to still link to this id, so the search can reach
+            // the node itself, at distance zero. Its lower lists are still
+            // empty, so a search starting there would find nothing and leave
+            // it with no neighbours on every layer below.
+            for (candidates) |candidate| {
+                if (candidate.node_id == vector_id) continue;
+                current = candidate.node_id;
+                break;
             }
 
             if (insert_layer == 0) break;
@@ -1427,37 +1828,52 @@ pub const HnswIndex = struct {
         self.max_layer = if (new_entry_point == null) 0 else new_max_layer;
     }
 
-    fn detach(self: *Self, vector_id: u64) HnswError!?HnswNodeEntry {
-        const removed = self.nodes.fetchRemove(vector_id) orelse return null;
-        const removed_entry = removed.value;
+    const DetachMode = enum {
+        /// The id leaves the index.
+        remove,
+        /// The id is re-inserted straight away with a new vector, so links
+        /// to it stay valid.
+        replace,
+    };
 
-        var iter = self.nodes.iterator();
-        while (iter.next()) |entry| {
-            var layer: u16 = 0;
-            while (layer <= entry.value_ptr.max_layer) : (layer += 1) {
-                const layer_u8: u8 = @intCast(layer);
-                const connections = try self.getConnections(entry.value_ptr.connections_loc, layer_u8);
-                defer self.allocator.free(connections);
+    /// Take a node out of the graph and repair the neighbours it leaves.
+    ///
+    /// Links run both ways for most pairs, so the nodes that point at the
+    /// removed one are found from its own lists rather than by scanning every
+    /// node. Each of them drops the link and, having lost a neighbour, takes
+    /// the closest of the removed node's other neighbours in its place, with
+    /// a link back so it does not lose an incoming one either. This keeps
+    /// out-degree and reachability from decaying under churn.
+    ///
+    /// A node can also point at the removed one without being pointed back
+    /// at, when the removed node pruned it. Those links are left until the
+    /// next save, or until enough have built up (see `remove`), and are then
+    /// dropped in one pass (`unlinkDangling`); search
+    /// already skips ids that are not in the node map, and saving them never
+    /// reaches the tree, so a saved index is the same as before.
+    fn detach(self: *Self, vector_id: u64, mode: DetachMode) HnswError!?HnswNodeEntry {
+        const removed_entry = self.nodes.get(vector_id) orelse return null;
 
-                var write_index: usize = 0;
-                var found = false;
-                for (connections) |neighbor| {
-                    if (neighbor == vector_id) {
-                        found = true;
-                    } else {
-                        connections[write_index] = neighbor;
-                        write_index += 1;
-                    }
-                }
+        if (mode == .remove) {
+            // Remember the id before changing anything, so a failure to
+            // remember it cannot leave links to it behind.
+            self.dangling.put(self.allocator, vector_id, {}) catch return HnswError.OutOfMemory;
+        }
+        _ = self.nodes.remove(vector_id);
+        self.markUnsaved(vector_id);
 
-                if (found) {
-                    try self.setConnections(
-                        entry.value_ptr.connections_loc,
-                        entry.key_ptr.*,
-                        layer_u8,
-                        connections[0..write_index],
-                    );
-                }
+        var own_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var list_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var layer: u16 = 0;
+        while (layer <= removed_entry.max_layer) : (layer += 1) {
+            const layer_u8: u8 = @intCast(layer);
+            const own = try self.connection_pool.getConnectionsInto(removed_entry.connections_loc, layer_u8, &own_buf);
+            for (own) |neighbor_id| {
+                const neighbor = self.nodes.get(neighbor_id) orelse continue;
+                if (layer_u8 > neighbor.max_layer) continue;
+                const list = try self.connection_pool.getConnectionsInto(neighbor.connections_loc, layer_u8, &list_buf);
+                if (std.mem.indexOfScalar(u64, list, vector_id) == null) continue;
+                try self.repairNeighbor(neighbor_id, neighbor, layer_u8, list, vector_id, own);
             }
         }
 
@@ -1477,11 +1893,139 @@ pub const HnswIndex = struct {
         return removed_entry;
     }
 
+    /// `node_id` pointed at `removed_id` on `layer`. Drop that link (and any
+    /// other link to an id no longer in the index), and if that leaves room,
+    /// link to the closest of the removed node's neighbours instead.
+    fn repairNeighbor(
+        self: *Self,
+        node_id: u64,
+        node: HnswNodeEntry,
+        layer: u8,
+        list: []const u64,
+        removed_id: u64,
+        removed_neighbors: []const u64,
+    ) HnswError!void {
+        var kept_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var kept: usize = 0;
+        for (list) |id| {
+            if (id == removed_id or !self.nodes.contains(id)) continue;
+            kept_buf[kept] = id;
+            kept += 1;
+        }
+
+        const max_conn: u16 = if (layer == 0) self.config.m_max0 else self.config.m;
+        var replacement: ?u64 = null;
+        if (kept < max_conn) {
+            const node_vec = self.vector_storage.borrowByLocation(node.vector_loc) catch return HnswError.StorageError;
+            defer node_vec.release();
+
+            // The removed node's neighbours, nearest first.
+            var candidates_buf: [MAX_NEIGHBORS]SearchResult = undefined;
+            var candidate_count: usize = 0;
+            for (removed_neighbors) |candidate_id| {
+                if (candidate_id == node_id or candidate_id == removed_id) continue;
+                if (std.mem.indexOfScalar(u64, kept_buf[0..kept], candidate_id) != null) continue;
+                const candidate = self.nodes.get(candidate_id) orelse continue;
+                if (layer > candidate.max_layer) continue;
+                candidates_buf[candidate_count] = .{
+                    .node_id = candidate_id,
+                    .distance = try self.distanceTo(node_vec.data, candidate.vector_loc),
+                };
+                candidate_count += 1;
+            }
+            const candidates = candidates_buf[0..candidate_count];
+            std.mem.sort(SearchResult, candidates, {}, struct {
+                fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
+                    return a.distance < b.distance;
+                }
+            }.lessThan);
+
+            // Take the nearest one that covers a direction the remaining
+            // neighbours do not, by the same rule as neighbour selection: it
+            // is closer to this node than to any neighbour it keeps.
+            for (candidates) |candidate| {
+                const candidate_entry = self.nodes.get(candidate.node_id).?;
+                const candidate_vec = self.vector_storage.borrowByLocation(candidate_entry.vector_loc) catch return HnswError.StorageError;
+                defer candidate_vec.release();
+                var diverse = true;
+                for (kept_buf[0..kept]) |kept_id| {
+                    const kept_entry = self.nodes.get(kept_id).?;
+                    if (try self.distanceTo(candidate_vec.data, kept_entry.vector_loc) <= candidate.distance) {
+                        diverse = false;
+                        break;
+                    }
+                }
+                if (diverse) {
+                    replacement = candidate.node_id;
+                    break;
+                }
+            }
+            if (replacement) |id| {
+                kept_buf[kept] = id;
+                kept += 1;
+            }
+        }
+
+        try self.writeList(node.connections_loc, layer, list, kept_buf[0..kept]);
+
+        if (replacement) |id| {
+            const candidate = self.nodes.get(id).?;
+            try self.addConnection(candidate.connections_loc, id, layer, node_id, max_conn);
+        }
+    }
+
+    /// Drop links to removed ids that `detach` could not reach through the
+    /// removed nodes' own lists. One pass over every list, run before the
+    /// node map is saved, so a saved graph never names an id it lacks.
+    fn unlinkDangling(self: *Self) HnswError!void {
+        if (self.dangling.count() == 0) return;
+
+        var list_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var kept_buf: [MAX_NEIGHBORS]u64 = undefined;
+        var iter = self.nodes.iterator();
+        while (iter.next()) |entry| {
+            var layer: u16 = 0;
+            while (layer <= entry.value_ptr.max_layer) : (layer += 1) {
+                const layer_u8: u8 = @intCast(layer);
+                const list = try self.connection_pool.getConnectionsInto(entry.value_ptr.connections_loc, layer_u8, &list_buf);
+                var kept: usize = 0;
+                for (list) |id| {
+                    // A removed id that was inserted again is valid again.
+                    if (self.dangling.contains(id) and !self.nodes.contains(id)) continue;
+                    kept_buf[kept] = id;
+                    kept += 1;
+                }
+                if (kept == list.len) continue;
+                try self.writeList(entry.value_ptr.connections_loc, layer_u8, list, kept_buf[0..kept]);
+            }
+        }
+        self.dangling.clearRetainingCapacity();
+    }
+
     /// Remove a vector from the index and release its storage for reuse.
+    /// All or nothing, like `insert`.
     pub fn remove(self: *Self, vector_id: u64) HnswError!void {
-        const removed_entry = (try self.detach(vector_id)) orelse return;
+        // Leftover links to removed ids take up list slots until they are
+        // dropped. Drop them once they would make up about 3% of the index,
+        // so the cost is a few list reads per removal and lists stay full.
+        if (self.dangling.count() >= 64 and self.dangling.count() * 32 >= self.nodes.count()) {
+            try self.unlinkDangling();
+        }
+
+        const snapshot = self.beginMutation();
+        defer self.endMutation();
+
+        const removed_entry = self.nodes.get(vector_id) orelse return;
+        errdefer {
+            self.rollback(snapshot);
+            self.nodes.put(vector_id, removed_entry) catch {};
+            self.markUnsaved(vector_id);
+        }
+        _ = try self.detach(vector_id, .remove);
         self.vector_storage.delete(removed_entry.vector_loc, vector_id) catch return HnswError.StorageError;
-        try self.connection_pool.freeSlot(removed_entry.connections_loc);
+        // Nothing refers to the slot any more; failing to mark it free only
+        // means it is not reused.
+        self.connection_pool.freeSlot(removed_entry.connections_loc) catch {};
     }
 
     /// Free search results allocated by search()
@@ -1494,7 +2038,7 @@ pub const HnswIndex = struct {
     // ========================================================================
 
     /// Sentinel key used to store HNSW metadata in the B+Tree.
-    const METADATA_KEY = [_]u8{0xFF} ** 8;
+    pub const METADATA_KEY = [_]u8{0xFF} ** 8;
 
     /// Serialize HNSW metadata (entry_point, max_layer, vector_count, pool_heads)
     /// into a stack buffer. Returns the slice of valid bytes.
@@ -1557,9 +2101,22 @@ pub const HnswIndex = struct {
         }
     }
 
+    /// Forget the graph so it can be built again from the stored vectors.
+    ///
+    /// The connection pages the old graph used are freed, so the new graph
+    /// reuses them instead of growing the file by the size of the graph on
+    /// every rebuild. A read-only handle frees nothing; its rebuilt graph
+    /// lives in memory only.
     pub fn resetForRebuild(self: *Self) void {
+        self.dangling.clearRetainingCapacity();
+        self.unsaved.clearRetainingCapacity();
+        self.needs_full_save = true;
         self.nodes.clearRetainingCapacity();
-        self.connection_pool.pool_heads.clearRetainingCapacity();
+        if (self.bp.pm.read_only) {
+            self.connection_pool.pool_heads.clearRetainingCapacity();
+        } else {
+            self.connection_pool.releaseAllPages();
+        }
         self.entry_point = null;
         self.max_layer = 0;
         self.vector_count = 0;
@@ -1568,9 +2125,55 @@ pub const HnswIndex = struct {
 
     /// Save the HNSW index state to a B+Tree for persistence.
     /// Only writes if the index is dirty.
-    pub fn saveToTree(self: *Self, tree: *BTree) HnswError!void {
+    ///
+    /// Writes only the node entries that changed since the last save, plus
+    /// the metadata. The whole map is rewritten the first time, after a
+    /// rebuild, or when change tracking could not keep up. Either way the tree
+    /// ends up holding exactly the node map, so loading is unaffected.
+    ///
+    /// The tree's keys are vector ids in `id_keys` order, the file's; the
+    /// metadata key is all 0xFF bytes in either order.
+    pub fn saveToTree(self: *Self, tree: *BTree, id_keys: IdKeyOrder) HnswError!void {
         if (!self.dirty) return;
+        try self.unlinkDangling();
+        if (self.needs_full_save) return self.saveAllToTree(tree, id_keys);
 
+        try self.saveMetadata(tree);
+
+        // A failure part way leaves `unsaved` intact for the next attempt;
+        // rewriting an entry that already made it is harmless.
+        var iter = self.unsaved.keyIterator();
+        while (iter.next()) |vector_id| {
+            const key_buf = id_keys.encode(vector_id.*);
+            tree.delete(&key_buf) catch |err| switch (err) {
+                BTreeError.KeyNotFound => {},
+                else => return HnswError.StorageError,
+            };
+            if (self.nodes.get(vector_id.*)) |entry| {
+                var val_buf: [HnswNodeEntry.SERIALIZED_SIZE]u8 = undefined;
+                entry.serialize(&val_buf);
+                tree.insert(&key_buf, &val_buf) catch return HnswError.StorageError;
+            }
+        }
+
+        self.unsaved.clearRetainingCapacity();
+        self.dirty = false;
+    }
+
+    fn saveMetadata(self: *Self, tree: *BTree) HnswError!void {
+        var meta_buf: [1300]u8 = undefined;
+        const meta_data = self.serializeMetadata(&meta_buf);
+
+        // Delete-then-insert pattern (delete of missing key returns KeyNotFound, which we ignore)
+        tree.delete(&METADATA_KEY) catch |err| switch (err) {
+            BTreeError.KeyNotFound => {},
+            else => return HnswError.StorageError,
+        };
+        tree.insert(&METADATA_KEY, meta_data) catch return HnswError.StorageError;
+    }
+
+    /// Rewrite the whole node map, dropping entries for ids no longer in it.
+    fn saveAllToTree(self: *Self, tree: *BTree, id_keys: IdKeyOrder) HnswError!void {
         var stale_keys: std.ArrayListUnmanaged(u64) = .empty;
         defer stale_keys.deinit(self.allocator);
 
@@ -1585,38 +2188,26 @@ pub const HnswIndex = struct {
                 if (e.key.len != 8) continue;
                 if (std.mem.eql(u8, e.key, &METADATA_KEY)) continue;
 
-                const vector_id = std.mem.readInt(u64, e.key[0..8], .little);
+                const vector_id = id_keys.decode(e.key[0..8]);
                 if (!self.nodes.contains(vector_id)) {
                     stale_keys.append(self.allocator, vector_id) catch return HnswError.OutOfMemory;
                 }
             }
         }
 
-        // 1. Save metadata under sentinel key
-        var meta_buf: [1300]u8 = undefined;
-        const meta_data = self.serializeMetadata(&meta_buf);
-
-        // Delete-then-insert pattern (delete of missing key returns KeyNotFound, which we ignore)
-        tree.delete(&METADATA_KEY) catch |err| switch (err) {
-            BTreeError.KeyNotFound => {},
-            else => return HnswError.StorageError,
-        };
-        tree.insert(&METADATA_KEY, meta_data) catch return HnswError.StorageError;
+        try self.saveMetadata(tree);
 
         for (stale_keys.items) |vector_id| {
-            var key_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &key_buf, vector_id, .little);
+            const key_buf = id_keys.encode(vector_id);
             tree.delete(&key_buf) catch |err| switch (err) {
                 BTreeError.KeyNotFound => {},
                 else => return HnswError.StorageError,
             };
         }
 
-        // 2. Save each node entry
         var iter = self.nodes.iterator();
         while (iter.next()) |entry| {
-            var key_buf: [8]u8 = undefined;
-            std.mem.writeInt(u64, &key_buf, entry.key_ptr.*, .little);
+            const key_buf = id_keys.encode(entry.key_ptr.*);
 
             var val_buf: [HnswNodeEntry.SERIALIZED_SIZE]u8 = undefined;
             entry.value_ptr.serialize(&val_buf);
@@ -1628,12 +2219,14 @@ pub const HnswIndex = struct {
             tree.insert(&key_buf, &val_buf) catch return HnswError.StorageError;
         }
 
+        self.unsaved.clearRetainingCapacity();
+        self.needs_full_save = false;
         self.dirty = false;
     }
 
     /// Load the HNSW index state from a B+Tree.
     /// Returns true if successfully loaded, false if no persisted state found.
-    pub fn loadFromTree(self: *Self, tree: *BTree) HnswError!bool {
+    pub fn loadFromTree(self: *Self, tree: *BTree, id_keys: IdKeyOrder) HnswError!bool {
         // 1. Look up metadata sentinel
         const meta_val = tree.get(&METADATA_KEY) catch return HnswError.StorageError;
         if (meta_val == null) return false;
@@ -1667,7 +2260,7 @@ pub const HnswIndex = struct {
 
             // Deserialize into an owned struct (no pointers into B+Tree page)
             const node_entry = HnswNodeEntry.deserialize(e.value[0..HnswNodeEntry.SERIALIZED_SIZE]);
-            const vector_id = std.mem.readInt(u64, e.key[0..8], .little);
+            const vector_id = id_keys.decode(e.key[0..8]);
             if (node_entry.vector_id != vector_id or
                 node_entry.max_layer > self.connection_pool.maxSupportedLevel())
             {
@@ -1702,6 +2295,9 @@ pub const HnswIndex = struct {
             if (actual_max_layer != self.max_layer) return HnswError.StorageError;
         }
 
+        // The tree now matches the map, so later saves can be incremental.
+        self.unsaved.clearRetainingCapacity();
+        self.needs_full_save = false;
         self.dirty = false;
         return true;
     }
@@ -2025,4 +2621,306 @@ test "hnsw rejects wrong vector dimensions" {
     try std.testing.expectError(HnswError.DimensionMismatch, index.insert(1, &[_]f32{ 1.0, 0.0, 0.0 }));
     try index.insert(1, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
     try std.testing.expectError(HnswError.DimensionMismatch, index.search(&[_]f32{ 1.0, 0.0, 0.0 }, 1, null));
+}
+
+test "hnsw search returns k results when k exceeds ef_search" {
+    const allocator = std.testing.allocator;
+
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/lattice_hnsw_k_exceeds_ef_test.db";
+    vfs_impl.delete(db_path) catch {};
+
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 64 * 4096);
+    defer bp.deinit();
+
+    var vs = try VectorStorage.init(allocator, &bp, 4);
+    var index = HnswIndex.init(allocator, &bp, &vs, .{
+        .dimensions = 4,
+        .m = 4,
+        .m_max0 = 8,
+        .ef_construction = 16,
+        .ef_search = 8,
+        .metric = .euclidean,
+    });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    for (1..65) |id| {
+        var vec: [4]f32 = undefined;
+        for (&vec) |*x| x.* = random.float(f32);
+        try index.insert(id, &vec);
+    }
+
+    const query = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
+
+    // k = 30 is past the configured ef_search of 8 and past an override of 4.
+    // The beam has to widen to k, or the search can only ever return ef.
+    for ([_]?u16{ null, 4 }) |ef| {
+        const results = try index.search(&query, 30, ef);
+        defer index.freeResults(results);
+        try std.testing.expectEqual(@as(usize, 30), results.len);
+        for (results[1..], results[0 .. results.len - 1]) |later, earlier| {
+            try std.testing.expect(earlier.distance <= later.distance);
+        }
+    }
+}
+
+test "hnsw filtered and exact searches keep to the allowed nodes" {
+    const allocator = std.testing.allocator;
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/lattice_hnsw_filtered_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 256 * 4096);
+    defer bp.deinit();
+    var vs = try VectorStorage.init(allocator, &bp, 4);
+    var index = HnswIndex.init(allocator, &bp, &vs, .{ .dimensions = 4, .m = 8, .m_max0 = 16, .ef_construction = 64, .ef_search = 32, .metric = .euclidean });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const random = prng.random();
+    var vectors: [400][4]f32 = undefined;
+    for (&vectors, 1..) |*v, id| {
+        for (v) |*x| x.* = random.float(f32);
+        try index.insert(id, v);
+    }
+
+    // Every seventh id is allowed.
+    const Sevenths = struct {
+        fn allows(_: *const anyopaque, id: u64) bool {
+            return id % 7 == 0;
+        }
+    };
+    var allowed_ids: [57]u64 = undefined;
+    for (&allowed_ids, 1..) |*id, i| id.* = i * 7;
+
+    const query = [_]f32{ 0.3, 0.6, 0.2, 0.9 };
+    // The true nearest five of the allowed, measured here.
+    var truth: [57]SearchResult = undefined;
+    for (&truth, allowed_ids) |*t, id| t.* = .{ .node_id = id, .distance = euclideanDistance(&query, &vectors[id - 1]) };
+    std.mem.sort(SearchResult, &truth, {}, struct {
+        fn lt(_: void, a: SearchResult, b: SearchResult) bool {
+            return a.distance < b.distance;
+        }
+    }.lt);
+
+    const exact = try index.searchExact(&query, 5, &allowed_ids);
+    defer index.freeResults(exact);
+    try std.testing.expectEqual(@as(usize, 5), exact.len);
+    for (exact, truth[0..5]) |got, want| {
+        try std.testing.expectEqual(want.node_id, got.node_id);
+        try std.testing.expectApproxEqAbs(want.distance, got.distance, 1e-5);
+    }
+
+    // Asking for more than there are returns them all, nearest first.
+    const all = try index.searchExact(&query, 100, &allowed_ids);
+    defer index.freeResults(all);
+    try std.testing.expectEqual(@as(usize, 57), all.len);
+
+    var dummy: u8 = 0;
+    const filtered = try index.searchFiltered(&query, 5, null, .{ .context = &dummy, .allowsFn = Sevenths.allows });
+    defer index.freeResults(filtered);
+    try std.testing.expectEqual(@as(usize, 5), filtered.len);
+    var hits: usize = 0;
+    for (filtered) |r| {
+        try std.testing.expect(r.node_id % 7 == 0);
+        for (truth[0..5]) |t| {
+            if (t.node_id == r.node_id) hits += 1;
+        }
+    }
+    try std.testing.expect(hits >= 4);
+
+    // The unfiltered search is unchanged by the scratch space being reused.
+    const plain_a = try index.search(&query, 10, null);
+    defer index.freeResults(plain_a);
+    const plain_b = try index.search(&query, 10, null);
+    defer index.freeResults(plain_b);
+    try std.testing.expectEqualSlices(SearchResult, plain_a, plain_b);
+}
+
+test "hnsw replacing a vector leaves the node linked on every layer" {
+    const allocator = std.testing.allocator;
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/s3_lattice_hnsw_replace_links_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 512 * 4096);
+    defer bp.deinit();
+
+    const dims = 8;
+    var vs = try VectorStorage.init(allocator, &bp, dims);
+    var index = HnswIndex.init(allocator, &bp, &vs, .{
+        .dimensions = dims,
+        .m = 4,
+        .m_max0 = 8,
+        .ef_construction = 32,
+        .ef_search = 32,
+    });
+    defer index.deinit();
+    index.rng = std.Random.DefaultPrng.init(7);
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    const count = 300;
+    var vectors: [count][dims]f32 = undefined;
+    for (&vectors, 0..) |*v, i| {
+        for (v) |*x| x.* = random.float(f32);
+        try index.insert(i + 1, v);
+    }
+
+    // Move every vector a little, twice over. Other nodes still link to the
+    // one being moved (links it did not return), so the searches that place
+    // it again can reach it, at distance zero from itself.
+    var conn_buf: [HnswIndex.MAX_NEIGHBORS]u64 = undefined;
+    for (0..2) |_| {
+        for (&vectors, 0..) |*v, i| {
+            for (v) |*x| x.* += (random.float(f32) - 0.5) * 0.05;
+            try index.insert(i + 1, v);
+
+            const node = index.getNode(i + 1).?;
+            var layer: u16 = 0;
+            while (layer <= node.max_layer) : (layer += 1) {
+                // Layers above every other node's top have no one to link to.
+                var others: usize = 0;
+                var it = index.nodes.iterator();
+                while (it.next()) |e| {
+                    if (e.key_ptr.* != i + 1 and e.value_ptr.max_layer >= layer) others += 1;
+                }
+                if (others == 0) continue;
+                const links = try index.connection_pool.getConnectionsInto(node.connections_loc, @intCast(layer), &conn_buf);
+                try std.testing.expect(links.len > 0);
+                try std.testing.expect(std.mem.indexOfScalar(u64, links, i + 1) == null);
+            }
+        }
+    }
+}
+
+test "hnsw rebuild reuses the connection pages the old graph used" {
+    const allocator = std.testing.allocator;
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/s3_lattice_hnsw_rebuild_pages_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 256 * 4096);
+    defer bp.deinit();
+
+    const dims = 8;
+    var vs = try VectorStorage.init(allocator, &bp, dims);
+    var index = HnswIndex.init(allocator, &bp, &vs, .{ .dimensions = dims, .m = 4, .m_max0 = 8, .ef_construction = 16 });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const random = prng.random();
+    const count = 400;
+    var vectors: [count][dims]f32 = undefined;
+    // Levels come from a clock-seeded generator. Seed it the same way for
+    // the first build and every rebuild, so each rebuild makes the same
+    // graph and needs exactly the pages the first one did.
+    const level_seed = 11;
+    index.rng = std.Random.DefaultPrng.init(level_seed);
+    for (&vectors, 1..) |*v, id| {
+        for (v) |*x| x.* = random.float(f32);
+        try index.insert(id, v);
+    }
+    var locations: [count]VectorLocation = undefined;
+    for (&locations, 1..) |*loc, id| loc.* = index.getNode(id).?.vector_loc;
+    try std.testing.expect(index.connection_pool.total_pages > 1);
+    const pages_before = pm.pageCount();
+
+    // What opening does when the saved graph cannot be loaded: forget it and
+    // place every stored vector again.
+    for (0..3) |_| {
+        index.resetForRebuild();
+        index.rng = std.Random.DefaultPrng.init(level_seed);
+        for (&vectors, locations, 1..) |*v, loc, id| try index.insertStored(id, loc, v);
+        try std.testing.expectEqual(pages_before, pm.pageCount());
+    }
+
+    const results = try index.search(&vectors[10], 1, null);
+    defer index.freeResults(results);
+    try std.testing.expectEqual(@as(u64, 11), results[0].node_id);
+}
+
+test "hnsw insert reports a candidate vector it could not read" {
+    const allocator = std.testing.allocator;
+    const vfs = lattice.storage.vfs;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+    const db_path = "/tmp/s3_lattice_hnsw_unreadable_candidate_test.db";
+    vfs_impl.delete(db_path) catch {};
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 256 * 4096);
+    defer bp.deinit();
+
+    // Vectors larger than a page are read into buffers the storage
+    // allocates, so a failed allocation makes a stored vector unreadable.
+    const dims = 1100;
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var vs = try VectorStorage.init(failing.allocator(), &bp, dims);
+    defer vs.deinit();
+    var index = HnswIndex.init(allocator, &bp, &vs, .{ .dimensions = dims, .m = 4, .m_max0 = 8, .ef_construction = 16 });
+    defer index.deinit();
+
+    var prng = std.Random.DefaultPrng.init(5);
+    const random = prng.random();
+    var vector: [dims]f32 = undefined;
+    for (1..40) |id| {
+        for (&vector) |*x| x.* = random.float(f32);
+        var fail_after: usize = 0;
+        while (true) : (fail_after += 1) {
+            failing.fail_index = failing.alloc_index + fail_after;
+            failing.has_induced_failure = false;
+            const inserted = index.insert(id, &vector);
+            const induced = failing.has_induced_failure;
+            failing.fail_index = std.math.maxInt(usize);
+            if (inserted) |_| {
+                // An insert that could not read a vector it needed must not
+                // report success.
+                try std.testing.expect(!induced);
+                break;
+            } else |_| {
+                try std.testing.expect(index.getNode(id) == null);
+            }
+        }
+    }
 }

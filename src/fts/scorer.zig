@@ -13,9 +13,11 @@ const BTree = btree.BTree;
 const ScopedTree = @import("scoped_tree.zig").ScopedTree;
 const BTreeError = btree.BTreeError;
 const NodeId = lattice.core.types.NodeId;
+const IdKeyOrder = lattice.core.id_key.IdKeyOrder;
 
 const posting = @import("posting.zig");
 const DocId = posting.DocId;
+const fuzzy = @import("fuzzy.zig");
 
 /// Scorer errors
 pub const ScorerError = error{
@@ -78,6 +80,8 @@ const DocLengthEntry = extern struct {
 pub const DocLengthStore = struct {
     allocator: Allocator,
     tree: ScopedTree,
+    /// How document keys encode document ids; the file decides it.
+    id_keys: IdKeyOrder,
     stats: DocStats,
 
     const Self = @This();
@@ -86,7 +90,7 @@ pub const DocLengthStore = struct {
     ///
     /// Document keys are always eight bytes, so a shorter key cannot collide
     /// with one however many documents are indexed.
-    const STATS_KEY = [_]u8{ 0x00, 's', 't', 'a', 't', 's' };
+    pub const STATS_KEY = [_]u8{ 0x00, 's', 't', 'a', 't', 's' };
 
     /// Statistics as they sit in the tree.
     const StatsEntry = extern struct {
@@ -102,10 +106,11 @@ pub const DocLengthStore = struct {
     /// score after a reopen was computed against an empty corpus: the inverse
     /// document frequency had no document count to work from and the length
     /// normalisation had no average to compare against.
-    pub fn init(allocator: Allocator, tree: ScopedTree) Self {
+    pub fn init(allocator: Allocator, tree: ScopedTree, id_keys: IdKeyOrder) Self {
         var self = Self{
             .allocator = allocator,
             .tree = tree,
+            .id_keys = id_keys,
             .stats = DocStats{
                 .total_docs = 0,
                 .total_tokens = 0,
@@ -133,21 +138,67 @@ pub const DocLengthStore = struct {
     /// Called on every change to a document. That is one extra tree write per
     /// indexed document, alongside the several that indexing already performs,
     /// and it buys scores that mean the same thing after a restart.
-    fn persistStats(self: *Self) void {
+    ///
+    /// A failure is returned rather than dropped: after the delete, a failed
+    /// insert leaves no stats at all, and every later open would score
+    /// against an empty corpus while the caller believed the write succeeded.
+    fn persistStats(self: *Self) ScorerError!void {
         const entry = StatsEntry{
             .total_docs = self.stats.total_docs,
             .total_tokens = self.stats.total_tokens,
         };
         const bytes = std.mem.asBytes(&entry);
 
-        self.tree.delete(&STATS_KEY) catch {};
-        self.tree.insert(&STATS_KEY, bytes) catch {};
+        self.tree.delete(&STATS_KEY) catch |err| {
+            if (err != BTreeError.KeyNotFound) return mapBTreeError(err);
+        };
+        self.tree.insert(&STATS_KEY, bytes) catch |err| return mapBTreeError(err);
+    }
+
+    /// Whether any document has a length stored here.
+    ///
+    /// The stats are the cheap answer but not a sure one: an index written
+    /// before they were stored (0.14 and earlier) has documents and no stats
+    /// until its next write. Scoped indexes reach their first document after
+    /// at most the stats and analysis keys; the unscoped view walks past every
+    /// scoped index's keys, so callers ask only when the stats say empty.
+    pub fn hasDocuments(self: *Self) ScorerError!bool {
+        if (self.stats.total_docs != 0) return true;
+        var iter: ScopedTree.Iterator = undefined;
+        self.tree.iterateAll(&iter) catch |err| return mapBTreeError(err);
+        defer iter.deinit();
+        while (iter.next() catch |err| return mapBTreeError(err)) |entry| {
+            const key = self.tree.callerKey(entry.key) orelse continue;
+            if (key.len == 8) return true;
+        }
+        return false;
+    }
+
+    /// Key the index's analyzer settings are stored under (see
+    /// `FtsIndex.analysis`). Six bytes, like the stats key, so it cannot
+    /// collide with a document key; 0.16.0 never looks it up.
+    pub const ANALYSIS_KEY = [_]u8{ 0x00, 'a', 'n', 'l', 'y', 'z' };
+    pub const ANALYSIS_LEN = 4;
+
+    /// The analyzer settings recorded for this index, or null if none were.
+    pub fn getAnalysis(self: *Self) ScorerError!?[ANALYSIS_LEN]u8 {
+        const value = (self.tree.get(&ANALYSIS_KEY) catch |err| return mapBTreeError(err)) orelse return null;
+        defer self.tree.freeValue(value);
+        if (value.len < ANALYSIS_LEN) return null;
+        return value[0..ANALYSIS_LEN].*;
+    }
+
+    /// Record the analyzer settings this index's terms are written with.
+    pub fn putAnalysis(self: *Self, value: [ANALYSIS_LEN]u8) ScorerError!void {
+        self.tree.delete(&ANALYSIS_KEY) catch |err| {
+            if (err != BTreeError.KeyNotFound) return mapBTreeError(err);
+        };
+        self.tree.insert(&ANALYSIS_KEY, &value) catch |err| return mapBTreeError(err);
     }
 
     /// Set document length (updates stats)
     pub fn setLength(self: *Self, doc_id: DocId, length: u32) ScorerError!void {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         // Check if document already exists and get old length
         var old_length: ?u32 = null;
@@ -189,13 +240,12 @@ pub const DocLengthStore = struct {
         }
 
         self.stats.recalculate();
-        self.persistStats();
+        try self.persistStats();
     }
 
     /// Get document length
     pub fn getLength(self: *Self, doc_id: DocId) ScorerError!u32 {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         const result = self.tree.get(&key_buf) catch |err| {
             return mapBTreeError(err);
@@ -210,10 +260,45 @@ pub const DocLengthStore = struct {
         return ScorerError.NotFound;
     }
 
+    /// Look up the lengths of many documents at once.
+    ///
+    /// `out[i]` receives the length of `doc_ids[i]`, or null when the document
+    /// has none. The lookups run in key order through one tree cursor (see
+    /// `ScopedTree.SortedLookup`), so scoring a long posting list costs roughly
+    /// one leaf visit per leaf of lengths it touches and no allocation per
+    /// document, where `getLength` costs a root-to-leaf descent and a copy of
+    /// the value each time. `order` is scratch of the same length.
+    pub fn getLengths(self: *Self, doc_ids: []const DocId, out: []?u32, order: []u32) ScorerError!void {
+        std.debug.assert(doc_ids.len == out.len and doc_ids.len == order.len);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        // In the order of their keys, which is id order only when the
+        // file's id keys are big-endian.
+        const Context = struct {
+            ids: []const DocId,
+            id_keys: IdKeyOrder,
+            fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                return ctx.id_keys.keyLessThan(ctx.ids[a], ctx.ids[b]);
+            }
+        };
+        std.mem.sort(u32, order, Context{ .ids = doc_ids, .id_keys = self.id_keys }, Context.lessThan);
+
+        var lookup: ScopedTree.SortedLookup = undefined;
+        lookup.init(self.tree) catch |err| return mapBTreeError(err);
+        defer lookup.deinit();
+
+        for (order) |i| {
+            const key_buf = self.id_keys.encode(doc_ids[i]);
+            const value = lookup.get(&key_buf) catch |err| return mapBTreeError(err);
+            out[i] = if (value) |v| blk: {
+                if (v.len < @sizeOf(DocLengthEntry)) break :blk null;
+                break :blk DocLengthEntry.deserialize(v).length;
+            } else null;
+        }
+    }
+
     /// Remove document and update stats
     pub fn removeDoc(self: *Self, doc_id: DocId) ScorerError!void {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         // Get current length before removing
         const result = self.tree.get(&key_buf) catch |err| {
@@ -232,14 +317,13 @@ pub const DocLengthStore = struct {
             self.stats.total_docs -= 1;
             self.stats.total_tokens -= entry.length;
             self.stats.recalculate();
-            self.persistStats();
+            try self.persistStats();
         }
     }
 
     /// Check if a document exists
     pub fn contains(self: *Self, doc_id: DocId) bool {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         return self.tree.contains(&key_buf) catch false;
     }
@@ -300,8 +384,9 @@ pub const Bm25Scorer = struct {
         return idf * tf_norm;
     }
 
-    /// Calculate BM25 score with fuzzy distance penalty
-    /// Applies quadratic penalty: score * (1 - (distance/max_distance)^2)
+    /// Calculate BM25 score with fuzzy distance penalty: the term's score
+    /// times `fuzzy.distancePenalty`, positive for every match within
+    /// `max_distance` and larger the closer the match.
     pub fn scoreTermFuzzy(
         self: *Self,
         stats: DocStats,
@@ -312,19 +397,7 @@ pub const Bm25Scorer = struct {
         max_distance: u32,
     ) f32 {
         const base_score = self.scoreTerm(stats, term_freq, doc_freq, doc_length);
-
-        // Apply distance penalty
-        if (max_distance == 0) {
-            return if (edit_distance == 0) base_score else 0.0;
-        }
-        if (edit_distance >= max_distance) {
-            return 0.0;
-        }
-
-        const ratio = @as(f32, @floatFromInt(edit_distance)) / @as(f32, @floatFromInt(max_distance));
-        const penalty = 1.0 - (ratio * ratio);
-
-        return base_score * penalty;
+        return base_score * fuzzy.distancePenalty(edit_distance, max_distance);
     }
 
     /// Calculate BM25 score for a document with multiple terms
@@ -398,7 +471,7 @@ test "bm25 score calculation" {
     defer bp.deinit();
 
     var tree = try BTree.init(allocator, &bp);
-    var doc_lengths = DocLengthStore.init(allocator, ScopedTree.unscoped(&tree));
+    var doc_lengths = DocLengthStore.init(allocator, ScopedTree.unscoped(&tree), .big);
 
     // Add some documents
     try doc_lengths.setLength(1, 100); // Doc 1: 100 tokens
@@ -451,7 +524,7 @@ test "doc length store operations" {
     defer bp.deinit();
 
     var tree = try BTree.init(allocator, &bp);
-    var store = DocLengthStore.init(allocator, ScopedTree.unscoped(&tree));
+    var store = DocLengthStore.init(allocator, ScopedTree.unscoped(&tree), .big);
 
     // Initially empty
     try std.testing.expectEqual(@as(u64, 0), store.stats.total_docs);

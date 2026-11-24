@@ -10,11 +10,21 @@ properties are `any`, errors are ordinary errors you can compare with
 go get github.com/jeffhajewski/latticedb/bindings/go
 ```
 
-Because it uses cgo, building needs the LatticeDB shared library available to
-the linker. Installing a release package puts it somewhere pkg-config can find,
-which is what the default build expects. If you are working inside a checkout of
-the repository, build the library first and use the `repolocal` build tag, which
-points the linker at `zig-out/lib`:
+Because it uses cgo, building needs the LatticeDB shared library, the header,
+and the `lattice.pc` pkg-config file, which is what the default build looks up.
+The `install.sh` script installs only the CLI and the shared library, so it is not
+enough on its own. Either unpack a release archive (it carries `include/`, `lib/`
+and `lib/pkgconfig/lattice.pc`) or install from a checkout, then point pkg-config
+at it:
+
+```bash
+zig build install --prefix /tmp/lattice-install   # or unpack a release archive
+export PKG_CONFIG_PATH=/tmp/lattice-install/lib/pkgconfig
+```
+
+If you are working inside a checkout of the repository, build the library first
+and use the `repolocal` build tag instead, which points the compiler and linker at
+`include/` and `zig-out/lib`:
 
 ```bash
 zig build
@@ -39,19 +49,31 @@ defer db.Close()
 |-------|--------------|
 | `Create` | Create the file if it is not there |
 | `ReadOnly` | Open without the ability to write |
-| `CacheSizeMB` | How much memory to keep pages in |
+| `CacheSizeMB` | How much memory to keep pages in (0: `LATTICE_BUFFER_POOL_MB` if set, else 100 MB) |
 | `PageSize` | Page size in bytes |
-| `EnableVectors` | Turn on the vector index |
-| `VectorDimensions` | How many numbers are in each vector |
-| `EnableAdjacencyCache` | Keep an in-memory map of connections to speed up traversal |
-| `DisableWAL` | Open without write-ahead logging |
+| `EnableVectors` | Create a vector index if the database has none |
+| `VectorDimensions` | How many numbers are in each vector, when `EnableVectors` is set (0 means the file's; creating an index needs it set) |
+| `VectorMetric` | How a new index measures distance: `VectorMetricCosine` (the default), `VectorMetricEuclidean` or `VectorMetricDotProduct` |
+| `VectorM` | HNSW connections per node for a new index, 2..32 (0 means 16) |
+| `VectorEfConstruction` | HNSW candidate list size while building a new index, 1..4096 (0 means 200) |
+| `SyncMode` | When a commit waits for the disk: `SyncModeFull` or `SyncModeNormal` |
+| `FullFsync` | On macOS, whether syncs ask the drive to flush its cache: `FullFsyncOn` or `FullFsyncOff` |
+| `EnableAdjacencyCache` | Accepted for compatibility. Queries and edge calls do not read it, so it changes neither their speed nor their results |
+| `DisableWAL` | Open without write-ahead logging: transactions work as with the log, and a commit reaches the file at the next flush. See [Running without the log](../configuration/durability.md#running-without-the-log) |
 | `DisableLock` | Open without taking a lock on the file |
+| `ChangefeedRetention` | How much of the changefeed to keep: `"all"`, `"off"`, `"last:N"`, `"age:7d"`; empty keeps the file's. See [The Changefeed](../guides/changefeed.md) |
+
+Three of these need a word of explanation. `DisableWAL` and `DisableLock` are
+phrased as negatives because a Go `bool` cannot tell "the caller left this alone"
+apart from "the caller set it to false", and both of those features default to
+on. Set them when you genuinely want them off. There is also an older
+`EnableVector` field kept for compatibility; new code should use `EnableVectors`.
+
+### In-memory databases
 
 ```go
 db, err := latticedb.Open(":memory:", latticedb.OpenOptions{})
 ```
-
-### In-memory databases
 
 Pass `:memory:` as the path and the database has no files behind it. Nothing is
 written to disk and nothing survives closing it, which suits a scratch database, a
@@ -70,12 +92,74 @@ it. Set `DisableLock` only on filesystems where locking does not work; it does n
 make concurrent access safe, it removes the thing that was going to tell you it
 was not.
 
-Three of these need a word of explanation. `DisableWAL` and `DisableLock` are
-phrased as negatives because a Go `bool` cannot tell "the caller left this alone"
-apart from "the caller set it to false", and both of those features default to
-on. Set them when you genuinely want them off. There is also an older
-`EnableVector` field kept for
-compatibility; new code should use `EnableVectors`.
+### The vector index
+
+A database file records its vector index: the dimensions, the metric,
+`VectorM` and `VectorEfConstruction`. A database that has an index opens with it
+whether or not `EnableVectors` is set, so reopening needs no vector options at
+all, also after a crash. The metric and the two HNSW settings configure a new
+index and are fixed once it exists. Any of them that is set, and
+`VectorDimensions` when `EnableVectors` is set, must match the file, or `Open`
+returns an error whose `Code` is `ErrorConfigMismatch`. `VectorDimensions` 0
+with `EnableVectors` means the file's dimensions: it opens a database that has an
+index whatever its size, and returns `ErrorInvalidArg` where an index would have
+to be created.
+
+```go
+db, err := latticedb.Open("vectors.lattice", latticedb.OpenOptions{
+    Create:           true,
+    EnableVectors:    true,
+    VectorDimensions: 2,
+    VectorMetric:     latticedb.VectorMetricEuclidean,
+})
+// ... store vectors, close ...
+
+db, err = latticedb.Open("vectors.lattice", latticedb.OpenOptions{})
+results, err := db.VectorSearch([]float32{1, 0}, latticedb.VectorSearchOptions{K: 2})
+// [{1 0} {2 2.236068}]
+```
+
+Cosine stores vectors at unit length and returns the cosine distance; Euclidean
+returns the L2 distance and dot product the negative dot product, both over
+vectors stored as given. Results come smallest first.
+
+### Durability settings
+
+`SyncModeFull`, the default, syncs the log on every commit, so a commit that has
+returned survives a power cut. `SyncModeNormal` returns once the operating
+system has the commit: it survives the process being killed, but a power cut or
+OS crash can lose the most recent commits. `FullFsyncOn` makes each sync on
+macOS ask the drive to flush its cache. The zero values defer to the
+`LATTICE_SYNC_MODE` and `LATTICE_FULL_FSYNC` environment variables, else a full
+sync without `F_FULLFSYNC`; a value you set wins over them. See
+[Durability and the Log](../configuration/durability.md).
+
+`Open` goes through `lattice_open_v5`, so the binding needs a native library
+that has it, as does `Deserialize`, which takes the same options.
+
+### Read-only opens
+
+`ReadOnly: true` on a database that was not closed cleanly recovers it in
+memory: the handle sees every committed transaction and nothing is written to
+the files. A recovery that needs more than 64 MB plus four times the size of the
+log and journal fails with `ErrorFull`; open the database read-write once to
+recover it on disk. A file that a newer release has marked as not writable by
+this one opens only with `ReadOnly: true`; a writable `Open` returns
+`ErrorNeedsNewerWriter` and writes nothing. A file in a format only a newer
+release can read is refused by every open with `ErrorVersionMismatch`.
+
+### Checkpoints
+
+```go
+stats, err := db.Checkpoint(latticedb.CheckpointTruncate) // fold the log into the file now
+err = db.SetAutoCheckpoint(10000, 0)                       // commits checkpoint every 10,000 frames
+err = db.SetAutoCheckpoint(0, 0)                           // commits never checkpoint
+```
+
+`CheckpointPassive` gives way if a changed page is in use, `CheckpointFull`
+writes every changed page, and `CheckpointTruncate` does that and empties the
+log. `CheckpointStats` reports `PagesFlushed`, `Duration`, `CheckpointLSN` and
+`WALTruncated`. Without the setter, the `LATTICE_AUTO_CHECKPOINT_FRAMES` environment variable sets the frame count; without either, the log may grow to an eighth of the page cache, from 1000 frames up to 64 MB (3,200 frames with the default 100 MB cache). A larger interval means fewer pauses, each longer, a longer `-wal` file and more to replay after a crash; see [Checkpointing](../configuration/durability.md#checkpointing).
 
 ## Writing
 
@@ -111,6 +195,30 @@ err = db.Update(func(tx *latticedb.Tx) error {
 `int64`, `float64`, `bool`, `[]byte`, and `[]float32` for vectors all work. Note
 `int64` rather than `int`, since the stored type is explicitly 64-bit.
 
+A `nil` value stores no property, as null does in Cypher. `CreateNode` and
+`CreateEdge` leave a `nil` property out, of the stored node and of the one they
+return; `SetProperty` and `SetEdgeProperty` with `nil` remove the property, and
+removing one that is not there does nothing. A `nil` inside a slice or a map is
+kept. Before 0.18.1 these stored the `nil` as a null property.
+
+`CreateEdge` returns `ErrorNotFound` unless both ends exist as the transaction
+sees them. `DeleteNode` refuses a node that still has relationships with
+`ErrorHasRelationships` and deletes nothing, as Cypher's `DELETE` does;
+`DetachDeleteNode` deletes the node and all its relationships, as
+`DETACH DELETE` does:
+
+```go
+err = db.Update(func(tx *latticedb.Tx) error {
+    return tx.DeleteNode(aliceID)
+})
+var latticeErr *latticedb.Error
+if errors.As(err, &latticeErr) && latticeErr.Code == latticedb.ErrorHasRelationships {
+    err = db.Update(func(tx *latticedb.Tx) error {
+        return tx.DetachDeleteNode(aliceID)
+    })
+}
+```
+
 Only one write transaction can be open at a time. A second one fails
 immediately with `ErrorLockTimeout` rather than waiting, so if several
 goroutines write, they need to take turns. See
@@ -139,7 +247,11 @@ to something empty", which a zero value alone could not tell you.
 
 If you would rather manage the transaction yourself, `BeginRead`, `BeginWrite`,
 `Commit`, and `Rollback` are available. `Update` and `View` are safer, because
-they cannot leave a transaction open on an early return.
+they cannot leave a transaction open on an early return. `Update` also rolls
+back when the commit itself fails; a manual `Commit` that returns an error leaves
+the transaction open, holding the writer slot, until you call `Rollback`. The
+exception is `ErrorTxnAborted`: the native transaction is already gone, so the
+`Tx` is no longer active and `Rollback` does nothing.
 
 ## Queries
 
@@ -208,7 +320,24 @@ values search more of the index and find more of the true nearest neighbours.
 different settings.
 
 Store a vector on a node with `tx.SetVector(nodeID, "embedding", vector)`, and
-load many at once with `tx.BatchInsertVectors`.
+load many at once with `tx.BatchInsertVectors`. A node has one vector, which
+Cypher reads as `n.embedding`; a key other than `"embedding"` (or `""`) returns
+`ErrorUnsupported`, and a vector with NaN or infinite components
+`ErrorInvalidArg`. A `K` larger than `EfSearch` widens the search to `K`.
+
+On a database created without a vector index, `SetVector`, `BatchInsertVectors`
+(before it creates any node) and `VectorSearch` return `ErrorUnsupported`, with a
+message that says the database was created without a vector index; before
+0.18.1 they returned `ErrorIO`. Opening the database with `EnableVectors` and
+`VectorDimensions` adds an index.
+
+`tx.GetVector(nodeID, "embedding")` returns the node's vector, with `ok` false
+when it has none. Under the cosine metric, the default, a committed vector reads
+back normalised to unit length (`{3, 4}` reads back as `{0.6, 0.8}`); an
+uncommitted one reads back as written. `tx.RemoveVector(nodeID, "embedding")`
+takes it away: the node keeps its labels and properties, and vector search no
+longer returns it. Removing a vector the node does not have does nothing. Both
+return `ErrorNotFound` for a node that does not exist.
 
 ## Full-text search
 
@@ -264,7 +393,14 @@ sequence, exists, err := db.GetStreamOffset("events", "billing-worker")
 ```
 
 `Changes` reads the built-in stream of graph mutations, so you can react to
-writes without publishing anything yourself. `TrimStream` discards records every
+writes without publishing anything yourself. It returns an error matching
+`ErrChangesTrimmed` when retention has dropped the events after the sequence
+you pass, and `ErrorUnsupported` when the policy is `"off"`; `ChangefeedStatus`
+reports the policy and the range held, and `TrimChangefeed` applies the policy
+in full now. Each transaction's events are its net effect, in an order that can
+be replayed as it comes: the edges it deletes, the nodes that exist after it,
+the edges that exist after it, then the nodes it deletes, each group by
+ascending id. `TrimStream` discards records every
 consumer has passed; nothing trims automatically.
 
 ## Errors
@@ -280,7 +416,27 @@ if errors.As(err, &latticeErr) {
 
 Query failures come back as `QueryError`, which carries where in the query text
 the problem is, so you can point at it rather than just reporting that something
-was wrong.
+was wrong:
+
+```go
+_, err := db.Query("RETURN 1/0", nil)
+var queryErr *latticedb.QueryError
+if errors.As(err, &queryErr) {
+    fmt.Println(err)                       // Division by zero: 1 / 0 (DivisionByZero)
+    fmt.Println(queryErr.Code)             // -1
+    fmt.Println(queryErr.Stage)            // 4, QueryErrorStageExecution
+    fmt.Println(queryErr.DiagnosticCode)   // DivisionByZero
+    fmt.Println(*queryErr.Location)        // {1 9 1}
+}
+```
+
+`Location` is nil when the failure does not belong to one place in the text.
+Parse and semantic failures have `Code` `ErrorInvalidArg` and execution failures
+`ErrorGeneric`, except that a `DELETE` of a node with relationships has
+`ErrorHasRelationships` and a relationship created to a node deleted earlier in
+the query `ErrorNotFound`, as `DeleteNode` and `CreateEdge` report them. A
+storage failure under a query has `ErrorIO` and an allocation failure
+`ErrorOutOfMemory`.
 
 ## Where to go next
 

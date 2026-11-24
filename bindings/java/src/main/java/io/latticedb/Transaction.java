@@ -38,10 +38,27 @@ public final class Transaction implements AutoCloseable {
         return active;
     }
 
-    /** Commits the transaction. A committed handle must not be reused. */
+    /**
+     * Commits the transaction. A committed handle must not be reused.
+     *
+     * <p>If the commit fails with {@link ErrorCode#TXN_ABORTED}, the native
+     * transaction is already gone and this one is over: {@link #rollback()}
+     * and {@link #close()} then do nothing. After any other failure it stays
+     * open, and closing it rolls it back.</p>
+     */
     public synchronized void commit() {
         ensureActive();
-        Native.commit(handle);
+        try {
+            Native.commit(handle);
+        } catch (LatticeException e) {
+            if (e.getErrorCode() == ErrorCode.TXN_ABORTED) {
+                // The native side has retired the handle; it cannot be
+                // committed or rolled back again.
+                handle = 0;
+                active = false;
+            }
+            throw e;
+        }
         handle = 0;
         active = false;
     }
@@ -90,7 +107,8 @@ public final class Transaction implements AutoCloseable {
     /* Nodes                                                               */
     /* ------------------------------------------------------------------ */
 
-    /** Creates a node with labels and properties. */
+    /** Creates a node with labels and properties. A property whose value is
+     * null is left out, as in Cypher's CREATE. */
     public Node createNode(List<String> labels, Map<String, Object> properties) {
         ensureWritable();
         String first = labels == null || labels.isEmpty() ? "" : labels.get(0);
@@ -104,7 +122,9 @@ public final class Transaction implements AutoCloseable {
         if (properties != null) {
             for (Map.Entry<String, Object> e : properties.entrySet()) {
                 Native.nodeSetProperty(handle, id, e.getKey(), e.getValue());
-                props.put(e.getKey(), e.getValue());
+                if (e.getValue() != null) {
+                    props.put(e.getKey(), e.getValue());
+                }
             }
         }
         return new Node(id, labels == null ? List.of() : List.copyOf(labels), props);
@@ -118,9 +138,23 @@ public final class Transaction implements AutoCloseable {
         return createNode(null, null);
     }
 
+    /**
+     * Deletes a node. A node that still has relationships is not deleted: this
+     * throws {@link ErrorCode#HAS_RELATIONSHIPS}, as Cypher's {@code DELETE}
+     * does, since deleting it alone would leave edges pointing at nothing. Use
+     * {@link #detachDeleteNode(long)} to delete them with it. Deleting a node
+     * that does not exist does nothing.
+     */
     public void deleteNode(long nodeId) {
         ensureWritable();
         Native.nodeDelete(handle, nodeId);
+    }
+
+    /** Deletes a node and every relationship it has, as Cypher's
+     * {@code DETACH DELETE} does. All of it is part of this transaction. */
+    public void detachDeleteNode(long nodeId) {
+        ensureWritable();
+        Native.nodeDetachDelete(handle, nodeId);
     }
 
     public boolean nodeExists(long nodeId) {
@@ -151,6 +185,9 @@ public final class Transaction implements AutoCloseable {
         Native.nodeRemoveLabel(handle, nodeId, label);
     }
 
+    /** Sets a property on a node. A null value removes the property, as
+     * Cypher's {@code SET n.x = null} does; removing one the node does not
+     * have does nothing. (Up to 0.18.0 it stored the null.) */
     public void setProperty(long nodeId, String key, Object value) {
         ensureWritable();
         Native.nodeSetProperty(handle, nodeId, key, value);
@@ -162,9 +199,52 @@ public final class Transaction implements AutoCloseable {
         return Optional.ofNullable(Native.nodeGetProperty(handle, nodeId, key));
     }
 
+    /**
+     * Sets the node's vector. {@code key} must be {@code "embedding"} or
+     * {@code ""}. Throws {@link ErrorCode#UNSUPPORTED} when the database was
+     * created without a vector index, or for another key, and
+     * {@link ErrorCode#INVALID_ARG} for a vector without the index's
+     * dimensions or with a NaN or infinite element.
+     */
     public void setVector(long nodeId, String key, float[] vector) {
         ensureWritable();
-        Native.nodeSetVector(handle, nodeId, key, vector);
+        // Another key is refused as unsupported before the index is looked at.
+        if (key != null && !key.isEmpty() && !key.equals("embedding")) {
+            Native.nodeSetVector(handle, nodeId, key, vector);
+            return;
+        }
+        LatticeException.needingVectorIndex("set a vector", () -> {
+            Native.nodeSetVector(handle, nodeId, key, vector);
+            return null;
+        });
+    }
+
+    /**
+     * The node's vector as this transaction sees it, or empty when it has
+     * none. {@code key} must be {@code "embedding"} or {@code ""}, as in
+     * {@link #setVector}. Throws {@link ErrorCode#NOT_FOUND} when the node does
+     * not exist.
+     *
+     * <p>Under the cosine metric, the default, a committed vector reads back
+     * scaled to unit length: {@code {3, 4}} reads back as {@code {0.6, 0.8}}.
+     * The direction, and so every cosine distance, is unchanged. Under the
+     * euclidean and dot-product metrics it reads back as stored. A vector set
+     * earlier in this transaction reads back as written.
+     */
+    public Optional<float[]> getVector(long nodeId, String key) {
+        ensureActive();
+        return Optional.ofNullable(Native.nodeGetVector(handle, nodeId, key));
+    }
+
+    /**
+     * Removes the node's vector. The node keeps its labels and properties;
+     * vector search no longer returns it. Removing a vector the node does not
+     * have does nothing. Throws {@link ErrorCode#NOT_FOUND} when the node does
+     * not exist.
+     */
+    public void removeVector(long nodeId, String key) {
+        ensureWritable();
+        Native.nodeRemoveVector(handle, nodeId, key);
     }
 
     /**
@@ -178,16 +258,24 @@ public final class Transaction implements AutoCloseable {
                 Native.findNodesByLabelProperty(handle, label, property, value, limit));
     }
 
-    /** Inserts multiple vector-bearing nodes with the same label in one call. */
+    /**
+     * Inserts multiple vector-bearing nodes with the same label in one call.
+     * Throws {@link ErrorCode#UNSUPPORTED}, and creates no node, when the
+     * database was created without a vector index.
+     */
     public List<Long> batchInsertVectors(String label, float[][] vectors) {
         ensureWritable();
-        return Database.toIdList(Native.batchInsert(handle, label, vectors));
+        return Database.toIdList(LatticeException.needingVectorIndex(
+                "insert nodes with vectors", () -> Native.batchInsert(handle, label, vectors)));
     }
 
     /* ------------------------------------------------------------------ */
     /* Edges                                                               */
     /* ------------------------------------------------------------------ */
 
+    /** Creates an edge. Throws {@link ErrorCode#NOT_FOUND} if either node does
+     * not exist as this transaction sees it. A property whose value is null is
+     * left out. */
     public Edge createEdge(long sourceId, long targetId, String type,
                            Map<String, Object> properties) {
         ensureWritable();
@@ -196,7 +284,9 @@ public final class Transaction implements AutoCloseable {
         if (properties != null) {
             for (Map.Entry<String, Object> e : properties.entrySet()) {
                 Native.edgeSetProperty(handle, edgeId, e.getKey(), e.getValue());
-                props.put(e.getKey(), e.getValue());
+                if (e.getValue() != null) {
+                    props.put(e.getKey(), e.getValue());
+                }
             }
         }
         return new Edge(edgeId, sourceId, targetId, type, props);
@@ -211,6 +301,8 @@ public final class Transaction implements AutoCloseable {
         Native.edgeDelete(handle, sourceId, targetId, type);
     }
 
+    /** Sets a property on an edge. A null value removes the property, as
+     * {@link #setProperty} does. */
     public void setEdgeProperty(long edgeId, String key, Object value) {
         ensureWritable();
         Native.edgeSetProperty(handle, edgeId, key, value);
@@ -278,11 +370,15 @@ public final class Transaction implements AutoCloseable {
     /* Search (transaction-scoped)                                         */
     /* ------------------------------------------------------------------ */
 
-    /** Vector search within this transaction's snapshot. */
+    /**
+     * Vector search within this transaction's snapshot. Throws
+     * {@link ErrorCode#UNSUPPORTED} when the database was created without a
+     * vector index.
+     */
     public List<VectorSearchResult> queryVector(float[] vector, int k, int efSearch) {
         ensureActive();
-        return Database.zipVectorResults(
-                Native.vectorSearchTxn(handle, vector, k, efSearch));
+        return Database.zipVectorResults(LatticeException.needingVectorIndex(
+                "search vectors", () -> Native.vectorSearchTxn(handle, vector, k, efSearch)));
     }
 
     /** Searches one declared index within this transaction's snapshot. */

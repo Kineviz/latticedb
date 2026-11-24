@@ -16,8 +16,7 @@ const SymbolId = lattice.graph.symbols.SymbolId;
 const NodeProperty = lattice.graph.node.Property;
 
 fn overwriteEdgePayloadWithInvalidData(db: *Database, edge_id: u64) !void {
-    var id_key: [8]u8 = undefined;
-    std.mem.writeInt(u64, &id_key, edge_id, .little);
+    const id_key = db.id_key_order.encode(edge_id);
     try db.edge_store.edge_id_index.delete(&id_key);
     try db.edge_store.edge_id_index.insert(&id_key, "bad");
 }
@@ -261,26 +260,18 @@ test "query: MATCH on unknown relationship type returns empty result" {
     try expectInt(result, 0, 0, 0);
 }
 
-test "query: MATCH variable-length relationship rejects edge variable" {
+test "query: MATCH variable-length relationship accepts an edge variable and a property map" {
     const path = "/tmp/lattice_qm_match_varlen_rejects_edge_var.ltdb";
     var db = try openTestDb(path, .{});
     defer cleanupTestDb(db, path);
 
-    try std.testing.expectError(
-        QueryError.SemanticError,
-        db.query("MATCH (a)-[r:REL*1..2]->(b) RETURN r"),
-    );
-}
-
-test "query: MATCH variable-length relationship rejects inline property map" {
-    const path = "/tmp/lattice_qm_match_varlen_rejects_props.ltdb";
-    var db = try openTestDb(path, .{});
-    defer cleanupTestDb(db, path);
-
-    try std.testing.expectError(
-        QueryError.SemanticError,
-        db.query("MATCH (a)-[:REL*1..2 {w: 1}]->(b) RETURN b"),
-    );
+    // The variable is the list of the path's relationships, and the map
+    // holds for each of them (tests/integration/lcy_cypher_phase2_test.zig
+    // checks the answers).
+    var with_variable = try db.query("MATCH (a)-[r:REL*1..2]->(b) RETURN r");
+    with_variable.deinit();
+    var with_map = try db.query("MATCH (a)-[:REL*1..2 {w: 1}]->(b) RETURN b");
+    with_map.deinit();
 }
 
 test "query: MATCH variable-length relationship rejects invalid hop range" {
@@ -326,7 +317,7 @@ test "query: queryDetailed surfaces semantic diagnostics with code" {
     var db = try openTestDb(path, .{});
     defer cleanupTestDb(db, path);
 
-    var detailed = try db.queryDetailed("MATCH (a)-[r:REL*1..2]->(b) RETURN r");
+    var detailed = try db.queryDetailed("MATCH (a)-[:REL*3..1]->(b) RETURN b");
     defer detailed.deinit();
 
     try std.testing.expect(detailed == .failure);
@@ -351,18 +342,18 @@ test "query: semicolon-terminated queries execute end-to-end" {
     try expectString(result, 0, 1, "Bob");
 }
 
-test "query: MATCH relationship type alternation is rejected" {
-    const path = "/tmp/lattice_qm_match_type_alternation_rejected.ltdb";
+test "query: MATCH relationship type alternation matches any listed type" {
+    const path = "/tmp/lattice_qm_match_type_alternation.ltdb";
     var db = try openTestDb(path, .{});
     defer cleanupTestDb(db, path);
 
     var seed = try db.query("CREATE (a:Person {name: \"Alice\"})-[:REL_A]->(b:Person {name: \"Bob\"})");
     seed.deinit();
 
-    try std.testing.expectError(
-        QueryError.SemanticError,
-        db.query("MATCH (a)-[:REL_A|REL_B]->(b) RETURN b"),
-    );
+    var result = try db.query("MATCH (a)-[:REL_A|REL_B]->(b) RETURN b.name");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+    try expectString(result, 0, 0, "Bob");
 }
 
 test "query: CREATE relationship type alternation is rejected" {
@@ -2317,4 +2308,117 @@ fn expectBool(result: anytype, row: usize, col: usize, expected: bool) !void {
         .bool_val => |v| try std.testing.expectEqual(expected, v),
         else => return error.UnexpectedValueType,
     }
+}
+
+// ============================================================================
+// Vector predicates in WHERE: thresholds, LIMIT and candidates
+// ============================================================================
+
+/// 150 :Person nodes nearer to [1, 0, 0, 0] than any of 20 :Doc nodes.
+/// Doc i (1..20) is [1, 0.05 i, 0, 0], so its cosine distance grows with i.
+fn seedVectorCrowd(db: *Database) !void {
+    var j: usize = 1;
+    while (j <= 150) : (j += 1) {
+        const person = try db.createNode(null, &[_][]const u8{"Person"});
+        try db.setNodeVector(person, &[_]f32{ 1.0, 0.0, 0.0001 * @as(f32, @floatFromInt(j)), 0.0 });
+    }
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        const doc = try db.createNode(null, &[_][]const u8{"Doc"});
+        try db.setNodeProperty(null, doc, "i", .{ .int_val = @intCast(i) });
+        try db.setNodeVector(doc, &[_]f32{ 1.0, 0.05 * @as(f32, @floatFromInt(i)), 0.0, 0.0 });
+    }
+}
+
+test "query: a vector threshold finds candidates beyond the global nearest 100" {
+    const path = "/tmp/lattice_qm_vector_crowd_threshold.ltdb";
+    var db = try openTestDb(path, .{ .enable_vector = true, .vector_dimensions = 4 });
+    defer cleanupTestDb(db, path);
+    try seedVectorCrowd(db);
+
+    var params = std.StringHashMap(PropertyValue).init(std.testing.allocator);
+    defer params.deinit();
+    const query_vec = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    try params.put("q", .{ .vector_val = &query_vec });
+
+    // The 150 people fill the global nearest 100, so intersecting that with
+    // :Doc used to return nothing.
+    {
+        var result = try db.queryWithParams("MATCH (d:Doc) WHERE d.embedding <=> $q < 0.3 RETURN d.i", &params);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 20), result.rowCount());
+    }
+    // Rows that carry other bindings survive the widening, each one.
+    {
+        var result = try db.queryWithParams("UNWIND [1, 2] AS x MATCH (d:Doc) WHERE d.embedding <=> $q < 0.3 RETURN x, d.i", &params);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 40), result.rowCount());
+        var sum: i64 = 0;
+        for (result.rows) |row| sum += row.values[0].int_val;
+        try std.testing.expectEqual(@as(i64, 60), sum);
+    }
+    // A threshold given as a parameter used to be ignored.
+    try params.put("t", .{ .float_val = 0.1 });
+    {
+        var result = try db.queryWithParams("MATCH (d:Doc) WHERE d.embedding <=> $q < $t RETURN d.i", &params);
+        defer result.deinit();
+        // 1 - 1/sqrt(1 + (0.05 i)^2) < 0.1 holds for i <= 9.
+        try std.testing.expectEqual(@as(usize, 9), result.rowCount());
+        // Nearest first.
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0].values[0].int_val);
+        try std.testing.expectEqual(@as(i64, 9), result.rows[8].values[0].int_val);
+    }
+    // A null threshold compares as null: no rows.
+    try params.put("t", .{ .null_val = {} });
+    {
+        var result = try db.queryWithParams("MATCH (d:Doc) WHERE d.embedding <=> $q < $t RETURN d.i", &params);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rowCount());
+    }
+}
+
+test "query: a vector predicate under LIMIT returns the nearest candidates" {
+    const path = "/tmp/lattice_qm_vector_crowd_limit.ltdb";
+    var db = try openTestDb(path, .{ .enable_vector = true, .vector_dimensions = 4 });
+    defer cleanupTestDb(db, path);
+    try seedVectorCrowd(db);
+
+    var params = std.StringHashMap(PropertyValue).init(std.testing.allocator);
+    defer params.deinit();
+    const query_vec = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    try params.put("q", .{ .vector_val = &query_vec });
+
+    var result = try db.queryWithParams("MATCH (d:Doc) WHERE d.embedding <=> $q RETURN d.i SKIP 1 LIMIT 3", &params);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rowCount());
+    try std.testing.expectEqual(@as(i64, 2), result.rows[0].values[0].int_val);
+    try std.testing.expectEqual(@as(i64, 4), result.rows[2].values[0].int_val);
+
+    // Without a threshold or LIMIT the answer is the nearest DEFAULT_K nodes
+    // among the candidates.
+    var all = try db.queryWithParams("MATCH (p:Person) WHERE p.embedding <=> $q RETURN p", &params);
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 100), all.rowCount());
+
+    // A threshold and a LIMIT together: the LIMIT, though more than 100 rows
+    // are within the threshold.
+    var within = try db.queryWithParams("MATCH (p:Person) WHERE p.embedding <=> $q < 0.01 RETURN p LIMIT 120", &params);
+    defer within.deinit();
+    try std.testing.expectEqual(@as(usize, 120), within.rowCount());
+}
+
+test "query: < and <= on a vector distance differ at the boundary" {
+    const path = "/tmp/lattice_qm_vector_strict.ltdb";
+    var db = try openTestDb(path, .{ .enable_vector = true, .vector_dimensions = 4 });
+    defer cleanupTestDb(db, path);
+
+    const doc = try db.createNode(null, &[_][]const u8{"Doc"});
+    try db.setNodeVector(doc, &[_]f32{ 1.0, 0.0, 0.0, 0.0 });
+
+    var strict = try db.query("MATCH (d:Doc) WHERE d.embedding <=> [1.0, 0.0, 0.0, 0.0] < 0 RETURN d");
+    defer strict.deinit();
+    try std.testing.expectEqual(@as(usize, 0), strict.rowCount());
+    var inclusive = try db.query("MATCH (d:Doc) WHERE d.embedding <=> [1.0, 0.0, 0.0, 0.0] <= 0 RETURN d");
+    defer inclusive.deinit();
+    try std.testing.expectEqual(@as(usize, 1), inclusive.rowCount());
 }

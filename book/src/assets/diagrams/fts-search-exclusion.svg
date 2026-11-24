@@ -1,64 +1,65 @@
-<svg width="421" height="447"
- viewBox="0.00 0.00 316.00 335.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
-<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 330.66)">
+<svg width="421" height="459"
+ viewBox="0.00 0.00 316.00 344.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 340.38)">
 <title>fts_search_exclusion</title>
 <!-- q -->
 <g id="node1" class="node">
 <title>q</title>
-<path fill="#f6f8fa" stroke="#c7d0da" stroke-width="1.2" d="M239.06,-326.66C239.06,-326.66 69.38,-326.66 69.38,-326.66 63.38,-326.66 57.38,-320.66 57.38,-314.66 57.38,-314.66 57.38,-302.66 57.38,-302.66 57.38,-296.66 63.38,-290.66 69.38,-290.66 69.38,-290.66 239.06,-290.66 239.06,-290.66 245.06,-290.66 251.06,-296.66 251.06,-302.66 251.06,-302.66 251.06,-314.66 251.06,-314.66 251.06,-320.66 245.06,-326.66 239.06,-326.66"/>
-<text xml:space="preserve" text-anchor="middle" x="154.22" y="-304.96" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">query: &quot;database &#45;mysql&quot;</text>
+<path fill="#f6f8fa" stroke="#c7d0da" stroke-width="1.2" d="M239.06,-336.38C239.06,-336.38 69.38,-336.38 69.38,-336.38 63.38,-336.38 57.38,-330.38 57.38,-324.38 57.38,-324.38 57.38,-312.38 57.38,-312.38 57.38,-306.38 63.38,-300.38 69.38,-300.38 69.38,-300.38 239.06,-300.38 239.06,-300.38 245.06,-300.38 251.06,-306.38 251.06,-312.38 251.06,-312.38 251.06,-324.38 251.06,-324.38 251.06,-330.38 245.06,-336.38 239.06,-336.38"/>
+<text xml:space="preserve" text-anchor="middle" x="154.22" y="-314.68" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">query: &quot;database &#45;mysql&quot;</text>
 </g>
 <!-- s1 -->
 <g id="node2" class="node">
 <title>s1</title>
-<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M245.81,-264.66C245.81,-264.66 62.62,-264.66 62.62,-264.66 56.62,-264.66 50.62,-258.66 50.62,-252.66 50.62,-252.66 50.62,-217.44 50.62,-217.44 50.62,-211.44 56.62,-205.44 62.62,-205.44 62.62,-205.44 245.81,-205.44 245.81,-205.44 251.81,-205.44 257.81,-211.44 257.81,-217.44 257.81,-217.44 257.81,-252.66 257.81,-252.66 257.81,-258.66 251.81,-264.66 245.81,-264.66"/>
-<text xml:space="preserve" text-anchor="start" x="66.47" y="-244.85" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">1. Parse</text>
-<text xml:space="preserve" text-anchor="start" x="66.47" y="-231.35" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;terms &#160;&#160;&#160;= [&quot;database&quot;]</text>
-<text xml:space="preserve" text-anchor="start" x="66.47" y="-217.85" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;excluded = [&quot;mysql&quot;]</text>
+<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M245.81,-274.38C245.81,-274.38 62.62,-274.38 62.62,-274.38 56.62,-274.38 50.62,-268.38 50.62,-262.38 50.62,-262.38 50.62,-227.16 50.62,-227.16 50.62,-221.16 56.62,-215.16 62.62,-215.16 62.62,-215.16 245.81,-215.16 245.81,-215.16 251.81,-215.16 257.81,-221.16 257.81,-227.16 257.81,-227.16 257.81,-262.38 257.81,-262.38 257.81,-268.38 251.81,-274.38 245.81,-274.38"/>
+<text xml:space="preserve" text-anchor="start" x="66.47" y="-254.57" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">1. Parse</text>
+<text xml:space="preserve" text-anchor="start" x="66.47" y="-241.07" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;terms &#160;&#160;&#160;= [&quot;database&quot;]</text>
+<text xml:space="preserve" text-anchor="start" x="66.47" y="-227.57" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;excluded = [&quot;mysql&quot;]</text>
 </g>
 <!-- q&#45;&gt;s1 -->
 <g id="edge1" class="edge">
 <title>q&#45;&gt;s1</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-290.33C154.22,-285.26 154.22,-279.52 154.22,-273.72"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-273.9 154.22,-266.9 151.77,-273.9 156.67,-273.9"/>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-300.05C154.22,-294.98 154.22,-289.24 154.22,-283.44"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-283.62 154.22,-276.62 151.77,-283.62 156.67,-283.62"/>
 </g>
 <!-- s2 -->
 <g id="node3" class="node">
 <title>s2</title>
-<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M239.06,-179.44C239.06,-179.44 69.38,-179.44 69.38,-179.44 63.38,-179.44 57.38,-173.44 57.38,-167.44 57.38,-167.44 57.38,-145.72 57.38,-145.72 57.38,-139.72 63.38,-133.72 69.38,-133.72 69.38,-133.72 239.06,-133.72 239.06,-133.72 245.06,-133.72 251.06,-139.72 251.06,-145.72 251.06,-145.72 251.06,-167.44 251.06,-167.44 251.06,-173.44 245.06,-179.44 239.06,-179.44"/>
-<text xml:space="preserve" text-anchor="start" x="73.22" y="-159.63" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">2. Search positive terms</text>
-<text xml:space="preserve" text-anchor="start" x="73.22" y="-146.13" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;→ candidate documents</text>
+<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M252.56,-189.16C252.56,-189.16 55.87,-189.16 55.87,-189.16 49.88,-189.16 43.88,-183.16 43.88,-177.16 43.88,-177.16 43.88,-155.44 43.88,-155.44 43.88,-149.44 49.88,-143.44 55.88,-143.44 55.88,-143.44 252.56,-143.44 252.56,-143.44 258.56,-143.44 264.56,-149.44 264.56,-155.44 264.56,-155.44 264.56,-177.16 264.56,-177.16 264.56,-183.16 258.56,-189.16 252.56,-189.16"/>
+<text xml:space="preserve" text-anchor="start" x="59.72" y="-169.35" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">2. Search positive terms</text>
+<text xml:space="preserve" text-anchor="start" x="59.72" y="-155.85" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;→ every matching document</text>
 </g>
 <!-- s1&#45;&gt;s2 -->
 <g id="edge2" class="edge">
 <title>s1&#45;&gt;s2</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-205.14C154.22,-199.59 154.22,-193.76 154.22,-188.16"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-188.28 154.22,-181.28 151.77,-188.28 156.67,-188.28"/>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-214.86C154.22,-209.31 154.22,-203.48 154.22,-197.88"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-198 154.22,-191 151.77,-198 156.67,-198"/>
 </g>
 <!-- s3 -->
 <g id="node4" class="node">
 <title>s3</title>
-<path fill="#fdf0ea" stroke="#c2703f" stroke-width="1.2" d="M269.43,-107.72C269.43,-107.72 39,-107.72 39,-107.72 33,-107.72 27,-101.72 27,-95.72 27,-95.72 27,-74 27,-74 27,-68 33,-62 39,-62 39,-62 269.43,-62 269.43,-62 275.43,-62 281.43,-68 281.43,-74 281.43,-74 281.43,-95.72 281.43,-95.72 281.43,-101.72 275.43,-107.72 269.43,-107.72"/>
-<text xml:space="preserve" text-anchor="start" x="42.84" y="-87.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">3. Build exclusion set</text>
-<text xml:space="preserve" text-anchor="start" x="42.84" y="-74.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;all doc_ids containing &quot;mysql&quot;</text>
+<path fill="#fdf0ea" stroke="#c2703f" stroke-width="1.2" d="M269.43,-117.44C269.43,-117.44 39,-117.44 39,-117.44 33,-117.44 27,-111.44 27,-105.44 27,-105.44 27,-83.72 27,-83.72 27,-77.72 33,-71.72 39,-71.72 39,-71.72 269.43,-71.72 269.43,-71.72 275.43,-71.72 281.43,-77.72 281.43,-83.72 281.43,-83.72 281.43,-105.44 281.43,-105.44 281.43,-111.44 275.43,-117.44 269.43,-117.44"/>
+<text xml:space="preserve" text-anchor="start" x="42.84" y="-97.63" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">3. Build exclusion set</text>
+<text xml:space="preserve" text-anchor="start" x="42.84" y="-84.13" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;all doc_ids containing &quot;mysql&quot;</text>
 </g>
 <!-- s2&#45;&gt;s3 -->
 <g id="edge3" class="edge">
 <title>s2&#45;&gt;s3</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-133.14C154.22,-127.91 154.22,-122.26 154.22,-116.74"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-116.93 154.22,-109.93 151.77,-116.93 156.67,-116.93"/>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-142.86C154.22,-137.63 154.22,-131.98 154.22,-126.46"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-126.65 154.22,-119.65 151.77,-126.65 156.67,-126.65"/>
 </g>
 <!-- s4 -->
 <g id="node5" class="node">
 <title>s4</title>
-<path fill="#eaf5ea" stroke="#2f7d32" stroke-width="1.2" d="M296.43,-36C296.43,-36 12,-36 12,-36 6,-36 0,-30 0,-24 0,-24 0,-12 0,-12 0,-6 6,0 12,0 12,0 296.43,0 296.43,0 302.43,0 308.43,-6 308.43,-12 308.43,-12 308.43,-24 308.43,-24 308.43,-30 302.43,-36 296.43,-36"/>
-<text xml:space="preserve" text-anchor="start" x="15.84" y="-14.3" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">4. Remove candidates in the exclusion set</text>
+<path fill="#eaf5ea" stroke="#2f7d32" stroke-width="1.2" d="M296.43,-45.72C296.43,-45.72 12,-45.72 12,-45.72 6,-45.72 0,-39.72 0,-33.72 0,-33.72 0,-12 0,-12 0,-6 6,0 12,0 12,0 296.43,0 296.43,0 302.43,0 308.43,-6 308.43,-12 308.43,-12 308.43,-33.72 308.43,-33.72 308.43,-39.72 302.43,-45.72 296.43,-45.72"/>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">4. Remove candidates in the exclusion set</text>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-12.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;&#160;sort, return top K</text>
 </g>
 <!-- s3&#45;&gt;s4 -->
 <g id="edge4" class="edge">
 <title>s3&#45;&gt;s4</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-61.54C154.22,-56.15 154.22,-50.35 154.22,-44.82"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-45.11 154.22,-38.11 151.77,-45.11 156.67,-45.11"/>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M154.22,-71.14C154.22,-65.91 154.22,-60.26 154.22,-54.74"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="156.67,-54.93 154.22,-47.93 151.77,-54.93 156.67,-54.93"/>
 </g>
 </g>
 </svg>

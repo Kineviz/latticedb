@@ -5,8 +5,9 @@
 > text search, and ACID transactions live in one local engine behind one Cypher query layer —
 > think SQLite, but for connected data you want to query by relationship, semantics, and text.
 
-LatticeDB is written in Zig, has no runtime dependencies, and embeds in-process with C, Python,
-and TypeScript/Node.js bindings. It is MIT licensed and developed at
+LatticeDB is written in Zig, its core has no runtime dependencies, and it embeds in-process with
+C, Python, TypeScript/Node.js, Go, and Java bindings (the Python package needs NumPy, and the
+TypeScript package uses koffi). It is MIT licensed and developed at
 https://github.com/jeffhajewski/latticedb.
 
 It is not a server. There is no daemon, no network hop, and no separate vector store to keep in
@@ -34,8 +35,19 @@ sync — a database is one file on disk.
 - [Working with Embeddings](https://docs.latticedb.org/guides/embeddings): storing and indexing vectors
 - [Full-Text Search](https://docs.latticedb.org/guides/full-text-search): BM25 ranking over node properties
 - [Durable Streams](https://docs.latticedb.org/guides/durable-streams): append-only streams and changefeeds
+- [The Changefeed](https://docs.latticedb.org/guides/changefeed): the record of every change, its event order, retention policies and stored format
+- [Data Export](https://docs.latticedb.org/guides/data-export): JSON, JSONL, CSV and DOT export and import
+- [RDF: Turtle and N-Triples](https://docs.latticedb.org/guides/rdf): importing and exporting RDF
 - [Transactions and Durability](https://docs.latticedb.org/guides/transactions): ACID semantics and crash safety
+- [Backup and Replication](https://docs.latticedb.org/guides/backup-and-replication): hot backup, continuous replication and point-in-time restore
+- [Property Indexes](https://docs.latticedb.org/guides/property-indexes): equality, range, prefix and ordered reads
 - [Performance Tuning](https://docs.latticedb.org/guides/performance-tuning): index and buffer-pool configuration
+
+## Configuration
+
+- [Opening a Database](https://docs.latticedb.org/configuration/opening): every open option
+- [Durability and the Log](https://docs.latticedb.org/configuration/durability): sync modes, full fsync, running without the log, checkpointing
+- [The lattice Command](https://docs.latticedb.org/getting-started/cli): the command-line tool
 
 ## Query language
 
@@ -51,6 +63,8 @@ sync — a database is one file on disk.
 - [C API](https://docs.latticedb.org/api/c): the core embedding interface
 - [Python](https://docs.latticedb.org/api/python): the `latticedb` package on PyPI
 - [TypeScript / Node.js](https://docs.latticedb.org/api/typescript): the `@hajewski/latticedb` package on npm
+- [Go](https://docs.latticedb.org/api/go): the cgo binding in `bindings/go`
+- [Java](https://docs.latticedb.org/api/java): the JNI binding, built from source
 
 ## Architecture
 

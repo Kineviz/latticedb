@@ -31,6 +31,11 @@ pub fn fuzzParser(allocator: std.mem.Allocator, input: []const u8) !void {
         for (query.clauses) |clause| {
             _ = validateClause(clause);
         }
+        for (query.unions) |branch| {
+            for (branch.clauses) |clause| {
+                _ = validateClause(clause);
+            }
+        }
     }
 
     // Errors are expected for malformed input - just ensure they exist
@@ -58,6 +63,12 @@ fn validateClause(clause: lattice.query.ast.Clause) bool {
         .with => true,
         .merge => true,
         .unwind => true,
+        .call => true,
+        .foreach => true,
+        .call_subquery => |sq| blk: {
+            for (sq.clauses) |c| if (!validateClause(c)) break :blk false;
+            break :blk true;
+        },
     };
 }
 
@@ -90,6 +101,27 @@ fn lexerFuzzRunner(_: std.mem.Allocator, smith: *std.testing.Smith) !void {
     var input: [4096]u8 = undefined;
     const len = smith.slice(&input);
     try fuzzLexer(input[0..len]);
+}
+
+/// Fuzz `=~`: the first input byte splits pattern from text. Patterns come
+/// from queries and parameters, so compiling and matching must neither crash
+/// nor take long, whatever the pattern.
+fn regexFuzzRunner(allocator: std.mem.Allocator, smith: *std.testing.Smith) !void {
+    var input: [512]u8 = undefined;
+    const len = smith.slice(&input);
+    if (len == 0) return;
+    const split = @min(@as(usize, input[0]), len - 1);
+    const pattern = input[1 .. 1 + split];
+    const text = input[1 + split .. len];
+    _ = lattice.query.regex.fullMatch(allocator, pattern, text) catch |err| switch (err) {
+        error.InvalidPattern, error.PatternTooComplex => return,
+        error.OutOfMemory => return err,
+    };
+}
+
+test "fuzz: regex handles arbitrary patterns and text" {
+    const allocator = std.testing.allocator;
+    try std.testing.fuzz(allocator, regexFuzzRunner, .{});
 }
 
 test "fuzz: parser handles arbitrary input" {
@@ -156,6 +188,162 @@ test "parser: handles numeric edge cases" {
     try fuzzParser(allocator, "MATCH (n) WHERE n.x = .5"); // Was panicking, now returns error
     try fuzzParser(allocator, "MATCH (n) WHERE n.x = 0.5");
     try fuzzParser(allocator, "MATCH (n) WHERE n.x = 1e999");
+}
+
+test "parser: handles the syntax added after 0.16" {
+    const allocator = std.testing.allocator;
+    const corpus = [_][]const u8{
+        "RETURN [1, 2, 3][0], [1, 2, 3][-1], [1, 2, 3][1..], [1, 2, 3][..-1], {a: 1}['a']",
+        "RETURN [[1, 2], [3]][0][1], [1][",
+        "RETURN [1][..",
+        "RETURN [1][1..2..3]",
+        "RETURN CASE WHEN true THEN 1 ELSE 2 END, CASE 1 WHEN 1 THEN 'a' END",
+        "RETURN CASE WHEN CASE 1 WHEN 1 THEN true END THEN CASE WHEN false THEN 0 END END",
+        "RETURN CASE",
+        "RETURN CASE WHEN",
+        "RETURN CASE WHEN 1 THEN",
+        "RETURN CASE END",
+        "MATCH (n) RETURN count(n) + 1, sum(n.x) / count(*)",
+        "RETURN 1 AS x UNION RETURN 2 AS x",
+        "RETURN 1 AS x UNION ALL RETURN 2 AS x UNION ALL RETURN 3 AS x",
+        "UNION",
+        "UNION ALL",
+        "RETURN 1 UNION",
+        "RETURN 1 UNION UNION RETURN 1",
+        "RETURN 1 UNION RETURN 1 UNION ALL RETURN 1",
+        "MATCH (a) OPTIONAL MATCH (a)-[r]->(b) WHERE r.x > 1 RETURN a, b",
+        "OPTIONAL MATCH (n) RETURN n UNION OPTIONAL MATCH (n) RETURN n",
+        "OPTIONAL",
+        "OPTIONAL MATCH",
+        "OPTIONAL (n)",
+        "MATCH (optional) RETURN optional",
+        "MATCH p = (a)-[*1..3]->(b), q = (c) RETURN length(p), nodes(q), relationships(p)",
+        "RETURN [x IN [1, 2] WHERE x > 1 | x * 2], [x IN [[1]] | [y IN x | y]], all(x IN [1] WHERE x > 0)",
+        "RETURN any(x IN [] WHERE true), none(x IN null WHERE x), single(x IN [1] WHERE true)",
+        "RETURN reduce(s = 0, x IN [1, 2] | s + x), reduce(a = [], x IN [1] | a + x)",
+        "RETURN [x IN",
+        "RETURN [x IN [1] |",
+        "RETURN all(x IN [1])",
+        "RETURN reduce(s = 0, x IN [1])",
+        "RETURN reduce(s, x)",
+        "MATCH (a) WHERE (a)-->() AND NOT (a)<-[:R]-(:X) AND exists((a)--()) RETURN a",
+        "MATCH (a) WHERE EXISTS { MATCH (a)-[r]->(b) WHERE r.x = 1 } RETURN COUNT { (a)-->() }, [(a)-->(b) WHERE b.x | b.y]",
+        "RETURN [p = (a)-->() | p], [(1), (2)], (1) - (2), (a)<-1",
+        "MATCH (a) WHERE EXISTS { RETURN 1 } RETURN a",
+        "RETURN EXISTS {",
+        "RETURN COUNT { (a) ",
+        "RETURN [(a)-->(b) |",
+        "RETURN [(a)-->(b) WHERE",
+        "CALL db.labels()",
+        "CALL db.indexes() YIELD type AS t, property WHERE t = 'x' RETURN t",
+        "CALL db.labels() YIELD *",
+        "CALL",
+        "CALL db.",
+        "CALL db.labels(",
+        "CALL db.labels() YIELD",
+        "CALL db.labels() YIELD a AS",
+        "CALL { RETURN 1 }",
+        "MATCH (n) CALL { WITH n MATCH (n)-->(m) RETURN count(m) AS c } RETURN n, c",
+        "UNWIND [1] AS x CALL { WITH x CREATE (:N {v: x}) } RETURN x",
+        "CALL { MATCH (a:A) RETURN a AS v UNION ALL MATCH (b:B) RETURN b AS v } RETURN v",
+        "CALL { CALL { RETURN 1 AS x } RETURN x } RETURN x",
+        "CALL {",
+        "CALL { }",
+        "CALL { RETURN 1",
+        "CALL { RETURN 1 } IN TRANSACTIONS",
+        "CALL { UNION RETURN 1 }",
+        "MATCH (n:A|B), (m:!A&(B|%)), (o:A&B {k: 1}) WHERE n:!B AND m:(A|B) RETURN n:A|:B, [x IN [n] WHERE x:A | x]",
+        "MATCH ()-[r]->() WHERE r:R|S AND NOT r:% RETURN r:R:S",
+        "MATCH (n:A|) RETURN n",
+        "MATCH (n:(A|B) RETURN n",
+        "MATCH (n:!) RETURN n",
+        "MATCH (n:A:B|C) RETURN n",
+        "MATCH (a)-[:!R]->(b) RETURN a",
+        "MATCH (a)-[:R&S]->(b) RETURN a",
+        "RETURN x:A&",
+        "CREATE (:A|B)",
+        "MATCH (p) RETURN COUNT { MATCH (p)-->(m) WITH m WHERE m.x > 1 RETURN m UNION MATCH (p)<--(m) RETURN m } AS c",
+        "MATCH (p) WHERE EXISTS { MATCH (p)-->(m) RETURN m ORDER BY m.x LIMIT 1 } RETURN COLLECT { MATCH (p)-->(m) RETURN COLLECT { UNWIND [1] AS x RETURN x } } AS c",
+        "RETURN COLLECT { }",
+        "RETURN COLLECT { MATCH (n)",
+        "RETURN EXISTS { (n) RETURN n }",
+        "RETURN COUNT { UNION RETURN 1 }",
+        "MATCH (p)-->(q) RETURN p.n AS nm, count(q) AS c ORDER BY toUpper(nm), c * -1, p.n",
+        "MATCH (p) FOREACH (k IN collect(p.n) | CREATE (:Q {k: k}))",
+        "MATCH (p) WHERE count(p) > 1 SET p.c = sum() RETURN count(1, 2)",
+        "MATCH (p) RETURN (p)-->() - 1, 1 - (p)-->(), (p)-->()-1",
+        "CALL db.labels() YIELD * RETURN *",
+        "RETURN 0o17, 0O7, -0o10, 0o18, 0o, 0or, 012, 00, 019, 01.5, 0o1000000000000000000000",
+        "MATCH (x) ((a)-[:R]->(b)){1,3} (y), (a)-->{2}(b), (c)-[:R]->+(d) RETURN x",
+        "MATCH (a) (b) RETURN [(a)-->{1}(b) | b], EXISTS { (a) (b) }",
+        "MATCH p (a) RETURN p",
+        "MATCH p = RETURN p",
+        "CREATE p = (a)",
+        "MERGE p = (a)",
+        "MATCH p = = (a) RETURN p",
+        "FOREACH (x IN [1, 2] | CREATE (:N {v: x}))",
+        "MATCH (n) FOREACH (i IN [1] | FOREACH (j IN [i] | SET n.v = j) REMOVE n.w) RETURN n",
+        "FOREACH (x IN [1] | MERGE (:N {v: x}) DELETE n)",
+        "FOREACH",
+        "FOREACH (",
+        "FOREACH (x",
+        "FOREACH (x IN",
+        "FOREACH (x IN [1]",
+        "FOREACH (x IN [1] |",
+        "FOREACH (x IN [1] | )",
+        "FOREACH (x IN [1] | CREATE (n)",
+        "FOREACH (x IN [1] | MATCH (n) RETURN n)",
+        "FOREACH (x IN [1] | FOREACH (y IN [x] | ))",
+        "MATCH (`a b`:`L 1`)-[r:`T:x`]->() RETURN `a b`.`p q` AS `c d`, {`k``k`: 1}",
+        "RETURN `toUpper`('a')",
+        "RETURN ``",
+        "RETURN `",
+        "RETURN `a",
+        "RETURN `a``",
+        "RETURN ```",
+        "MATCH (n:`a\n`) RETURN n",
+        "WITH 1 AS `match` RETURN `match`",
+        "MATCH (n) WHERE n:A:B AND NOT n:`c d` RETURN n:A, (n:B)",
+        "MATCH (n) WHERE n:",
+        "MATCH (n) RETURN n ORDER BY n.v NULLS FIRST, n.w DESC NULLS LAST",
+        "MATCH (n) RETURN n ORDER BY n.v NULLS",
+        "RETURN 0x1F, 0x, .5, .5e3, ., 0xffffffffffffffffff",
+        "LOAD CSV FROM 'x' AS r RETURN r",
+        "CREATE INDEX FOR (n:T) ON (n.v)",
+        "MATCH p = shortestPath((a)-[*]-(b)) RETURN p",
+        "MATCH p = allShortestPaths((a:A {v: 1})<-[r:R|S*0..4]-(b)) WHERE a.v = 1 RETURN p, r",
+        "MATCH shortestPath((a)-->(b)), q = shortestPath((b)-[*..2]-(c)) RETURN q",
+        "MATCH p = shortestPath(",
+        "MATCH p = shortestPath((a)",
+        "MATCH p = shortestPath((a)-[*]->(b)",
+        "MATCH (a)-->shortestPath((b)-->(c)) RETURN a",
+        "RETURN shortestPath((a)-->(b))",
+        "CREATE shortestPath((a)-[:R]->(b))",
+        "MATCH ((a)-->(b)){1,3} RETURN a",
+        "MATCH (n:A|B) RETURN n",
+        "MATCH (n:!A&B) RETURN n",
+        "MATCH (n WHERE n.v > 1)-[r WHERE r.x]->(m) RETURN n",
+        "MATCH (a)-[r:R*1..3 {w: 1}]->(b) RETURN r, size(r), [e IN r | e.w], r[0]",
+        "MATCH (a)-[r]->(b) WITH *, a.v AS v WITH * WHERE v > 1 RETURN DISTINCT *, 1 AS one",
+        "RETURN *",
+        "RETURN *, *",
+        "RETURN 1, *",
+        "WITH * RETURN",
+        "UNWIND [1] AS x RETURN * UNION RETURN *",
+        "MATCH (n) RETURN n {.name, .*, k: n.v + 1, x, `a b`: 1, end: 2}, (n {}).k, collect(n {.v})",
+        "RETURN n {",
+        "RETURN n {.",
+        "RETURN n {.a,",
+        "RETURN n {.a",
+        "RETURN n {1}",
+        "RETURN n {end}",
+        "RETURN n {.*.*}",
+        "MATCH (n) RETURN *",
+        "MATCH (n) RETURN n {.a}",
+        "RETURN 1 IS :: INTEGER, 'a' || 'b'",
+        "OPTIONAL CALL db.labels()",
+    };
+    for (corpus) |input| try fuzzParser(allocator, input);
 }
 
 test "lexer: handles binary data" {

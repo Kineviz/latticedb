@@ -45,7 +45,11 @@ public final class Database implements AutoCloseable {
         long handle = Native.open(path, options.create(), options.readOnly(),
                 options.cacheSizeMB(), options.pageSize(), options.enableVectors(),
                 options.vectorDimensions(), options.enableWal(),
-                options.enableAdjacencyCache(), options.lock());
+                options.enableAdjacencyCache(), options.lock(),
+                options.syncModeCode(), options.fullFsyncCode(),
+                options.vectorMetricCode(), options.vectorM(),
+                options.vectorEfConstruction(), options.changefeedRetentionMode(),
+                options.changefeedRetentionValue());
         return new Database(path, options, handle);
     }
 
@@ -58,13 +62,24 @@ public final class Database implements AutoCloseable {
      * Opens an in-memory database from bytes produced by {@link #serialize()}.
      * The bytes are copied, so the caller may reuse or discard them after this
      * method returns. Changes do not affect the input array.
+     *
+     * <p>The options mean what they mean to {@link #open(String, OpenOptions)},
+     * apart from {@code create} and {@code readOnly}, which are ignored. Bytes
+     * that hold a vector index open with the configuration they record, and
+     * any vector option that is set must match it, or this throws
+     * {@link ErrorCode#CONFIG_MISMATCH}; {@code enableVectors(true)} creates
+     * an index, configured by the vector options, in bytes that have none.</p>
      */
     public static Database deserialize(byte[] bytes, OpenOptions options) {
         Objects.requireNonNull(bytes, "bytes");
         Objects.requireNonNull(options, "options");
         long handle = Native.deserialize(bytes, options.cacheSizeMB(), options.pageSize(),
                 options.enableVectors(), options.vectorDimensions(), options.enableWal(),
-                options.enableAdjacencyCache(), options.lock());
+                options.enableAdjacencyCache(), options.lock(),
+                options.syncModeCode(), options.fullFsyncCode(),
+                options.vectorMetricCode(), options.vectorM(),
+                options.vectorEfConstruction(), options.changefeedRetentionMode(),
+                options.changefeedRetentionValue());
         return new Database("<deserialized>", options, handle);
     }
 
@@ -76,21 +91,36 @@ public final class Database implements AutoCloseable {
         return handle != 0;
     }
 
+    /**
+     * Closes the database. Throws {@link ErrorCode#INVALID_ARG} while a
+     * transaction or result from it is still open; the database then stays
+     * open, so end those and close again. An {@link ErrorCode#IO} failure
+     * still closes it.
+     */
     @Override
     public synchronized void close() {
         if (handle == 0) {
             return;
         }
-        long h = handle;
+        try {
+            Native.close(handle);
+        } catch (LatticeException e) {
+            // Only a refused close leaves the native database open. Keeping
+            // the handle lets the caller finish what is open and try again;
+            // dropping it would strand the file lock and the unflushed log.
+            if (e.getErrorCode() == ErrorCode.IO) {
+                handle = 0;
+            }
+            throw e;
+        }
         handle = 0;
-        Native.close(h);
     }
 
     // Synchronized against close(): without this, one thread can read a
     // live handle while another closes and frees it, leaving the first
-    // with a stale jlong. The C API's handle registry turns a freed handle
-    // into err_invalid_arg rather than a crash, but address reuse could
-    // still route an operation to a different database.
+    // with a stale jlong. The C API hands out tokens that are never reused,
+    // so a freed handle is refused with err_invalid_arg, but the caller
+    // still gets an error from an operation that raced a close.
     synchronized long handle() {
         long h = handle;
         if (h == 0) {
@@ -180,10 +210,16 @@ public final class Database implements AutoCloseable {
     /* Search                                                              */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * The nearest nodes to {@code vector}. Throws {@link ErrorCode#UNSUPPORTED}
+     * when the database was created without a vector index.
+     */
     public List<VectorSearchResult> vectorSearch(float[] vector, VectorSearchOptions opts) {
         int k = opts == null ? 10 : opts.k();
         int ef = opts == null ? 0 : opts.efSearch();
-        Object[] out = Native.vectorSearch(handle(), vector, k, ef);
+        long db = handle();
+        Object[] out = LatticeException.needingVectorIndex(
+                "search vectors", () -> Native.vectorSearch(db, vector, k, ef));
         return zipVectorResults(out);
     }
 
@@ -347,9 +383,49 @@ public final class Database implements AutoCloseable {
         return Native.streamGetLastSequence(handle(), stream);
     }
 
-    /** Reads the built-in graph changefeed. */
+    /**
+     * Reads the built-in graph changefeed: up to {@code limit} records with a
+     * sequence greater than {@code afterSequence}, oldest first.
+     * {@code afterSequence} 0 reads from the oldest event held.
+     *
+     * @throws ChangesTrimmedException (a {@link ErrorCode#NOT_FOUND}) when
+     *     retention or a trim has dropped the events after
+     *     {@code afterSequence}: the reader has missed changes
+     * @throws LatticeException with {@link ErrorCode#UNSUPPORTED} when the
+     *     retention policy is {@code "off"}
+     */
     public List<StreamRecord> changes(long afterSequence, int limit, int timeoutMs) {
-        return readStream("__lattice_changes", afterSequence, limit, timeoutMs);
+        try {
+            return readStream("__lattice_changes", afterSequence, limit, timeoutMs);
+        } catch (LatticeException e) {
+            if (e.getErrorCode() == ErrorCode.NOT_FOUND) {
+                throw new ChangesTrimmedException(afterSequence);
+            }
+            if (e.getErrorCode() == ErrorCode.UNSUPPORTED) {
+                throw new LatticeException(ErrorCode.UNSUPPORTED,
+                        "the changefeed is off (changefeedRetention \"off\")");
+            }
+            throw e;
+        }
+    }
+
+    /** The changefeed's retention policy and the events it holds. */
+    public ChangefeedStatus changefeedStatus() {
+        long[] out = Native.changefeedStatus(handle());
+        return new ChangefeedStatus(
+                OpenOptions.changefeedRetentionText((int) out[0], out[1]), out[2], out[3]);
+    }
+
+    /**
+     * Applies the changefeed's retention policy in full now (checkpoints apply
+     * it a bounded number of events at a time) and makes that durable.
+     *
+     * @return the number of events dropped
+     * @throws LatticeException with {@link ErrorCode#LOCK_TIMEOUT} while a
+     *     write transaction is open
+     */
+    public long trimChangefeed() {
+        return Native.changefeedTrim(handle());
     }
 
     /* ------------------------------------------------------------------ */
@@ -363,6 +439,70 @@ public final class Database implements AutoCloseable {
     public QueryCacheStats cacheStats() {
         Object[] out = Native.cacheStats(handle());
         return new QueryCacheStats((Integer) out[0], (Long) out[1], (Long) out[2]);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Checkpoints                                                         */
+    /* ------------------------------------------------------------------ */
+
+    /** Runs a {@link CheckpointMode#TRUNCATE} checkpoint now. */
+    public CheckpointStats checkpoint() {
+        return checkpoint(CheckpointMode.TRUNCATE);
+    }
+
+    /**
+     * Folds the log (the {@code -wal} file) into the database file now.
+     *
+     * <p>A commit is durable once it is in the log; a checkpoint writes the
+     * pages the log's commits changed into the database file and, with
+     * {@link CheckpointMode#TRUNCATE}, empties the log.</p>
+     *
+     * <p>Throws {@link ErrorCode#READ_ONLY} on a read-only database,
+     * {@link ErrorCode#LOCK_TIMEOUT} if a transaction already has records in
+     * the log (a checkpoint would cut its commit off from them), and
+     * {@link ErrorCode#IO} if writing failed, in which case the log still holds
+     * every commit.</p>
+     *
+     * @throws NullPointerException if {@code mode} is null
+     */
+    public CheckpointStats checkpoint(CheckpointMode mode) {
+        Objects.requireNonNull(mode, "mode");
+        long[] out = Native.checkpoint(handle(), mode.code());
+        return new CheckpointStats((int) out[0], out[1], out[2], out[3] != 0);
+    }
+
+    /**
+     * Sets when commits checkpoint from now on.
+     *
+     * <p>A commit runs a {@link CheckpointMode#TRUNCATE} checkpoint once the
+     * log holds {@code maxWalFrames} frames (one frame is one page, usually
+     * 4096 bytes), and no sooner than {@code minIntervalMs} after the last
+     * automatic one (0 for no minimum). {@code maxWalFrames} 0 switches
+     * automatic checkpoints off: the log grows until {@link #checkpoint}
+     * runs, though {@link #close()} still folds it into the file. Without this
+     * call the {@code LATTICE_AUTO_CHECKPOINT_FRAMES} environment variable
+     * sets the frame count (0 for none), and without that the log may grow to
+     * an eighth of the page cache, from 1000 frames up to 64 MB. This call
+     * wins over the variable, and its count is used as given, not scaled to
+     * the cache. It has no effect on a
+     * read-only database.</p>
+     *
+     * <p>A larger interval means fewer checkpoints, each a longer pause for
+     * the commit that runs it, a longer log on disk and more to replay after a
+     * crash. A smaller one means shorter pauses, more often.</p>
+     *
+     * @throws IllegalArgumentException if either argument is negative
+     */
+    public void setAutoCheckpoint(long maxWalFrames, long minIntervalMs) {
+        if (maxWalFrames < 0) {
+            throw new IllegalArgumentException(
+                    "maxWalFrames must not be negative: " + maxWalFrames);
+        }
+        if (minIntervalMs < 0) {
+            throw new IllegalArgumentException(
+                    "minIntervalMs must not be negative: " + minIntervalMs);
+        }
+        Native.setAutoCheckpoint(handle(), maxWalFrames, minIntervalMs);
     }
 
     @Override

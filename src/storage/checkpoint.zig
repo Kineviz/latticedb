@@ -119,23 +119,34 @@ pub const Checkpointer = struct {
             return CheckpointError.WalError;
         };
 
-        // 3. Flush dirty pages based on mode
-        const pages_flushed = switch (mode) {
-            .passive => try self.flushPassive(),
-            .full, .truncate => try self.flushFull(),
-        };
-
-        // 4. Record the coming reset, then sync the database file. The counter
-        //    has to be durable before the log is truncated in step 8, because a
-        //    follower that misses the reset would keep counting through frame
-        //    numbers that no longer mean what it thinks they do.
+        // 3. Record the coming reset in the header, so that it reaches the
+        //    file in the same flush as the pages. The counter has to be
+        //    durable before the log is truncated in step 8, because a
+        //    follower that misses the reset would keep counting through
+        //    frame numbers that no longer mean what it thinks they do.
         if (mode == .truncate) {
             self.pm.advanceCheckpointSeq() catch {
                 return CheckpointError.IoError;
             };
         }
-        self.pm.sync() catch {
-            return CheckpointError.IoError;
+
+        // 4. Flush every dirty page and the header as one atomic step, which
+        //    also syncs the database file. `.passive` gives way to anything
+        //    holding a dirty page; it then writes nothing at all, because a
+        //    flush of some pages and not others is exactly what must never
+        //    reach the file, and the checkpoint position stays where it was.
+        const pages_flushed: u32 = switch (mode) {
+            .passive => (try self.flushPassive()) orelse {
+                const skipped = CheckpointStats{
+                    .pages_flushed = 0,
+                    .duration_ns = @intCast(@import("compat").nanoTimestamp() - start_time),
+                    .checkpoint_lsn = self.wal.getCheckpointLsn(),
+                    .wal_truncated = false,
+                };
+                self.last_stats = skipped;
+                return skipped;
+            },
+            .full, .truncate => try self.flushFull(),
         };
 
         // 5. Write CHECKPOINT_END to WAL with stats
@@ -180,65 +191,21 @@ pub const Checkpointer = struct {
         return stats;
     }
 
-    /// Flush pages without blocking - skip pages that are currently pinned
-    fn flushPassive(self: *Self) CheckpointError!u32 {
-        var pages_flushed: u32 = 0;
-
+    /// Flush without waiting: null if any dirty page is in use.
+    fn flushPassive(self: *Self) CheckpointError!?u32 {
         for (self.bp.frames) |*frame| {
-            // Skip empty or clean frames
-            if (frame.page_id == 0 or !frame.dirty) {
-                continue;
-            }
-
-            // Skip pinned frames (in use by transactions)
-            if (frame.isPinned()) {
-                continue;
-            }
-
-            // Try to acquire latch without blocking
-            if (frame.latch.tryAcquireShared()) {
-                defer frame.latch.releaseShared();
-
-                if (frame.dirty) {
-                    self.pm.writePage(frame.page_id, frame.data) catch {
-                        return CheckpointError.IoError;
-                    };
-                    frame.dirty = false;
-                    pages_flushed += 1;
-                }
-            }
-            // If we can't get the latch, skip this page (passive mode)
+            if (frame.page_id != 0 and frame.dirty and frame.isPinned()) return null;
         }
-
-        return pages_flushed;
+        for (self.bp.overflow.items) |slot| {
+            const frame = slot orelse continue;
+            if (frame.page_id != 0 and frame.dirty and frame.isPinned()) return null;
+        }
+        return try self.flushFull();
     }
 
     /// Flush all dirty pages, waiting for latches if needed
     fn flushFull(self: *Self) CheckpointError!u32 {
-        var pages_flushed: u32 = 0;
-
-        for (self.bp.frames) |*frame| {
-            // Skip empty or clean frames
-            if (frame.page_id == 0 or !frame.dirty) {
-                continue;
-            }
-
-            // Wait for latch (full mode waits)
-            while (!frame.latch.tryAcquireShared()) {
-                std.atomic.spinLoopHint();
-            }
-            defer frame.latch.releaseShared();
-
-            if (frame.dirty) {
-                self.pm.writePage(frame.page_id, frame.data) catch {
-                    return CheckpointError.IoError;
-                };
-                frame.dirty = false;
-                pages_flushed += 1;
-            }
-        }
-
-        return pages_flushed;
+        return self.bp.flushAll() catch return CheckpointError.IoError;
     }
 
     /// Truncate the WAL file (reset to header only)
@@ -275,8 +242,77 @@ pub const Checkpointer = struct {
 
 /// Configuration for automatic checkpointing
 pub const AutoCheckpointConfig = struct {
-    /// WAL frames written before a checkpoint is considered.
-    max_wal_frames: u64 = 1000,
+    /// The variable that sets the default for the C API, the bindings and
+    /// the CLI: frames between automatic checkpoints, 0 for none. A frame
+    /// count set this way is used as it is, not scaled to the cache.
+    pub const environment_variable = "LATTICE_AUTO_CHECKPOINT_FRAMES";
+
+    /// The policy `LATTICE_AUTO_CHECKPOINT_FRAMES` asks for: the default one
+    /// with its frame count, or `.off` for 0. Null when it is unset or not a
+    /// whole number.
+    pub fn fromEnvironment() ?EnvironmentSetting {
+        const text = std.c.getenv(environment_variable) orelse return null;
+        const frames = std.fmt.parseInt(u64, std.mem.span(text), 10) catch return null;
+        if (frames == 0) return .off;
+        return .{ .policy = .{ .max_wal_frames = frames } };
+    }
+
+    pub const EnvironmentSetting = union(enum) {
+        off,
+        policy: AutoCheckpointConfig,
+
+        pub fn get(self: EnvironmentSetting) ?AutoCheckpointConfig {
+            return switch (self) {
+                .off => null,
+                .policy => |p| p,
+            };
+        }
+    };
+
+    /// Where the default interval comes from, when no one chose one.
+    ///
+    /// A checkpoint writes every page dirtied since the last one twice (into
+    /// the journal, then in place) and syncs, so checkpointing often throws
+    /// away what a large page cache could hold. A bulk load of 1M nodes and
+    /// 2M relationships, 10K rows per transaction, took 12.8 s with a 1 GB
+    /// cache at the old fixed 1000 frames (4 MB of log) and 9.2 s at 64 MB of
+    /// log. With the 100 MB default cache the interval made no measurable
+    /// difference, since the flush that runs when half the cache is dirty
+    /// dominates there. So the log may grow to an eighth of the cache:
+    ///
+    /// - the floor is the old default, 1000 frames of 4096 bytes, so a small
+    ///   cache checkpoints as often as it always did;
+    /// - the cap, 64 MB, bounds the log left to replay after a crash and the
+    ///   size of the `-wal` file on disk.
+    pub const scaled_default = struct {
+        /// The log may grow to `cache bytes / cache_divisor`, between the two
+        /// bounds below.
+        pub const cache_divisor: u64 = 8;
+        pub const min_log_bytes: u64 = 1000 * 4096;
+        pub const max_log_bytes: u64 = 64 * 1024 * 1024;
+    };
+
+    /// The frame count commits checkpoint at by default, for a page cache of
+    /// `cache_bytes` and a log whose frames are `frame_size` bytes.
+    pub fn defaultMaxWalFrames(cache_bytes: u64, frame_size: u32) u64 {
+        const d = scaled_default;
+        const log_bytes = std.math.clamp(cache_bytes / d.cache_divisor, d.min_log_bytes, d.max_log_bytes);
+        return @max(1, log_bytes / @max(1, frame_size));
+    }
+
+    /// This policy with `max_wal_frames` filled in: as given when it was
+    /// chosen, otherwise scaled to the page cache.
+    pub fn resolved(self: AutoCheckpointConfig, cache_bytes: u64, frame_size: u32) AutoCheckpointConfig {
+        var policy = self;
+        if (policy.max_wal_frames == null) policy.max_wal_frames = defaultMaxWalFrames(cache_bytes, frame_size);
+        return policy;
+    }
+
+    /// WAL frames written before a checkpoint is considered. Null, the
+    /// default, scales it to the page cache (`defaultMaxWalFrames`): from
+    /// 1000 frames for a small cache up to 64 MB of log for a cache of
+    /// 512 MB or more. A number set here is used as it is.
+    max_wal_frames: ?u64 = null,
     /// Shortest gap between two automatic checkpoints, in nanoseconds.
     ///
     /// Zero by default, because under `.truncate` the frame threshold already
@@ -409,19 +445,23 @@ test "checkpoint passive skips pinned pages" {
     frame2.dirty = true;
     bp.unpinPage(frame2, true);
 
-    // Passive checkpoint should only flush page2 (page1 is pinned)
+    // A passive checkpoint gives way to the pinned page. It cannot write
+    // page2 on its own either: some pages and not others is a torn image.
+    // So it writes nothing, and the checkpoint position does not move.
+    const lsn_before = wal.getCheckpointLsn();
     const stats = try checkpointer.checkpoint(.passive);
-
-    // Only 1 page should be flushed (page2), page1 is still pinned
-    try std.testing.expectEqual(@as(u32, 1), stats.pages_flushed);
+    try std.testing.expectEqual(@as(u32, 0), stats.pages_flushed);
+    try std.testing.expectEqual(lsn_before, wal.getCheckpointLsn());
+    try std.testing.expectEqual(lsn_before, stats.checkpoint_lsn);
 
     // Now unpin page1
     bp.unpinPage(frame1, true);
     frame1_pinned = false;
 
-    // Full checkpoint should flush remaining dirty page
-    const stats2 = try checkpointer.checkpoint(.full);
-    try std.testing.expectEqual(@as(u32, 1), stats2.pages_flushed);
+    // With nothing in use, the same request flushes both pages together.
+    const stats2 = try checkpointer.checkpoint(.passive);
+    try std.testing.expectEqual(@as(u32, 2), stats2.pages_flushed);
+    try std.testing.expect(wal.getCheckpointLsn() > lsn_before);
 }
 
 test "checkpoint updates WAL checkpoint_lsn" {

@@ -19,10 +19,10 @@ extern "C" {
 #endif
 
 /* Version information */
-#define LATTICE_VERSION "0.15.0"
+#define LATTICE_VERSION "0.18.1"
 #define LATTICE_VERSION_MAJOR 0
-#define LATTICE_VERSION_MINOR 15
-#define LATTICE_VERSION_PATCH 0
+#define LATTICE_VERSION_MINOR 18
+#define LATTICE_VERSION_PATCH 1
 
 /* Opaque handle types */
 typedef struct lattice_database lattice_database;
@@ -41,6 +41,8 @@ typedef uint64_t lattice_edge_id;
 /* Error codes */
 typedef enum {
     LATTICE_OK = 0,
+    /* A failure that none of the codes below describes. Every function
+     * returns the specific code when there is one. */
     LATTICE_ERROR = -1,
     LATTICE_ERROR_IO = -2,
     LATTICE_ERROR_CORRUPTION = -3,
@@ -51,6 +53,10 @@ typedef enum {
     LATTICE_ERROR_LOCK_TIMEOUT = -8,
     LATTICE_ERROR_READ_ONLY = -9,
     LATTICE_ERROR_FULL = -10,
+    /* The database file, or its write-ahead log, was written by a newer
+     * release in a format this one cannot read (the header's
+     * min_reader_version, or the log's version, is above what this release
+     * knows). Read-only opens are refused too. Nothing was written. */
     LATTICE_ERROR_VERSION_MISMATCH = -11,
     LATTICE_ERROR_CHECKSUM = -12,
     LATTICE_ERROR_OUT_OF_MEMORY = -13,
@@ -58,7 +64,18 @@ typedef enum {
     LATTICE_ERROR_VALUE_TOO_LARGE = -15,
     /* Another process holds the database. Distinct from LATTICE_ERROR_LOCK_TIMEOUT,
      * which reports a second writer inside this process. */
-    LATTICE_ERROR_DATABASE_LOCKED = -16
+    LATTICE_ERROR_DATABASE_LOCKED = -16,
+    /* lattice_node_delete was asked to delete a node that still has
+     * relationships. lattice_node_detach_delete removes them with it. */
+    LATTICE_ERROR_HAS_RELATIONSHIPS = -17,
+    /* The open options contradict the vector index configuration the database
+     * file records: a different vector_dimensions, vector_metric, vector_m or
+     * vector_ef_construction. Nothing was read with the wrong configuration. */
+    LATTICE_ERROR_CONFIG_MISMATCH = -18,
+    /* The database file was written by a newer release that does not allow
+     * this one to write it (its header's min_writer_version is above this
+     * release's format version). It opens read-only. Nothing was written. */
+    LATTICE_ERROR_NEEDS_NEWER_WRITER = -19
 } lattice_error;
 
 /* Transaction modes */
@@ -129,13 +146,19 @@ struct lattice_map_entry {
     lattice_value value;
 };
 
-/* Open options */
+/* Open options
+ *
+ * cache_size_mb, in every version: a size set here wins over the
+ * LATTICE_BUFFER_POOL_MB environment variable. 0 means not set: the variable's
+ * size if it is set to a positive number of megabytes, else 100 MB. A null
+ * options pointer leaves the size to the variable, else to the engine's own
+ * sizing (16 MB, plus 12 MB each for full-text search and vectors). */
 typedef struct {
     bool create;            /* Create if not exists */
     bool read_only;         /* Open in read-only mode */
-    uint32_t cache_size_mb; /* Cache size in MB (default: 100) */
+    uint32_t cache_size_mb; /* Cache size in MB (default: 100; 0: see below) */
     uint32_t page_size;     /* Page size in bytes (default: 4096) */
-    bool enable_vector;     /* Enable vector storage for embeddings */
+    bool enable_vector;     /* Create a vector index if none (see v5) */
     uint16_t vector_dimensions; /* Vector dimensions, 1..4096 (default: 128) */
 } lattice_open_options;
 
@@ -147,9 +170,9 @@ typedef struct {
     size_t struct_size;     /* Must be sizeof(lattice_open_options_v2) */
     bool create;            /* Create if not exists */
     bool read_only;         /* Open in read-only mode */
-    uint32_t cache_size_mb; /* Cache size in MB (default: 100) */
+    uint32_t cache_size_mb; /* Cache size in MB (default: 100; 0: see below) */
     uint32_t page_size;     /* Page size in bytes (default: 4096) */
-    bool enable_vector;     /* Enable vector storage for embeddings */
+    bool enable_vector;     /* Create a vector index if none (see v5) */
     uint16_t vector_dimensions; /* Vector dimensions, 1..4096 (default: 128) */
     bool enable_wal;        /* Enable WAL-backed transactions (default: true) */
 } lattice_open_options_v2;
@@ -162,12 +185,15 @@ typedef struct {
     size_t struct_size;     /* Must be sizeof(lattice_open_options_v3) */
     bool create;            /* Create if not exists */
     bool read_only;         /* Open in read-only mode */
-    uint32_t cache_size_mb; /* Cache size in MB (default: 100) */
+    uint32_t cache_size_mb; /* Cache size in MB (default: 100; 0: see below) */
     uint32_t page_size;     /* Page size in bytes (default: 4096) */
-    bool enable_vector;     /* Enable vector storage for embeddings */
+    bool enable_vector;     /* Create a vector index if none (see v5) */
     uint16_t vector_dimensions; /* Vector dimensions, 1..4096 (default: 128) */
     bool enable_wal;        /* Enable WAL-backed transactions (default: true) */
-    bool enable_adjacency_cache; /* Enable in-memory graph adjacency cache */
+    /* Keep an in-memory adjacency cache. Nothing in this API reads it:
+     * queries and the edge functions go to the B+Tree either way, so it
+     * speeds up nothing here and costs a little on each edge write. */
+    bool enable_adjacency_cache;
 } lattice_open_options_v3;
 
 /* Default open options v3 */
@@ -178,12 +204,15 @@ typedef struct {
     size_t struct_size;     /* Must be sizeof(lattice_open_options_v4) */
     bool create;            /* Create if not exists */
     bool read_only;         /* Open in read-only mode */
-    uint32_t cache_size_mb; /* Cache size in MB (default: 100) */
+    uint32_t cache_size_mb; /* Cache size in MB (default: 100; 0: see below) */
     uint32_t page_size;     /* Page size in bytes (default: 4096) */
-    bool enable_vector;     /* Enable vector storage for embeddings */
+    bool enable_vector;     /* Create a vector index if none (see v5) */
     uint16_t vector_dimensions; /* Vector dimensions, 1..4096 (default: 128) */
     bool enable_wal;        /* Enable WAL-backed transactions (default: true) */
-    bool enable_adjacency_cache; /* Enable in-memory graph adjacency cache */
+    /* Keep an in-memory adjacency cache. Nothing in this API reads it:
+     * queries and the edge functions go to the B+Tree either way, so it
+     * speeds up nothing here and costs a little on each edge write. */
+    bool enable_adjacency_cache;
     /* Take a lock on the file so two processes cannot tread on each other
      * (default: true). A read-write handle takes the file exclusively and a
      * read-only handle shares it, so opening returns LATTICE_ERROR_DATABASE_LOCKED
@@ -194,6 +223,121 @@ typedef struct {
 
 /* Default open options v4 */
 #define LATTICE_OPEN_OPTIONS_V4_DEFAULT { sizeof(lattice_open_options_v4), false, false, 100, 4096, false, 128, true, false, true }
+
+/* When a commit waits for the disk (lattice_open_options_v5.sync_mode). */
+typedef enum {
+    /* LATTICE_SYNC_MODE from the environment ("full" or "normal") if it is set,
+     * else FULL. */
+    LATTICE_SYNC_MODE_DEFAULT = 0,
+    /* Sync the log on every commit: a commit that has returned survives a
+     * power cut. */
+    LATTICE_SYNC_MODE_FULL = 1,
+    /* Hand the commit to the operating system and return. It survives the
+     * process being killed; a power cut or OS crash can lose the most recent
+     * commits, from the end only, and the database stays consistent. */
+    LATTICE_SYNC_MODE_NORMAL = 2
+} lattice_sync_mode;
+
+/* Whether syncs ask the drive to flush its cache, on macOS
+ * (lattice_open_options_v5.full_fsync). No effect elsewhere. */
+typedef enum {
+    /* LATTICE_FULL_FSYNC from the environment ("1"/"true" or "0"/"false") if
+     * it is set, else OFF. */
+    LATTICE_FULL_FSYNC_DEFAULT = 0,
+    LATTICE_FULL_FSYNC_OFF = 1,
+    LATTICE_FULL_FSYNC_ON = 2
+} lattice_full_fsync;
+
+/* How the vector index measures distance (lattice_open_options_v5.vector_metric).
+ * Search results are ordered by this distance, smallest first, and the Cypher
+ * <=> operator returns it. */
+typedef enum {
+    /* The metric the database file records, or COSINE for a new index. */
+    LATTICE_VECTOR_METRIC_DEFAULT = 0,
+    /* 1 - cos(a, b), in [0, 2]. Vectors are stored scaled to unit length. */
+    LATTICE_VECTOR_METRIC_COSINE = 1,
+    /* Euclidean (L2) distance, sqrt(sum((a - b)^2)). Vectors are stored as given. */
+    LATTICE_VECTOR_METRIC_EUCLIDEAN = 2,
+    /* Negative dot product, -(a . b): the largest dot product comes first.
+     * Vectors are stored as given. */
+    LATTICE_VECTOR_METRIC_DOT_PRODUCT = 3
+} lattice_vector_metric;
+
+/* How much of the changefeed (__lattice_changes) to keep
+ * (lattice_open_options_v5.changefeed_retention). The database file records
+ * its policy; retention drops the oldest events at checkpoints and on
+ * lattice_changefeed_trim(). */
+typedef enum {
+    /* The policy the file records, or ALL if it records none. A new database
+     * takes LATTICE_CHANGEFEED_RETENTION from the environment if it is set
+     * ("all", "off", "last:<events>", "age:<duration>" such as "7d"); a value
+     * that is none of these is ignored. */
+    LATTICE_CHANGEFEED_RETENTION_DEFAULT = 0,
+    /* Keep every event. */
+    LATTICE_CHANGEFEED_RETENTION_ALL = 1,
+    /* Keep the newest changefeed_retention_value events. */
+    LATTICE_CHANGEFEED_RETENTION_LAST = 2,
+    /* Keep events committed within the last changefeed_retention_value
+     * milliseconds. */
+    LATTICE_CHANGEFEED_RETENTION_AGE = 3,
+    /* Write no events and drop the ones there are. Reading the changefeed
+     * then returns LATTICE_ERROR_UNSUPPORTED. Switching back on leaves one
+     * sequence number unused, so a reader that read before the feed went off
+     * gets LATTICE_ERROR_NOT_FOUND instead of silently missing changes. */
+    LATTICE_CHANGEFEED_RETENTION_OFF = 4
+} lattice_changefeed_retention;
+
+/* Open options v5.
+ *
+ * Every v4 field keeps its meaning. The new fields use 0 for "not set":
+ *
+ * sync_mode and full_fsync take a lattice_sync_mode and lattice_full_fsync. A
+ * value set here wins over the LATTICE_SYNC_MODE and LATTICE_FULL_FSYNC
+ * environment variables; those apply only to a handle that leaves the field at
+ * 0, which is also what every older open function does.
+ *
+ * vector_metric, vector_m and vector_ef_construction configure a vector index
+ * when this open creates one (enable_vector on a database that has none). The
+ * database file records the index's configuration, and a database that has one
+ * opens with it whether or not enable_vector is set. Any of these fields that is
+ * set, and vector_dimensions when enable_vector is set, must then match the file,
+ * or the open fails with LATTICE_ERROR_CONFIG_MISMATCH. A database written by
+ * 0.16.0 records no configuration; its index is cosine, m 16, ef_construction
+ * 200, with the dimensions its vector pages carry, and that configuration is
+ * recorded the first time this release opens it for writing.
+ *
+ * changefeed_retention takes a lattice_changefeed_retention, with
+ * changefeed_retention_value the number of events (LAST) or milliseconds (AGE),
+ * which must then be at least 1. A value other than DEFAULT replaces the
+ * policy the file records when the database is opened for writing; a read-only
+ * open never changes it.
+ */
+typedef struct {
+    size_t struct_size;     /* Must be sizeof(lattice_open_options_v5) */
+    bool create;            /* Create if not exists */
+    bool read_only;         /* Open in read-only mode */
+    uint32_t cache_size_mb; /* Cache size in MB (default: 100; 0: see below) */
+    uint32_t page_size;     /* Page size in bytes (default: 4096) */
+    bool enable_vector;     /* Create a vector index if the database has none */
+    uint16_t vector_dimensions; /* Vector dimensions, 1..4096 (default: 128) */
+    bool enable_wal;        /* Enable WAL-backed transactions (default: true) */
+    bool enable_adjacency_cache; /* As in v3: nothing in this API reads it */
+    bool lock;              /* As in v4 (default: true) */
+    uint8_t sync_mode;      /* A lattice_sync_mode (default: 0, DEFAULT) */
+    uint8_t full_fsync;     /* A lattice_full_fsync (default: 0, DEFAULT) */
+    uint8_t vector_metric;  /* A lattice_vector_metric (default: 0, DEFAULT) */
+    /* HNSW connections per node, 2..32 (layer 0 keeps twice as many). 0 means
+     * the file's, or 16 for a new index. Fixed once the index exists. */
+    uint16_t vector_m;
+    /* HNSW candidate list size while building, 1..4096. 0 means the file's, or
+     * 200 for a new index. Fixed once the index exists. */
+    uint16_t vector_ef_construction;
+    uint8_t changefeed_retention; /* A lattice_changefeed_retention (default: 0) */
+    uint64_t changefeed_retention_value; /* Events (LAST) or milliseconds (AGE) */
+} lattice_open_options_v5;
+
+/* Default open options v5 */
+#define LATTICE_OPEN_OPTIONS_V5_DEFAULT { sizeof(lattice_open_options_v5), false, false, 100, 4096, false, 128, true, false, true, 0, 0, 0, 0, 0, 0, 0 }
 
 /*
  * Database operations
@@ -230,20 +374,103 @@ lattice_error lattice_open_v4(
     lattice_database** db_out
 );
 
+/* Open a database file with v5 options; see lattice_open_options_v5.
+ * Returns LATTICE_ERROR_CONFIG_MISMATCH if the options contradict the vector
+ * index configuration the file records, and LATTICE_ERROR_INVALID_ARG for a
+ * value out of range. A file a newer release has marked as not writable by
+ * this one opens only read-only; otherwise LATTICE_ERROR_NEEDS_NEWER_WRITER.
+ * The older open functions behave as this one with the v5 fields at 0. */
+lattice_error lattice_open_v5(
+    const char* path,
+    const lattice_open_options_v5* options,
+    lattice_database** db_out
+);
+
 /* Close a database.
  * Returns LATTICE_ERROR_INVALID_ARG if transaction or result handles that
  * depend on this database are still active. Close those handles first; the
- * database remains open in that case.
+ * database remains open in that case. A lattice_stream_read waiting on this
+ * database in another thread does not hold the close up: it is woken and
+ * returns LATTICE_ERROR_INVALID_ARG before the database is freed.
  * Once finalization begins, this function always consumes the database handle.
  * In particular, LATTICE_ERROR_IO reports a sync/checkpoint failure but the
  * handle is still closed and must not be reused or passed to lattice_close. */
 lattice_error lattice_close(lattice_database* db);
 
 /*
+ * Checkpoints
+ *
+ * A commit is durable once it is in the log (the -wal file). A checkpoint
+ * writes the pages the log's commits changed into the database file, through
+ * the flush journal, and can then empty the log. By default a commit runs one
+ * once the log reaches an eighth of the page cache (cache_size_mb), never
+ * less than 1000 frames of 4096 bytes and never more than 64 MB: 3200
+ * frames for the default 100 MB cache, 16384 for 512 MB or more.
+ * LATTICE_AUTO_CHECKPOINT_FRAMES in the environment sets a fixed frame count
+ * instead (0 for none). Opening and closing a database fold whatever the log
+ * holds into the file.
+ *
+ * The interval is a trade-off. A larger one means fewer checkpoints, each a
+ * longer pause for the commit that runs it (it writes every page changed
+ * since the last one), a longer log on disk and more to replay after a crash.
+ * A smaller one means shorter pauses, more often.
+ */
+
+typedef enum {
+    /* Write the changed pages and record the checkpoint in the log, but give
+     * way if any changed page is in use: then nothing is written and the
+     * stats report 0 pages. Leaves the log in place. */
+    LATTICE_CHECKPOINT_PASSIVE = 0,
+    /* Write every changed page. Leaves the log in place, so anything reading
+     * it (replication) keeps its position. */
+    LATTICE_CHECKPOINT_FULL = 1,
+    /* FULL, then empty the log. The only mode that bounds the log's size; what
+     * automatic checkpoints use. */
+    LATTICE_CHECKPOINT_TRUNCATE = 2
+} lattice_checkpoint_mode;
+
+typedef struct {
+    uint32_t pages_flushed;  /* Pages written into the database file */
+    uint64_t duration_ns;    /* How long the checkpoint took */
+    uint64_t checkpoint_lsn; /* The log position the file now holds */
+    bool wal_truncated;      /* Whether the log was emptied */
+} lattice_checkpoint_stats;
+
+/* Checkpoint now. stats_out may be NULL.
+ * An open transaction does not hold a checkpoint back while its changes are
+ * held in memory, which is how they are kept until commit. Should one already
+ * have records in the log, every mode is refused with
+ * LATTICE_ERROR_LOCK_TIMEOUT, because a checkpoint would cut its commit off
+ * from them. Returns LATTICE_ERROR_READ_ONLY for a read-only handle,
+ * LATTICE_ERROR_INVALID_ARG for an unknown mode, and LATTICE_ERROR_IO if
+ * writing failed (the log still holds every commit). */
+lattice_error lattice_checkpoint(
+    lattice_database* db,
+    lattice_checkpoint_mode mode,
+    lattice_checkpoint_stats* stats_out
+);
+
+/* Set when commits checkpoint (TRUNCATE) from now on: once the log holds
+ * max_wal_frames frames, and no sooner than min_interval_ms after the last
+ * automatic checkpoint (0 for no minimum). max_wal_frames 0 switches automatic
+ * checkpoints off, leaving them to lattice_checkpoint; the log then grows until
+ * one runs. Either way, close still folds the log into the file. The frame
+ * count is used as given, not scaled to the cache; pass 1000 for the
+ * interval of releases before the default followed the cache. Overrides
+ * LATTICE_AUTO_CHECKPOINT_FRAMES. Has no effect on a read-only handle. */
+lattice_error lattice_set_auto_checkpoint(
+    lattice_database* db,
+    uint64_t max_wal_frames,
+    uint64_t min_interval_ms
+);
+
+/*
  * Transaction operations
  */
 
 /* Begin a transaction.
+ * The lattice_txn* is an opaque token, not necessarily an address: pass it
+ * back to the API, but never dereference or reinterpret it.
  * At most one read-write transaction may be active per database handle.
  * Beginning a second writer returns LATTICE_ERROR_LOCK_TIMEOUT; read-only
  * transactions may remain active alongside the writer. */
@@ -255,12 +482,16 @@ lattice_error lattice_begin(
 
 /* Commit a transaction.
  * On success, the transaction handle is closed and must not be used for new
- * operations. Reusing it before database close returns LATTICE_ERROR_TXN_ABORTED. */
+ * operations. Reusing it returns LATTICE_ERROR_TXN_ABORTED, also after the
+ * database is closed; it never reaches a later transaction. The handle's
+ * memory is released here, not at database close. */
 lattice_error lattice_commit(lattice_txn* txn);
 
 /* Rollback a transaction.
  * On success, the transaction handle is closed and must not be used for new
- * operations. Reusing it before database close returns LATTICE_ERROR_TXN_ABORTED. */
+ * operations. Reusing it returns LATTICE_ERROR_TXN_ABORTED, also after the
+ * database is closed; it never reaches a later transaction. The handle's
+ * memory is released here, not at database close. */
 lattice_error lattice_rollback(lattice_txn* txn);
 
 /*
@@ -268,7 +499,16 @@ lattice_error lattice_rollback(lattice_txn* txn);
  */
 
 /* Create a node with an optional single label.
- * Pass NULL or "" to create an unlabeled node. */
+ * Pass NULL or "" to create an unlabeled node.
+ *
+ * The id is the node's once lattice_commit has returned LATTICE_OK. Ids are
+ * never handed out twice by one open database, and a committed node's id is
+ * never reused, even after it is deleted or the process crashes. After a
+ * crash, ids handed out to transactions that never committed (after the last
+ * committed creation) can be handed out again: they never existed in the
+ * database. A program that stores an id elsewhere before the commit returns
+ * must treat it as unassigned if the commit fails or the process dies first;
+ * if it died inside lattice_commit, read the node back to find out. */
 lattice_error lattice_node_create(
     lattice_txn* txn,
     const char* label,
@@ -289,8 +529,19 @@ lattice_error lattice_node_remove_label(
     const char* label
 );
 
-/* Delete a node */
+/* Delete a node.
+ * Returns LATTICE_ERROR_HAS_RELATIONSHIPS, and deletes nothing, while the node
+ * has relationships the transaction can see, as Cypher's DELETE does: deleting
+ * the node alone would leave edges pointing at nothing. Deleting a node that
+ * does not exist succeeds and does nothing. */
 lattice_error lattice_node_delete(
+    lattice_txn* txn,
+    lattice_node_id node_id
+);
+
+/* Delete a node and every relationship it has, as Cypher's DETACH DELETE does.
+ * All of it is part of the transaction. */
+lattice_error lattice_node_detach_delete(
     lattice_txn* txn,
     lattice_node_id node_id
 );
@@ -298,7 +549,11 @@ lattice_error lattice_node_delete(
 /* Set a property on a node.
  * The value tree is borrowed for the duration of the call only.
  * STRING/BYTES/VECTOR pointers may be NULL only when their lengths are zero.
- * LIST/MAP container pointers must be non-NULL; empty containers use len=0. */
+ * LIST/MAP container pointers must be non-NULL; empty containers use len=0.
+ * A LATTICE_VALUE_NULL value removes the property, as Cypher's
+ * SET n.x = null does, and returns LATTICE_OK when the node has no such
+ * property; no property is ever stored as null. (Up to 0.18.0 it stored the
+ * null.) A null inside a LIST or MAP is stored as given. */
 lattice_error lattice_node_set_property(
     lattice_txn* txn,
     lattice_node_id node_id,
@@ -500,6 +755,26 @@ lattice_error lattice_deserialize_borrowed(
     lattice_database** db_out
 );
 
+/* lattice_deserialize and lattice_deserialize_borrowed with v5 options, so a
+ * deserialized database opens with the same options as a file: the sync
+ * settings, and the vector index options, which must match the index the
+ * bytes record (LATTICE_ERROR_CONFIG_MISMATCH otherwise) or configure the one
+ * an enable_vector creates. create and read_only are ignored, as in the v4
+ * functions. The borrowed variant's bytes must outlive the database. */
+lattice_error lattice_deserialize_v5(
+    const uint8_t* bytes,
+    size_t len,
+    const lattice_open_options_v5* options,
+    lattice_database** db_out
+);
+
+lattice_error lattice_deserialize_borrowed_v5(
+    const uint8_t* bytes,
+    size_t len,
+    const lattice_open_options_v5* options,
+    lattice_database** db_out
+);
+
 /* Release a buffer returned by lattice_serialize. */
 void lattice_free_bytes(uint8_t* bytes, size_t len);
 
@@ -543,7 +818,10 @@ lattice_error lattice_stream_publish_get_sequence(
 );
 
 /* Read records after a sequence cursor. Reads do not commit offsets. If no
- * records are available, timeout_ms waits for a same-process commit wakeup. */
+ * records are available, timeout_ms waits for a same-process commit wakeup.
+ * The wait does not block other calls on the database. If another thread
+ * closes the database during the wait, the read returns
+ * LATTICE_ERROR_INVALID_ARG promptly and the close goes ahead. */
 lattice_error lattice_stream_read(
     lattice_database* db,
     const char* stream,
@@ -588,6 +866,27 @@ lattice_error lattice_stream_get_last_sequence(
     uint64_t* sequence_out
 );
 
+/* The changefeed's retention policy (a lattice_changefeed_retention and its
+ * value), the oldest event it holds (0 when it holds none), and the last
+ * sequence it handed out. Any output pointer may be NULL.
+ *
+ * Reading the changefeed after a sequence whose next event retention or a trim
+ * has dropped returns LATTICE_ERROR_NOT_FOUND: the reader missed changes. An
+ * after_sequence of 0 always reads from the oldest event held. */
+lattice_error lattice_changefeed_status(
+    lattice_database* db,
+    uint8_t* retention_out,
+    uint64_t* retention_value_out,
+    uint64_t* oldest_sequence_out,
+    uint64_t* last_sequence_out
+);
+
+/* Apply the retention policy in full now, rather than a bounded part of it at
+ * each checkpoint, and make the result durable. removed_out (may be NULL)
+ * receives the number of events dropped. Returns LATTICE_ERROR_LOCK_TIMEOUT
+ * while a write transaction is open. */
+lattice_error lattice_changefeed_trim(lattice_database* db, uint64_t* removed_out);
+
 lattice_error lattice_stream_set_offset(
     lattice_txn* txn,
     const char* stream,
@@ -604,7 +903,13 @@ lattice_error lattice_stream_trim(
     uint64_t through_sequence
 );
 
-/* Set a vector on a node */
+/* Set a vector on a node. A node holds one vector, read in Cypher as
+ * `n.embedding`; `key` must be "embedding", "" or NULL, and any other key
+ * returns LATTICE_ERROR_UNSUPPORTED. A database created without a vector index
+ * also returns LATTICE_ERROR_UNSUPPORTED (before 0.18.1, LATTICE_ERROR_IO);
+ * opening it with enable_vector and vector_dimensions adds one. A vector whose
+ * length is not the index's dimensions, or with a NaN or infinite component,
+ * returns LATTICE_ERROR_INVALID_ARG. */
 lattice_error lattice_node_set_vector(
     lattice_txn* txn,
     lattice_node_id node_id,
@@ -613,11 +918,49 @@ lattice_error lattice_node_set_vector(
     uint32_t dimensions
 );
 
+/* Get a node's vector as the transaction sees it, including a vector set or
+ * removed earlier in the same transaction. `key` must be "embedding", "" or
+ * NULL, as in lattice_node_set_vector; any other key returns
+ * LATTICE_ERROR_UNSUPPORTED. A node without a vector, or a database without a
+ * vector index, is not an error: *vector_out is NULL and *dimensions_out is 0.
+ * Returns LATTICE_ERROR_NOT_FOUND if the node does not exist.
+ *
+ * Under the cosine metric, the default, the index keeps each vector scaled to
+ * unit length and the file holds no other copy, so a committed vector reads
+ * back normalised: (3, 4) reads back as (0.6, 0.8). The direction, and so every
+ * cosine distance, is unchanged. Under the euclidean and dot-product metrics a
+ * vector reads back as it was stored. A vector set earlier in the same
+ * transaction and not yet committed reads back as written.
+ *
+ * The caller owns *vector_out and must release it with lattice_free_vector(). */
+lattice_error lattice_node_get_vector(
+    lattice_txn* txn,
+    lattice_node_id node_id,
+    const char* key,
+    float** vector_out,
+    uint32_t* dimensions_out
+);
+
+/* Free a vector returned by lattice_node_get_vector. NULL is ignored. */
+void lattice_free_vector(float* vector, uint32_t dimensions);
+
+/* Remove a node's vector. The node keeps its labels and properties; it no
+ * longer reads back a vector, and vector search no longer returns it. Removing
+ * a vector the node does not have succeeds and changes nothing. `key` is
+ * checked as in lattice_node_set_vector. Returns LATTICE_ERROR_NOT_FOUND if the
+ * node does not exist and LATTICE_ERROR_READ_ONLY in a read-only transaction. */
+lattice_error lattice_node_remove_vector(
+    lattice_txn* txn,
+    lattice_node_id node_id,
+    const char* key
+);
+
 /*
  * Batch insert operations
  */
 
-/* Node spec for batch insert: label + vector */
+/* Node spec for batch insert: label + vector. An empty label ("") creates
+ * an unlabeled node, as lattice_node_create does; NULL is rejected. */
 typedef struct {
     const char* label;
     const float* vector;
@@ -628,6 +971,8 @@ typedef struct {
  * On success, node_ids_out[0..count_out] contains created node IDs.
  * On partial failure, count_out indicates how many succeeded;
  * caller should rollback the transaction.
+ * A database created without a vector index returns LATTICE_ERROR_UNSUPPORTED
+ * before creating any node.
  */
 lattice_error lattice_batch_insert(
     lattice_txn* txn,
@@ -659,7 +1004,8 @@ lattice_error lattice_batch_insert(
  *   lattice_vector_result_free(results);
  */
 
-/* Search for similar vectors */
+/* Search for similar vectors. A database created without a vector index
+ * returns LATTICE_ERROR_UNSUPPORTED (before 0.18.1, LATTICE_ERROR_IO). */
 lattice_error lattice_vector_search(
     lattice_database* db,
     const float* vector,
@@ -729,7 +1075,19 @@ void lattice_vector_result_free(lattice_vector_result* result);
  * name does not look like a query that found nothing.
  */
 
-/* Search one declared index for documents matching a text query */
+/* Search one declared index for documents matching a text query.
+ *
+ * Query syntax (the same for Cypher's @@):
+ *   quick fox          every word is required
+ *   quick OR fox       either side; AND binds tighter, so "a b OR c" is (a b) OR c
+ *   fox -dog           excludes documents with "dog"; -"a phrase" excludes a phrase
+ *   "quick brown"      the words next to each other, in order
+ *   data*              any word starting with "data"
+ *   databse~ / ~1      words within two / one edit(s)
+ *   \- \* \~ \" \OR   a backslash makes an operator character literal
+ * A query of only exclusions returns LATTICE_ERROR_INVALID_ARG, as does a phrase
+ * on an index created before 0.17.0, which stores no word positions (drop and
+ * re-create the index to get them). */
 lattice_error lattice_fts_search(
     lattice_database* db,
     const char* label,
@@ -754,9 +1112,9 @@ lattice_error lattice_fts_search_txn(
  * max_distance: max Levenshtein edit distance (0 = default 2)
  * min_term_length: min term length for fuzzy expansion (0 = default 4)
  *
- * Text written in the current transaction and not yet committed is matched by
- * term presence rather than edit distance, so a typo will not find a document
- * this transaction has only just written. */
+ * A document matching any one word is returned, as before; the query syntax
+ * of lattice_fts_search applies otherwise. Text written in the current
+ * transaction and not yet committed is matched with the same edit distances. */
 lattice_error lattice_fts_search_fuzzy(
     lattice_database* db,
     const char* label,
@@ -807,11 +1165,14 @@ typedef enum {
 } lattice_embedding_api_format;
 
 typedef struct {
-    const char* endpoint;
+    const char* endpoint;       /* full URL to POST to; nothing is appended */
     const char* model;
     lattice_embedding_api_format api_format;
     const char* api_key;        /* NULL for no auth */
-    uint32_t timeout_ms;        /* 0 = default 30s */
+    /* How long to wait for the response to begin, in ms; 0 = 30s. Connecting
+     * and reading the rest of a response that has begun are not bounded by it,
+     * and it is not applied on Windows. */
+    uint32_t timeout_ms;
 } lattice_embedding_config;
 
 /* Generate a hash embedding (built-in, no external service).
@@ -825,7 +1186,8 @@ lattice_error lattice_hash_embed(
 /* Free a hash embedding vector */
 void lattice_hash_embed_free(float* vector, uint32_t dimensions);
 
-/* Create an HTTP embedding client */
+/* Create an HTTP embedding client. The strings in `config` are copied; the
+ * caller's buffers need not outlive this call. */
 lattice_error lattice_embedding_client_create(
     const lattice_embedding_config* config,
     lattice_embedding_client** client_out
@@ -846,7 +1208,9 @@ void lattice_embedding_client_free(lattice_embedding_client* client);
  * Edge operations
  */
 
-/* Create an edge between two nodes */
+/* Create an edge between two nodes.
+ * Returns LATTICE_ERROR_NOT_FOUND if either node does not exist as the
+ * transaction sees it. */
 lattice_error lattice_edge_create(
     lattice_txn* txn,
     lattice_node_id source,
@@ -864,7 +1228,9 @@ lattice_error lattice_edge_delete(
 );
 
 /* Set a property on an edge by stable edge ID.
- * The value tree is borrowed for the duration of the call only. */
+ * The value tree is borrowed for the duration of the call only.
+ * A LATTICE_VALUE_NULL value removes the property, as for
+ * lattice_node_set_property. */
 lattice_error lattice_edge_set_property(
     lattice_txn* txn,
     lattice_edge_id edge_id,
@@ -993,7 +1359,9 @@ lattice_error lattice_edge_result_get_id(
     lattice_edge_id* edge_id_out
 );
 
-/* Get an edge from a result set by index */
+/* Get an edge from a result set by index.
+ * *edge_type_out is NUL-terminated and *edge_type_len_out excludes the NUL.
+ * Both stay valid until lattice_edge_result_free(). */
 lattice_error lattice_edge_result_get(
     lattice_edge_result* result,
     uint32_t index,
@@ -1068,7 +1436,7 @@ lattice_error lattice_query_execute(
  * Cleared automatically before each execute call.
  */
 lattice_query_error_stage lattice_query_last_error_stage(lattice_query* query);
-const char* lattice_query_last_error_message(lattice_query* query);
+const char* lattice_query_last_error_message(lattice_query* query); /* nullable */
 const char* lattice_query_last_error_code(lattice_query* query); /* nullable */
 /* Whether executing this query could change the database.
  * Bindings use this to choose between a read-only and a read-write

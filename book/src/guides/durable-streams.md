@@ -34,7 +34,7 @@ await db.write(async (txn) => {
   await txn.publishStream("jobs", { id: 1 }, "job.queued");
 });
 
-const records = await db.readStream("jobs", { afterSequence: 0, limit: 100 });
+const records = await db.readStream("jobs", { afterSequence: 0n, limit: 100 });
 ```
 
 ## Graph Changefeed
@@ -61,3 +61,9 @@ For very large property changes, `old_value` or `new_value` may be a summary map
 with `__lattice_value_omitted`, `type`, and `encoded_bytes`.
 
 Python exposes `Database.changes(...)`; TypeScript exposes `db.changes(...)`.
+
+Every event is kept by default. A retention policy (`all`, `last:<N>`,
+`age:<duration>` or `off`) bounds how much of the changefeed the file holds.
+[The Changefeed](./changefeed.md) covers what it is for, what it costs, the
+policies and when to choose each, how to configure them in every language, and
+its stored format.

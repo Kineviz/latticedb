@@ -68,8 +68,18 @@ pub const Distinct = struct {
     fn open(ptr: *anyopaque, ctx: *ExecutionContext) OperatorError!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Open input
+        // Open input. If draining it fails, close it here: the caller never
+        // closes an operator whose open failed.
+        // Opened again for each row of a CALL { ... }: start afresh.
+        if (self.opened or self.rows.items.len > 0) {
+            var it = self.seen.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.seen.clearRetainingCapacity();
+            self.rows.clearRetainingCapacity();
+        }
+
         try self.input.open(ctx);
+        errdefer self.input.close(ctx);
 
         // Consume all input rows and deduplicate
         var key_buf: std.ArrayList(u8) = .empty;

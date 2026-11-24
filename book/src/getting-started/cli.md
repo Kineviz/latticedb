@@ -60,17 +60,26 @@ Created database: social.lattice
 ```
 
 If you plan to store embeddings, turn the vector index on at creation time and say how
-many dimensions your vectors have. This has to be decided up front, because the index
-is built into the file:
+many dimensions your vectors have. This is decided up front, because the index is
+built into the file and the file records how it was built:
 
 ```bash
 lattice create embeddings.lattice --enable-vector --vector-dims=1536
+```
+
+```text
+Created database: embeddings.lattice
+  Vector index enabled (dimensions: 1536, metric: cosine)
+  Full-text search enabled
 ```
 
 | Option | What it does |
 |--------|--------------|
 | `--enable-vector` | Turn on the vector index for similarity search |
 | `--vector-dims=<n>` | How many numbers are in each vector, 1 to 4096 (default 128) |
+| `--vector-metric=<m>` | How distance is measured: `cosine` (default), `euclidean`, or `dot_product` (the negated dot product) |
+| `--vector-m=<n>` | HNSW connections per node, 2 to 32 (default 16) |
+| `--vector-ef-construction=<n>` | HNSW candidate list size while building, 1 to 4096 (default 200). These four options need `--enable-vector`: without it the command is refused rather than creating a database with no index |
 | `--enable-fts` | Turn on full-text search — already the default |
 | `--no-fts` | Leave full-text search out |
 | `--cache-size=<mb>` | How much memory to keep pages in, in MB (default 64) |
@@ -78,7 +87,35 @@ lattice create embeddings.lattice --enable-vector --vector-dims=1536
 
 Pick `--vector-dims` to match whatever produces your embeddings. OpenAI's
 `text-embedding-3-small` gives you 1536 numbers per vector, so that is the number you
-would use.
+would use. The metric and the two HNSW settings cannot be changed later either; to
+change them, create a new database with the ones you want and import an export of
+the old one into it. (A JSON import into a database with no vector index, given
+`--enable-vector`, copies the original's settings instead.)
+
+### Opening a database that stores vectors
+
+The database file records its vector index: dimensions, metric and build settings.
+Every command opens the index as it was created, with no vector options, including
+`export`, `dump` and `import`, which carry node vectors, and the first command after
+a crash, which replays the vector changes in the log.
+
+A `--vector-dims` that contradicts the file is refused:
+
+```bash
+lattice count embeddings.lattice --enable-vector --vector-dims=4
+```
+
+```text
+Error: Failed to open database embeddings.lattice: its vector index has a different number of dimensions than --vector-dims gives. A database with a vector index opens with it as it was created; leave out --vector-dims.
+```
+
+The vector options of commands other than `create` are needed in two cases only.
+`--enable-vector --vector-dims=<n>` on a database that has no vector index creates
+one, for example to import a file that carries vectors into a database created
+without them. And a database last written by LatticeDB 0.16.0 records no vector
+settings: its dimensions are read from its vector pages, and in the rare case that
+fails, a command that has to replay vector changes from its log stops and asks for
+`--enable-vector --vector-dims=<n>` with the dimensions it was created with.
 
 ## Running queries
 
@@ -95,6 +132,29 @@ You can keep a longer query in a file instead of fighting with shell quoting:
 
 ```bash
 lattice exec social.lattice --file=report.cypher
+```
+
+When a query fails, the error says at which stage it failed, what went wrong and
+where, with a caret under the part of the query it is about, and the command exits
+with status 1:
+
+```bash
+lattice exec social.lattice --query="MATCH (p:Person) RETURN p.name, p.age / 0"
+```
+
+```text
+Error: Execution error (DivisionByZero) at 1:39: Division by zero: 30 / 0
+  1 | MATCH (p:Person) RETURN p.name, p.age / 0
+    |                                       ^
+```
+
+A misspelt function is found before the query runs, whether or not any rows would
+reach it:
+
+```text
+Error: Semantic error (unknown_function) at 1:25: Unknown function 'toUppr'
+  1 | MATCH (p:Person) RETURN toUppr(p.name)
+    |                         ^^^^^^
 ```
 
 ### An interactive shell
@@ -157,28 +217,79 @@ Edge Types:
 Total: 1 label(s), 1 edge type(s)
 ```
 
-`info` describes the file rather than its contents — size, counts, and which features
-it was built with:
+`info` describes the file rather than its contents — size, counts, which features
+it was built with, and which releases can open it. Here for a database
+with a vector index and two [property indexes](../guides/property-indexes.md):
 
 ```bash
-lattice info social.lattice
+lattice info people.lattice
 ```
 
 ```text
-Database: social.lattice
+Database: people.lattice
 ─────────────────────────────
 Size:         68 KB
 Nodes:        2
 Edges:        1
-Format:       v3
+Format:       v5
+Id keys:      big-endian (format 5: scans return ascending ids)
+Min reader:   v5, so 0.18 and earlier cannot open it (ordered property index, changefeed events, ordered id keys)
+Vector:       enabled
+  Dimensions: 384
+  Metric:     cosine
+  M:          16
+  ef_construction: 200
 FTS:          enabled
+Changefeed:   keep all, events 1..10
+Index:        :Person(age)  ordered_dense
+Index:        [:KNOWS](since)  ordered
 ```
+
+`Format` is the format the file was last written in. `Id keys` says how the
+file stores node, edge and document ids as keys: a file created by this
+release has `big-endian` keys, stored in id order; one created by 0.18 or
+earlier keeps `little-endian (created before format 5)` until
+`compact --upgrade-id-keys` converts it, and `info` says so on the next line
+([Upgrading an older file to format 5](#upgrading-an-older-file-to-format-5)).
+
+`Min reader` is the oldest LatticeDB that can open the file, and what keeps
+older ones out. `ordered id keys` is in every file this release creates and
+needs format 5: 0.18 and earlier cannot open it. A file created before format 5
+needs no more than `v4`, which 0.17 and 0.18 open, and says why 0.16.0 cannot:
+`changefeed events`, `ordered property index`, `vector index settings` (a
+metric other than cosine, or an `M` other than 16) or `full-text positions`.
+Storing changefeed events is the usual reason, since the database keeps them
+by default. A file that has none of these says `v3` and still opens in 0.16.0
+([Opening with 0.16.0](../guides/changefeed.md#opening-with-0160)).
+
+`Vector` gives the index's settings, which are fixed when it is created.
+`Changefeed` is the [changefeed](../guides/changefeed.md): the record of every
+change, its retention policy and the events it holds. Here the two people and
+the edge between them, with their labels and properties, took ten events.
+
+Each `Index` line is a property index and how its keys are encoded. An index
+created by LatticeDB 0.16.0 shows `digest`: it answers equality only until
+`compact --upgrade-indexes` rebuilds it.
+
+`--format=json` gives the same as one object, with the reasons as a list and
+the indexes as objects:
+
+```text
+{"path":"people.lattice","size_kb":68,"nodes":2,"edges":1,"format_version":5,"id_keys":"big-endian","vector_enabled":true,"min_reader_version":5,"min_reader_reasons":["ordered property index","changefeed events","ordered id keys"],"vector_dimensions":384,"vector_metric":"cosine","vector_m":16,"vector_ef_construction":200,"fts_enabled":true,"changefeed_retention":"all","changefeed_oldest_sequence":1,"changefeed_last_sequence":10,"property_indexes":[{"entity":"node","scope":"Person","property":"age","encoding":"ordered_dense"},{"entity":"relationship","scope":"KNOWS","property":"since","encoding":"ordered"}]}
+```
+
+`--format=csv` gives `property,value` rows with the same names, the reasons
+joined by `;` (`min_reader_reasons,ordered property index;changefeed events;ordered id keys`)
+and one `property_index` row per index (`property_index,:Person(age)
+ordered_dense`).
 
 ## Moving data in and out
 
 ### Importing
 
-`import` reads JSON or CSV:
+`import` reads JSON, JSONL or CSV, chosen by the file extension. It also reads
+RDF in Turtle (`.ttl`) and N-Triples (`.nt`), which
+[RDF: Turtle and N-Triples](../guides/rdf.md) describes:
 
 ```bash
 lattice import social.lattice --file=people.json
@@ -205,38 +316,144 @@ JSON should have a `nodes` array and an `edges` array:
 }
 ```
 
-CSV needs two files, one for nodes and one for edges. Columns starting with an
-underscore have special meaning; everything else becomes a property:
+In JSON, `id` is a name local to the file: edges refer to nodes by it, and each
+node gets a fresh ID in the database. A node can also carry a `"vector"` array,
+which is stored as its embedding; that needs a database with a vector index. Into a
+database without one, the import stops and asks for `--enable-vector`, which
+creates the index with the dimensions, metric and HNSW settings an exported JSON
+file records in its header; a file without them also needs `--vector-dims=<n>`.
+Files that `export` writes
+also have a `"version"` field and write some values in a tagged form; see
+[Data Export](../guides/data-export.md) for the format.
+
+JSONL is what `export` writes to a `.jsonl` file: one record per line, each a
+node (`"kind":"node"`) or an edge (`"kind":"edge"`), with edges naming nodes
+from earlier lines.
+
+CSV files are read as RFC 4180 describes: a quoted field can hold commas, line
+breaks and doubled quotes (`""`). Columns are found by name in the header. A
+nodes file has an `_id` column, `_labels` with the labels separated by `;`, an
+optional `_vector`, and a column per property:
 
 ```text
 _id,_labels,name,age
-n1,"Person;Employee",Alice,30
+n1,"Person;Employee","Smith, Jr",30
+n2,Person,"Ann ""The Hat"" Lee",41
 ```
+
+An edges file has `_source`, `_target` and `_type`, and a column per property:
 
 ```text
 _source,_target,_type,since
 n1,n2,KNOWS,2020
 ```
 
+A property column holds plain text, read as an integer, a float, or else a
+string. A column named `<key>:json` holds a value in the JSON export encoding
+instead, which is how a list, a map, bytes or a string that looks like a number
+gets through CSV; `export` writes every property column that way.
+
+How an edges file names its nodes depends on how you import it. Give `import`
+the `--file` value an export was given, and it imports `<base>_nodes.csv` and
+`<base>_edges.csv` together, matching `_source` and `_target` against the nodes
+file's `_id` values:
+
+```bash
+lattice import social.lattice --file=people.csv
+```
+
+```text
+Importing people_nodes.csv and people_edges.csv into social.lattice...
+Import complete
+  Nodes imported: 2
+  Edges imported: 1
+```
+
+An edges file imported on its own names nodes by their numeric database IDs, and
+an ID that is not a node in the database is an error.
+
+#### When a record is wrong
+
+Without further options, `import` stops at the first record it cannot import and
+says which one it was and why:
+
+```text
+Error: Import failed at nodes[1]: its "labels" is not an array
+Nothing was imported. Use --on-error=skip to import the records that are valid.
+```
+
+Records are named by where they are: `nodes[1]` and `edges[0]` in JSON, `line 12`
+in JSONL and CSV, `edges file line 4` when a CSV pair is imported together. A
+record is imported whole or not at all: a property that cannot be read or
+stored, a label or property of the wrong JSON type, or an edge whose endpoint
+names no node fails the record.
+
+A CSV file that cannot be read as CSV at all, such as one with a quote that is
+never closed or text after a field's closing quote, stops the import at the line
+where the problem starts:
+
+```text
+Error: Import failed at line 2: a quoted field that starts here has no closing quote
+Nothing was imported. Fix the file and import it again.
+```
+
+`--on-error=skip` cannot skip past such a fault, since the reader cannot tell where
+the next record begins, so it stops the import too, and the message does not
+suggest it.
+
 Two options are worth knowing about for large imports:
 
 | Option | What it does |
 |--------|--------------|
-| `--batch-size=<n>` | Commit every N items instead of all at once (default 1000) |
-| `--on-error=skip` | Skip records that fail instead of giving up on the whole import |
+| `--batch-size=<n>` | Commit every N records (default 1000) |
+| `--on-error=skip` | Leave out records that fail instead of stopping |
 
-`--on-error=skip` applies records one at a time, so the good rows still land. That is
-slower, but it means one bad row in a large file does not cost you the import.
+When an import stops, batches committed before the failing one stay in the
+database, and the message says how many records they held. With
+`--on-error=skip`, each record is committed on its own, so a bad one leaves
+nothing behind, and every record left out is listed (up to 20, then a count):
+
+```text
+Skipped nodes[1]: its "labels" is not an array
+Skipped edges[0]: target "n9" is not the id of any node in the file
+Importing bad.json into bad.lattice...
+Import complete
+  Nodes imported: 1
+  Nodes failed:   1
+  Edges imported: 0
+  Edges failed:   1
+```
+
+Committing record by record is slower, but one bad row in a large file does not
+cost you the import.
 
 ### Exporting
 
-`export` writes JSON, JSONL, CSV, or DOT. It picks the format from the file extension:
+`export` writes JSON, JSONL, CSV, or DOT, or RDF as Turtle or N-Triples. It
+picks the format from the file extension:
 
 ```bash
 lattice export social.lattice --file=backup.json
 lattice export social.lattice --file=graph.jsonl
 lattice export social.lattice --file=people.csv --labels=Person
 lattice export social.lattice --file=graph.dot
+```
+
+JSON, JSONL and CSV exports import back with `import`. Every node gets a new ID
+when they do.
+
+CSV export writes two files named after the one you give:
+`--file=people.csv` produces `people_nodes.csv` and `people_edges.csv`:
+
+```text
+_id,_labels,age:json,name:json
+1,"Person",29,"""Carol"""
+2,"Person",35,"""Dan"""
+```
+
+```text
+_source,_target,_type,since:json
+1,2,KNOWS,2021
 ```
 
 DOT is the format Graphviz reads, so you can turn a small graph into a picture:
@@ -249,8 +466,26 @@ digraph G {
 }
 ```
 
-You can narrow what gets exported with `--labels=Person,Company`, or export the result
-of a query instead of the whole graph with `--query="..."`.
+You can narrow what gets exported in one of two ways. `--labels=Person,Company`
+exports the nodes with any of those labels and the edges between them.
+`--query` exports what a query returns: the nodes and relationships in its rows,
+plus the endpoints of every relationship, so the file imports on its own:
+
+```bash
+lattice export social.lattice --file=knows.json --query="MATCH (a:Person)-[k:KNOWS]->(b:Person) RETURN k"
+```
+
+The query has to return nodes or relationships, not just their properties
+(`RETURN p`, not `RETURN p.name`); otherwise the export fails and says so.
+`--labels` and `--query` cannot be combined.
+
+Node vectors are included whenever the database has a vector index. The one
+exception is a database last written by 0.16.0 whose dimensions cannot be read
+from its vector pages: its export works, with a warning that the vectors are left
+out unless you pass `--enable-vector --vector-dims=<n>`.
+
+An export that fails removes the file it was writing rather than leave a
+partial one behind.
 
 ### Dumping
 
@@ -262,7 +497,10 @@ lattice dump social.lattice > snapshot.json
 
 Because the ordering is fixed, two dumps of the same data produce identical files. That
 makes `dump` useful in tests and for spotting what changed between two databases with a
-plain `diff`.
+plain `diff`. It uses the same format as a JSON export, with each edge's ID added,
+and it takes `--labels`, `--query` and the vector options the same way `export`
+does. The summary line (`Dumped 2 nodes, 1 edges`) goes to standard error, so
+it does not end up in the file.
 
 ## Looking after a database
 
@@ -276,7 +514,8 @@ lattice check social.lattice
 
 ```text
 Database file checks passed
-  Pages checked: 16
+  Pages checked: 15
+  Min reader:    v5, so 0.18 and earlier cannot open it (changefeed events, ordered id keys)
   Note: sibling WAL file exists but was not validated
 ```
 
@@ -324,90 +563,119 @@ open. Neither announces itself at copy time — you find out at restore. Use
 ### Shipping changes somewhere else
 
 A backup taken by hand is only as good as the last time you remembered to take
-one. `replicate` keeps a directory up to date with a database, so a failed disk
-costs you the last few seconds of writes rather than everything since your last
-copy:
+one. `replicate` copies a database into a directory you can restore from later:
 
 ```bash
-lattice replicate social.lattice --to=/mnt/backup/social
+lattice replicate social.lattice --to=social-backup
 ```
 
 ```text
-Started generation 1 for social.lattice in /mnt/backup/social
-  Snapshot bytes:  73728
+Started generation 1 for social.lattice in social-backup
+  Snapshot bytes:  65536
+  Generation:      1
+  Frames shipped:  0
+  Bytes shipped:   0
+  Duration:        4 ms
+```
+
+The first pass starts a **generation**: a full snapshot of the database, which
+later passes extend with the write-ahead log frames written after it. Run it
+again with nothing changed and it ships nothing:
+
+```text
+Nothing new to ship for social.lattice
   Generation:      1
   Frames shipped:  0
   Bytes shipped:   0
   Duration:        2 ms
 ```
 
-The first pass copies the whole database. Every pass after that copies only the
-changes since the last one, which is why running it often is cheap:
+That is normal and not an error: the command exits successfully, so you can put
+it on a timer without filling your logs with things that look like failures.
 
-```text
-Shipped social.lattice to /mnt/backup/social
-  Generation:      1
-  Frames shipped:  5
-  Bytes shipped:   20480
-  Duration:        2 ms
-```
-
-A pass with nothing to ship is normal and is not an error. It tells you so and
-exits successfully, which means you can put this on a timer without your logs
-filling up with things that look like failures.
-
-Add `--follow` to leave it running instead:
+Frames can only be shipped while the log still holds them. A process that writes
+to the database and then closes it, as `lattice exec` or an application does,
+folds the log into the file and resets it, and a reset log starts a new
+generation. So when the writers are separate processes, as they are from the
+command line, every pass after a change takes a fresh snapshot:
 
 ```bash
-lattice replicate social.lattice --to=/mnt/backup/social --follow --interval=30
+lattice exec social.lattice --query="CREATE (:Person {name: 'Carol'})"
+lattice replicate social.lattice --to=social-backup
 ```
-
-Inside the destination you will find a manifest, a snapshot, and the changes
-that have arrived since:
 
 ```text
-/mnt/backup/social/manifest.json
-/mnt/backup/social/gen-0000000001/snapshot.lattice
-/mnt/backup/social/gen-0000000001/frames/0000000012-0000000016.frames
+Started generation 2 for social.lattice in social-backup
+  Snapshot bytes:  65536
+  Generation:      2
+  Frames shipped:  0
+  Bytes shipped:   0
+  Duration:        5 ms
 ```
 
-Every so often LatticeDB folds pending changes into the database file and starts
-the log over. When that happens, replication starts a **generation**: a fresh
-snapshot, followed by the changes that came after it. Older generations are left
-alone, because restoring to a moment inside one still needs them.
+The destination then holds a manifest and one directory per generation:
 
-There is one important limit. This command opens the database, and LatticeDB does
-not lock a database across processes, so you must not point it at a database
-another process has open. If you want to replicate a database while your
-application is using it, call `replicateTo` on the handle your application
-already has, and use this command for the case where nothing else is running.
+```text
+social-backup/manifest.json
+social-backup/gen-0000000001/snapshot.lattice
+social-backup/gen-0000000002/snapshot.lattice
+```
+
+Older generations are left alone, because restoring to a moment inside one still
+needs them. Delete a `gen-` directory to reclaim its space, at the cost of
+restoring to any moment inside it.
+
+Passes that ship frames rather than snapshots come from a process that keeps the
+database open while it writes and replicates through the same handle: the Zig
+API's `replicateTo`. Its log is reset only by a checkpoint (automatically, by
+default once the log reaches an eighth of the page cache, between a thousand
+frames and 64 MB) or when the database closes, and between
+resets each pass copies only the new frames, into a `frames/` directory inside
+the generation. The C API and the
+language bindings do not expose replication.
+
+This command opens the database for writing, so it takes the file lock. It
+cannot run against a database another process has open; it stops with the error
+described under [One process at a time](#one-process-at-a-time). `--follow`
+keeps it running and replicating on an interval:
+
+```bash
+lattice replicate social.lattice --to=social-backup --follow --interval=30
+```
+
+Each pass opens the database and closes it again, so other processes can use
+the database between passes. A pass that finds the database open elsewhere is
+skipped until the next interval; a process that opens the database while a pass
+is running gets the same error and can retry. To replicate a database your
+application keeps open, call `replicateTo` from the application.
 
 ### Getting a database back
 
 `restore` turns a replication directory back into a database:
 
 ```bash
-lattice restore /mnt/backup/social --output=recovered.lattice
+lattice restore social-backup --output=recovered.lattice
 ```
 
 ```text
-Restored /mnt/backup/social to recovered.lattice
-  Generation:      1
-  Segments:        2
-  Frames replayed: 20
-  Bytes written:   73728
-  Restored to:     2026-08-25T22:44:18Z
-  Duration:        468 ms
+Restored social-backup to recovered.lattice
+  Generation:      2
+  Segments:        0
+  Frames replayed: 0
+  Bytes written:   65536
+  Restored to:     2026-11-12T00:17:49Z
+  Duration:        500 ms
 ```
 
-It copies the snapshot, replays the changes shipped after it, and folds the
+It copies the snapshot, replays the frames shipped after it (none here, since
+every pass in this generation came from the command line), and folds the
 result into one file. You can open that file, copy it, or move it, with nothing
 else beside it that has to be kept together with it.
 
 To go back to an earlier moment, say when:
 
 ```bash
-lattice restore /mnt/backup/social --output=recovered.lattice --at="2026-08-25T14:00:00Z"
+lattice restore social-backup --output=recovered.lattice --at="2026-11-12T00:18:00Z"
 ```
 
 Times are read as UTC, so a restore means the same thing wherever you run it. A
@@ -446,8 +714,29 @@ copying a database file, so the copy is complete on its own, and on a database
 that has been open a very long time under heavy writes, if you want to pick the
 moment the flush happens rather than let it land mid-request.
 
+How often a command's commits checkpoint is set with `--auto-checkpoint=<frames>`
+on any command that writes: a checkpoint runs once the log holds that many frames
+(one per page written), and `0` means none while the command runs, though closing
+still folds the log into the file. Without the option the
+`LATTICE_AUTO_CHECKPOINT_FRAMES` environment variable decides, else the log may
+grow to an eighth of the page cache, between 1000 frames and 64 MB: 2048 frames
+with the default 64 MB cache, 16,384 with `--cache-size=512` or more:
+
+```bash
+lattice import social.lattice --file=people.jsonl --auto-checkpoint=0
+```
+
 This is not the same as `compact`. Checkpointing shrinks the log, not the
 database file.
+
+After a crash nothing has to be run first. The commands that only read
+(`info`, `count`, `labels`, `types`, `schema`, `export` and `dump`) open the file
+read-only and recover it in memory, so they show every committed transaction
+without changing the files; the first command that writes recovers the files
+themselves. `check` reads the database file's pages rather than the log, but it
+too finishes a flush the crash interrupted, in memory from the journal, before it
+checks, and adds a note saying so; the files stay as they were until a writing
+command finishes the flush on disk.
 
 ### Reclaiming space
 
@@ -461,8 +750,8 @@ lattice compact social.lattice
 
 ```text
 Compacted database: social.lattice
-  Pages before:    17
-  Pages after:     17
+  Pages before:    16
+  Pages after:     16
   Pages removed:   0
   Bytes reclaimed: 0
 ```
@@ -475,6 +764,182 @@ knowing before you run it on real data:
   shrink much.
 - Live pages are never moved, which is what makes it safe to interrupt.
 - It will refuse to run on a read-only database, or while any transaction is open.
+
+With `--upgrade-indexes` it first rebuilds every property index still in an older
+encoding, so that one created by 0.16.0 answers ranges and sorting too, and
+reports how many it rebuilt as `Indexes rebuilt:`.
+
+### Upgrading an older file to format 5
+
+A file created by 0.18 or earlier stores its ids little-endian (`lattice info`
+says `Id keys: little-endian`). It keeps working as it is: this release reads and
+writes it in that layout, and you never have to upgrade it
+([Upgrading to Format 5](../guides/upgrading-to-format-5.md) has which release
+opens which file, and when upgrading is worth it). Upgrading gives it the
+format-5 layout, where ids are stored in order, so scans return ascending ids and
+the id trees are full. `--upgrade-id-keys` does it, and it asks before it does.
+Run it first without `--apply`:
+
+```bash
+lattice compact social.lattice --upgrade-id-keys
+```
+
+```text
+social.lattice has not been changed. Upgrading it to format 5 needs --apply.
+
+Before you go ahead:
+  - It cannot be undone. LatticeDB 0.18 and earlier cannot open the
+    upgraded file.
+  - Replication starts over. The upgraded file gets a new id, so a
+    directory 'lattice replicate' already writes to will refuse it.
+    Replicate to a new, empty directory afterwards. The old directory
+    still restores the database as it was before the upgrade.
+  - It needs room on disk for a second copy of the database (about
+    2 MB), and no other program may have the database open.
+
+Are you sure? To continue, run the command again with --apply:
+  lattice compact social.lattice --upgrade-id-keys --apply
+```
+
+That run opens the database read-only, changes nothing, and exits with status 1,
+so a script that forgot `--apply` does not carry on as if the file were upgraded.
+The notice goes to standard error in every output format. `--apply` is what does
+the upgrade:
+
+```bash
+lattice compact social.lattice --upgrade-id-keys --apply
+```
+
+```text
+Upgraded the id keys of social.lattice to big-endian (format 5)
+  This is one-way: 0.18 and earlier can no longer open this file.
+  node tree: 299 entries, 35 pages before, 34 after
+  edge id index: 399 entries, 7 pages before, 6 after
+  full-text document lengths: 602 entries, 7 pages before, 5 after
+  full-text reverse index: 598 entries, 9 pages before, 7 after
+  vector index node tree: 300 entries, 5 pages before, 4 after
+  Entries checked: 2198
+  Pages checked unchanged: 402
+  Size before:     1908736 bytes
+  Size upgraded:   2023424 bytes
+  63 pages freed for reuse; the file shrinks only if they are at its end.
+  The file has a new id: replicate it to a new directory, not an old one.
+Compacted database: social.lattice
+  Pages before:    494
+  Pages after:     494
+  Pages removed:   0
+  Bytes reclaimed: 0
+```
+
+**It is one-way.** The upgraded file needs a format-5 reader, so 0.18 and earlier
+refuse it. There is no command to go back. Keep a backup if an older release still
+has to open the data.
+
+The original is not touched until a converted copy has passed every check. With
+`--apply`, the command:
+
+1. Opens the database, which locks it, and keeps it locked to the end. A second
+   `compact --upgrade-id-keys --apply` on the same file stops here, without touching
+   the first one's copy.
+2. Copies the database to `<path>.upgrade-id-keys` beside it, the way `backup` does.
+3. Rewrites the five trees keyed by id in the copy: the node tree, the edge-ID index,
+   the full-text document lengths and reverse index, and the vector index's node
+   tree. Each one is read whole, its keys turned around, and written again in order.
+4. Opens the copy the normal way and compares it with the original: every node's
+   labels and properties, every edge's ends, type and properties, the next node and
+   edge ids, every full-text and vector entry, and the number of entries in each
+   tree. Every page the conversion had no reason to change (vector data, full-text
+   postings, the label and property indexes, the changefeed and the other trees) must
+   be byte for byte the same as in the original. It also reads every page back with
+   its checksum, and checks that no page belongs to two trees, or to a tree and the
+   free list.
+5. Closes the original, keeping its file locked, checks its log is empty, and renames
+   the copy over it. On Linux and macOS the lock is held through the rename, so no
+   other process can open the database at any point. On Windows a file cannot be
+   renamed over while it is open, so the lock is let go just before the rename.
+
+If any step fails, the copy is deleted and the original is left as it was. If the
+command is stopped part way, the path holds either the whole original or the whole
+upgraded file, and running it again finishes the job. It refuses while another
+process has the database open.
+
+Stop the programs that use the database before you upgrade it. One that has it
+open keeps the upgrade from starting, and one that tries to open it during the
+upgrade is told the database is locked.
+
+**What it needs.** Memory: the conversion holds every key of the tree it is working
+on at once, 13 bytes per entry, so the largest tree decides: about 1.3 GB for a
+database with 100 million edges, on top of the page cache. Disk: room beside the
+database for a second copy of it, plus the growth described below. Running out of
+either fails like any other step, with the copy deleted and the original untouched.
+
+**The file gets a new id.** A [replication](../guides/backup-and-replication.md)
+directory made before the upgrade then refuses the upgraded file: `replicate` says
+the directory "already holds backups of a different database". Start a new
+directory after upgrading. The old one still restores the database as it was before
+the upgrade, so keep it as long as you might need that. The new id is deliberate:
+a log or journal left over from the old file carries the old id, and the database
+refuses to apply it to the new file rather than write old pages into it.
+
+The upgraded file is usually a little **larger**, not smaller: the new trees are
+written into new pages, and the old trees' pages go on the free list in the middle
+of the file, where `compact` cannot cut them off (`63 pages freed for reuse`, above).
+Those pages are reused as the database grows. Measured on files created by 0.18.1:
+
+| Database | Before | After | Time | Peak memory |
+|----------|--------|-------|------|-------------|
+| 1,000,000 nodes, 2,000,000 edges | 524 MB | 576 MB (+10%) | 13 to 30 s on a busy laptop | 255 MB |
+| 70,000 nodes, 150,000 edges, two full-text indexes, 23,000 vectors | 125 MB | 133 MB (+6%) | 1 s | |
+
+The second file shows the reuse. After the upgrade, 20,000 nodes, 40,000 edges and
+10,000 vectors were added to it and to a copy that was not upgraded. The upgraded
+file stayed at 133 MB, taking the new data into its freed pages. The other grew
+from 125 MB to 153 MB.
+
+With a file that is already format 5 the command says `Id keys are already
+big-endian (format 5); nothing to upgrade.` and just compacts, with or without
+`--apply`: there is nothing left to agree to. It can be combined with
+`--upgrade-indexes`. `--apply` without `--upgrade-id-keys` is an error.
+
+### Keeping the changefeed in check
+
+Every change to the graph is recorded as an event in the changefeed, and by
+default every event is kept, so a database that is edited a lot grows with its
+history. `changefeed` shows how much there is and how much the file keeps:
+
+```bash
+lattice changefeed social.lattice
+```
+
+```text
+Changefeed of social.lattice
+  Retention:      all
+  Events held:    10
+  Bytes:          136
+  Sequences:      1..10
+```
+
+`--changefeed=<policy>` sets how much to keep: `all`, `off`, `last:<events>`,
+or `age:<duration>` such as `age:30d`. The file records it, and old events are
+dropped as the database checkpoints; `--trim` drops them now:
+
+```bash
+lattice changefeed social.lattice --changefeed=last:2 --trim
+```
+
+```text
+Changefeed of social.lattice
+  Retention:      last:2
+  Events held:    2
+  Bytes:          32
+  Sequences:      9..10
+  Trimmed:        8 events
+```
+
+Every command that writes takes `--changefeed` too, so
+`lattice create big.lattice --changefeed=off` makes a database that keeps no
+history at all. [The Changefeed](../guides/changefeed.md) explains what the
+history is for and how to choose.
 
 ### Updating
 
@@ -520,6 +985,24 @@ filesystems where locking does not work, such as some network filesystems. It
 does not make concurrent access safe — it removes the thing that was going to
 tell you it was not.
 
+## Files from a newer release
+
+A database file can say that releases older than some version may read it but not
+write it. A command that writes stops on such a file and names the ones that
+still work:
+
+```text
+Error: future.lattice was written by a newer LatticeDB that does not let this version write to it. info, count, labels, types, schema, export, dump, backup, query and exec (for statements that only read) still read it; use that newer version for anything else.
+```
+
+`exec` opens the database read-only for a statement that cannot write, and
+`backup` always does, so both work on such a file; `query` opens it read-only
+with a notice. The commands that write, `import`, `compact`, `checkpoint` and an
+`exec` of a writing statement, are refused.
+
+A file whose header asks for a newer *reader* than this release is refused by
+every command, with a message saying a newer LatticeDB wrote it.
+
 ## Output formats
 
 Most commands can print in a different format, which is what you want when something
@@ -538,11 +1021,33 @@ labels,1
 edge_types,1
 ```
 
-`table` is the default and is meant for reading. `json` and `csv` are meant for piping
-somewhere else:
+`table` is the default and is meant for reading. It prints floats with six
+decimals, and in the shortest scientific form that reads back as the same number
+when they are 1e16 or more, or below 1e-6, in size (`1e300`, `1e-300`), so a very
+small number never shows as `0.000000`. `json` and `csv` are meant for piping
+somewhere else, and print floats in full, as plain decimals. A float that is not
+a number or is infinite is written `NaN`, `Infinity` or `-Infinity`: as strings
+in JSON (`"NaN"`, also inside lists and maps), since JSON has no number for
+them, and as the bare words in CSV and in a table. These are the spellings
+`toFloat()` reads back. A query's JSON is for display, not a typed format: a
+float such as `2.0` prints as `2`; [exports](../guides/data-export.md) keep
+types.
 
 ```bash
 lattice exec social.lattice --query="MATCH (p:Person) RETURN p.name" --format=json | jq
+```
+
+A query's CSV follows RFC 4180, with one line per row ending in a newline: a
+column name or value that holds a comma, a quote or a line break is put in
+quotes, with each quote inside doubled. A list or map is written as its JSON, in
+quotes, so `{k: 'v'}` becomes `"{""k"":""v""}"`. A query without `RETURN` prints
+nothing in CSV, an empty `columns` list in JSON and "Query executed" in a table.
+
+Output redirected to a file can be appended to with `>>`, for example to keep a
+log of counts taken over time:
+
+```bash
+lattice count social.lattice --format=csv >> counts.csv
 ```
 
 ## Every command at a glance
@@ -550,17 +1055,18 @@ lattice exec social.lattice --query="MATCH (p:Person) RETURN p.name" --format=js
 | Command | What it does |
 |---------|--------------|
 | `create <path>` | Make a new database |
-| `info <path>` | Show file size, counts, and enabled features |
-| `compact <path>` | Give free pages at the end of the file back to the OS |
+| `info <path>` | Show file size, counts, features, indexes, and which releases can open it |
+| `compact <path>` | Give free pages at the end of the file back to the OS; `--upgrade-id-keys --apply` converts an older file to format 5 |
 | `checkpoint <path>` | Flush pending writes into the file and reset the log |
+| `changefeed <path>` | Show the changefeed, set how much of it to keep, trim it |
 | `backup <path>` | Copy to another file while the database stays open |
 | `replicate <path>` | Keep a directory up to date with the database |
 | `restore <dir>` | Rebuild a database from a replication directory |
 | `check <path>` | Verify page checksums in the main file |
 | `query <path>` | Open an interactive Cypher shell |
 | `exec <path>` | Run one query and exit |
-| `import <path>` | Load data from JSON or CSV |
-| `export <path>` | Write data to JSON, JSONL, CSV, or DOT |
+| `import <path>` | Load data from JSON, JSONL, CSV, Turtle or N-Triples |
+| `export <path>` | Write data to JSON, JSONL, CSV, DOT, Turtle or N-Triples |
 | `dump <path>` | Print the whole database as canonical JSON |
 | `labels <path>` | List node labels and their counts |
 | `types <path>` | List edge types and their counts |

@@ -8,7 +8,7 @@ If you are looking for a Neo4j alternative, the first question is not performanc
 
 Neo4j runs as a service. Your application opens a Bolt connection, sends a query, and receives a result set over the network. That indirection buys you multi-client access, independent scaling, clustering, and an operational surface you can monitor and back up with standard tools.
 
-LatticeDB runs inside your process. There is no connection, no serialisation, no network hop, and no second thing to deploy. A query is a function call against memory-mapped pages. The database is one file you can copy, ship, or delete.
+LatticeDB runs inside your process. There is no connection, no serialisation, no network hop, and no second thing to deploy. A query is a function call against pages cached in your own process. The database is one file you can copy, ship, or delete.
 
 Neo4j does offer an embedded mode, but it is JVM-only — you embed it in a Java or Kotlin application. If your application is Python, TypeScript, Rust, Go, or C, embedded Neo4j is not available to you and the server is the only option.
 
@@ -16,7 +16,7 @@ Neo4j does offer an embedded mode, but it is JVM-only — you embed it in a Java
 
 This is the important section, and [When to Use LatticeDB](../getting-started/when-to-use.md) says it plainly. Summarised:
 
-**Full Cypher.** LatticeDB implements a substantial subset. `OPTIONAL MATCH` and `CALL` procedures are not implemented. If your queries depend on them, Neo4j is the complete implementation and LatticeDB will simply fail to run your workload.
+**Full Cypher.** LatticeDB implements a substantial subset, including `OPTIONAL MATCH`, `UNION`, `CASE`, `CALL { }` subqueries and `shortestPath`. Quantified path patterns, `LOAD CSV`, user-defined and APOC procedures, temporal and spatial types, and schema statements are not implemented. If your queries depend on them, Neo4j is the complete implementation and LatticeDB will refuse those queries.
 
 **Multi-client access.** LatticeDB is single-writer, single-process. One process opens the file and owns it. If several applications need to write concurrently over a network, you need a server, and that server is Neo4j or Postgres.
 
@@ -30,7 +30,7 @@ This is the important section, and [When to Use LatticeDB](../getting-started/wh
 
 **No server.** No process to deploy, secure, monitor, upgrade, or pay for. For a desktop application, a CLI tool, an edge deployment, a notebook, or a test suite, this is often the entire argument.
 
-**No network hop.** Published Neo4j point-lookup figures sit around 28 ms at p99 in a third-party comparison; LatticeDB measures 0.13 us on its own benchmark. Most of that gap is the network and serialisation, not the storage engine — which is exactly the point of embedding, but it also means the comparison is measuring architecture rather than engineering. See [how to read the numbers](./overview.md#how-to-read-the-numbers).
+**No network hop.** A third-party comparison put Neo4j point lookups around 28 ms at p99; a Cypher lookup by an indexed property in LatticeDB, in process, takes about 2.3 us ([Benchmarks](../performance/benchmarks.md#point-lookups)). Most of that gap is the network and serialisation, not the storage engine — which is exactly the point of embedding, but it also means the comparison is measuring architecture rather than engineering, and the two figures come from different machines and methods. See [how to read the numbers](./overview.md#how-to-read-the-numbers).
 
 **Vector and text search in the same engine.** Neo4j does vector indexes and Lucene-backed full-text, but LatticeDB was designed around combining them with traversal in one query rather than adding them alongside it.
 
@@ -43,7 +43,7 @@ This is the important section, and [When to Use LatticeDB](../getting-started/wh
 | | LatticeDB | Neo4j |
 |---|---|---|
 | Deployment | Library, in-process | Server (JVM embedded available) |
-| Languages | C, Python, TypeScript | Drivers for everything; embedded is JVM-only |
+| Languages | C, Python, TypeScript, Go, Java | Drivers for everything; embedded is JVM-only |
 | Cypher | Subset | Complete, plus procedures |
 | Concurrency | Single writer, single process | Many clients |
 | Clustering | No | Yes |

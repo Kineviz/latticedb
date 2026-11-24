@@ -32,8 +32,11 @@
 - [Working with Embeddings](./guides/embeddings.md)
 - [Full-Text Search](./guides/full-text-search.md)
 - [Migrating to Per-Property FTS](./guides/migrating-to-per-property-fts.md)
+- [Upgrading to Format 5](./guides/upgrading-to-format-5.md)
 - [Durable Streams](./guides/durable-streams.md)
+- [The Changefeed](./guides/changefeed.md)
 - [Data Export](./guides/data-export.md)
+- [RDF: Turtle and N-Triples](./guides/rdf.md)
 - [Transactions and Durability](./guides/transactions.md)
 - [Backup and Replication](./guides/backup-and-replication.md)
 - [Property Indexes](./guides/property-indexes.md)
@@ -62,6 +65,7 @@
 - [Python](./api/python.md)
 - [TypeScript / Node.js](./api/typescript.md)
 - [Go](./api/go.md)
+- [Java](./api/java.md)
 
 # Architecture
 

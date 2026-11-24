@@ -1,14 +1,21 @@
-//! Query plan cache for Lattice database.
+//! Query cache for Lattice database.
 //!
 //! Caches parsed ASTs and semantic analysis results to eliminate re-parsing
-//! for repeated queries. Parameters are resolved at execution time, so the
-//! same cached parse tree works for different parameter values.
+//! for repeated queries. It does not cache plans: every execution plans the
+//! query again, against the indexes and symbols the database has then.
+//! Parameters are resolved at execution time, so the same cached parse tree
+//! works for different parameter values.
 //!
 //! Design:
 //! - Cache key: raw query text bytes, hashed with Wyhash
 //! - Eviction: LRU, configurable max entries (default 128)
 //! - Thread safety: RwLatch (shared for lookups, exclusive for inserts)
-//! - Invalidation: Schema version counter, bumped on label/edge-type mutations
+//! - Invalidation: Schema version counter, bumped when an index is created or
+//!   dropped. Data writes leave entries alone: an entry holds only the AST and
+//!   the variable bindings, which come from the query text and never from
+//!   the graph. Labels, types and property names are looked up when each
+//!   execution plans the query, so a write that creates a new one is seen by
+//!   the next execution of a cached query.
 //! - Pinning: ref_count prevents eviction during execution
 
 const std = @import("std");

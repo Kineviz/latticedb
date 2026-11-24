@@ -22,6 +22,8 @@ from latticedb.types import (
     VectorSearchResult,
     FtsSearchResult,
     StreamRecord,
+    ChangefeedStatus,
+    CheckpointStats,
 )
 from latticedb.embedding import (
     hash_embed as _hash_embed,
@@ -33,10 +35,14 @@ from latticedb._bindings import (
     LatticeIOError,
     LatticeCorruptionError,
     LatticeNotFoundError,
+    LatticeChangesTrimmedError,
     LatticeAlreadyExistsError,
     LatticeInvalidArgError,
     LatticeTxnAbortedError,
     LatticeDatabaseLockedError,
+    LatticeHasRelationshipsError,
+    LatticeConfigMismatchError,
+    LatticeNeedsNewerWriterError,
     LatticeLockTimeoutError,
     LatticeReadOnlyError,
     LatticeFullError,
@@ -63,7 +69,7 @@ def version() -> str:
         return cast(str, result.decode("utf-8"))
     return __version__
 
-__version__ = "0.15.0"
+__version__ = "0.18.1"
 
 # Deprecated compatibility alias for latticedb.embedding.EmbeddingApiFormat.
 EmbeddingApiFormat = _EmbeddingApiFormat
@@ -72,7 +78,7 @@ EmbeddingApiFormat = _EmbeddingApiFormat
 def hash_embed(text: str, dimensions: int = 128) -> np.ndarray:
     """Deprecated compatibility wrapper for :func:`latticedb.embedding.hash_embed`."""
     warnings.warn(
-        "latticedb.hash_embed is deprecated; use latticedb.embedding.hash_embed. Earliest removal is v0.6.0.",
+        "latticedb.hash_embed is deprecated; use latticedb.embedding.hash_embed.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -84,7 +90,7 @@ class EmbeddingClient(_EmbeddingClient):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         warnings.warn(
-            "latticedb.EmbeddingClient is deprecated; use latticedb.embedding.EmbeddingClient. Earliest removal is v0.6.0.",
+            "latticedb.EmbeddingClient is deprecated; use latticedb.embedding.EmbeddingClient.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -102,16 +108,22 @@ __all__ = [
     "VectorSearchResult",
     "FtsSearchResult",
     "StreamRecord",
+    "ChangefeedStatus",
+    "CheckpointStats",
     # Exceptions
     "LatticeError",
     "LatticeIOError",
     "LatticeCorruptionError",
     "LatticeNotFoundError",
+    "LatticeChangesTrimmedError",
     "LatticeAlreadyExistsError",
     "LatticeInvalidArgError",
     "LatticeTxnAbortedError",
     "deserialize",
     "LatticeDatabaseLockedError",
+    "LatticeHasRelationshipsError",
+    "LatticeConfigMismatchError",
+    "LatticeNeedsNewerWriterError",
     "LatticeLockTimeoutError",
     "LatticeReadOnlyError",
     "LatticeFullError",

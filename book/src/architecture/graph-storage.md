@@ -27,7 +27,11 @@ How do you store a graph in a B+Tree (which is fundamentally a key-value store)?
 The key insight: **decompose the graph into multiple B+Trees, each optimized for a specific access pattern.**
 
 <img class="diagram" src="../assets/diagrams/graph-storage-btrees.svg"
-     alt="The graph storage layer decomposed into four B+Trees: SYMBOLS mapping strings to ids and back, NODES mapping node id to node data, EDGES keyed by a composite key, and LABEL_INDEX mapping a label and node pair to an empty value">
+     alt="The graph storage layer decomposed into six B+Trees: SYMBOLS mapping strings to ids, SYMBOLS_REVERSE mapping ids back to strings, NODES mapping node id to node data, EDGES holding traversal keys with empty values, EDGE_ID mapping an edge id to the edge payload, and LABEL_INDEX mapping a label and node pair to an empty value">
+
+The core graph uses these six trees. The database keeps further trees beside
+them for property indexes, full-text search, vectors and streams; the
+[Summary](#summary) lists the graph-related ones.
 
 ## String Interning (Symbol Table)
 
@@ -59,6 +63,11 @@ Symbol IDs are u16 (0-65535):
 - 1-999: Reserved for system use
 - 1000-65535: User-defined symbols
 
+The next ID to hand out is found when the database opens, by scanning the
+reverse tree for the highest one in use. If that scan fails when an existing
+database is opened for writing, the open fails: starting again at 1000 would give
+a new name the ID of an existing one, and the two names would become one.
+
 ### API
 
 ```zig
@@ -83,9 +92,114 @@ Nodes are stored in a B+Tree with simple u64 keys:
 
 ```
 NODES B+Tree:
-  Key: node_id (u64, little-endian)
+  Key: node_id (u64, big-endian in a format-5 file, little-endian in an older one)
   Value: NodeData (serialized)
 ```
+
+### Id Key Order
+
+The B+Tree compares keys byte by byte. Until format 5 the node tree, the
+edge-ID index, the full-text document trees and the vector index's node tree
+all wrote their u64 ids little-endian, lowest byte first. That made byte order
+and id order disagree: id 256 is `00 01 00 …` and sorts between 0 and 1. Ids
+are handed out in sequence, so each new one landed in a different leaf rather
+than at the right edge of the tree. A load of 1,000,000 nodes and 2,000,000
+relationships left the node tree 73% full and the edge-ID index 69% full, and
+every insert dirtied a different page.
+
+Format 5 writes those ids **big-endian**. Byte order is now id order, new ids
+append at the right edge, and the B+Tree's in-order split keeps the leaves
+full. On the same load the two trees ended 99% full (node tree 70.6 → 51.9 MB,
+edge-ID index 100 → 69 MB). Measured with that change alone, before the
+others in the same release, the default load went from about 35 s to 27 s and a
+load without the log from 8 s to 6.3 s.
+
+The order is a property of the file, chosen when it is created. A file
+created in format 5 sets `FileFlags.ORDERED_ID_KEYS` in its header and
+requires a format-5 reader (`min_reader_version` 5), so 0.17 and 0.18, which
+would decode every id wrongly, refuse it. A file created earlier keeps its
+little-endian keys: opening it converts nothing, every read and write on it
+uses the old order, and it stays open to 0.17 and 0.18. The database reads the
+order from the header once at open (`Database.id_key_order`) and hands it to
+the node store, the edge store, the full-text index and the vector index;
+`src/core/id_key.zig` does the encoding. `DatabaseConfig.new_database_id_keys
+= .little` creates a new file in the old layout, for a file that 0.18 has to
+read.
+
+#### Upgrading an older file
+
+`lattice compact --upgrade-id-keys --apply` converts a little-endian file, one-way
+(`Database.upgradeIdKeysTo` in `src/storage/id_key_upgrade.zig`). It never
+works on the file itself. It copies the database with `backup`, converts the
+copy, checks the copy against the original, which is still open, and only then
+renames the copy over it.
+
+The conversion opens the copy below the `Database`, with a page manager and a
+buffer pool and no log: the copy is disposable, so a crash there only means
+starting again. It converts the five trees one at a time, smallest first. For
+each it collects every key, works out the new key, sorts, and inserts into an
+empty tree in that order, fetching each value from the old tree by its old key.
+Sorted inserts fill the leaves, as new ids do in a format-5 file. Then it frees
+every page of the old tree and records the new root. Only when all five are
+done does it set `ORDERED_ID_KEYS`, raise the minimum reader version to 5, give
+the file a new `file_uuid`, and sync. A copy that stops half way is still
+little-endian in its header, and it is deleted anyway.
+
+Not every key in these trees is a bare id, so the converter checks the shape of
+each one and refuses a key it does not recognise:
+
+| Tree | Keys | Converted |
+|------|------|-----------|
+| Node tree | 8-byte node id | id |
+| Edge-ID index | 8-byte edge id; id 0 holds `next_edge_id` (`EDGE_ID_META_KEY`) | id (0 is all zero bytes either way) |
+| Full-text lengths | `[scope:4][doc_id:8]`, an unscoped `[doc_id:8]`, the statistics keys `\x00stats` and `\x00anlyz` (6 bytes, `STATS_KEY` and `ANALYSIS_KEY`), and the same two behind a scope (10 bytes) | the id after the scope; the statistics keys are kept as they are |
+| Full-text reverse index | `[scope:4][doc_id:8]`, or `[doc_id:8]` | the id after the scope |
+| Vector index node tree | 8-byte node id; `0xFF × 8` holds the index metadata (`METADATA_KEY`) | id; the metadata key is kept |
+
+The scope is the four-byte prefix `ScopedTree` puts in front of a key; it is
+not an id and stays as it is. Values are not touched: they were little-endian
+in every format.
+
+Freeing the old pages is the step that could lose data if it went wrong, so it
+is checked from two sides. Before converting, the converter walks every page of
+every tree in the header (internal, leaf and overflow pages, through
+`BTree.forEachPage`) and the free list, and records an owner for each page; a
+page found twice stops it. It frees a page of an old tree only if that walk
+recorded the page as that tree's, so pages that are not B-tree pages at all
+(full-text postings, vector data, HNSW connections) can never be freed. After
+the conversion it walks everything again: every page must be the header, in
+exactly one tree, or free. Verification repeats that walk on the copy as it was
+reopened, reads every page back with its checksum, and compares it with the
+original through the stores. It also compares, byte for byte, every page that
+the first walk gave to nothing (vector data, neighbour lists, postings) or to a
+tree other than the five: those must be exactly as in the original's file, which
+`backup` left quiesced. Only the header, the five trees' pages and pages that
+were free may differ. Any difference deletes the copy. The integration
+test then fills every freed page with new data and compares again, because a
+page freed while still in use would show only once it was reused.
+
+The conversion holds every key of the tree it is converting in memory at once,
+13 bytes each (a length byte and up to 12 key bytes), allocated once at the size
+the tree reports; the largest tree decides how much.
+
+The CLI keeps the original locked throughout: it opens the database, upgrades,
+checkpoints, and closes it with `Database.closeKeepingLock`, which does
+everything `close` does but hands back the file still open and locked.
+`id_key_upgrade.replaceWithUpgraded` takes that file, checks the log and journal
+are empty, deletes them, and renames the copy over the original while the lock
+is still held, then lets go. On Windows a file that is open cannot be renamed
+over, so the lock is released just before the rename.
+
+The converted file is usually somewhat larger than the original. The new trees
+go into new pages at the end of the file, and the old trees' pages become free
+pages in the middle, which `compact` cannot cut off. They are reused as the
+database grows.
+
+Only the keys changed. Values (the edge payload, the next edge id, document
+lengths, the vector index's node entries) are little-endian in every format.
+The symbol table's u16 ids are little-endian keys too, and stay so in format 5:
+the table holds at most 65,535 entries and is walked whole on open, so their
+order costs nothing.
 
 ### NodeData Format
 
@@ -143,8 +257,8 @@ const node_id = try store.create(&labels, &properties);
 var node = try store.get(node_id);
 defer node.deinit(allocator);
 
-// Check existence
-if (store.exists(node_id)) { ... }
+// Check existence (can fail with an I/O error, so it needs `try`)
+if (try store.exists(node_id)) { ... }
 
 // Update a node
 try store.update(node_id, &new_labels, &new_properties);
@@ -152,6 +266,33 @@ try store.update(node_id, &new_labels, &new_properties);
 // Delete a node
 try store.delete(node_id);
 ```
+
+### Node ids
+
+Node ids come from a counter that never goes down. The database keeps it in the
+file header and writes it with every flush, in the same header image as the node
+tree pages it describes, so opening a database reads it rather than scanning the
+node tree, and the id of a committed node is never handed out again, even after the
+node is deleted. Ids handed out by a transaction that rolled back, or that had not
+committed when the process died, can be handed out again. A file last written by
+0.16.0 has no stored counter; the first read-write open finds the highest id with
+one scan and stores the counter from then on. If that scan fails, the open fails
+rather than start the ids again at 1.
+
+### Deleting a node that has relationships
+
+`NodeStore.delete` removes the node record only. The rule that a node with
+relationships cannot be deleted lives one level up, in the database:
+`Database.deleteNode` (C `lattice_node_delete`) refuses a node that has any
+relationship the transaction can see, its own uncommitted ones included, with
+`NodeHasRelationships` (`LATTICE_ERROR_HAS_RELATIONSHIPS`), and
+`detachDeleteNode` (`lattice_node_detach_delete`) deletes the relationships with
+the node. Cypher's `DELETE` and `DETACH DELETE` go through the same two calls. The
+check is one range probe over the node's edge keys, plus a look at the node's own
+pending edges in the transaction. Creating an edge likewise checks that both its
+ends exist as the transaction sees them, a key probe each, and fails with
+`NotFound` (`LATTICE_ERROR_NOT_FOUND`) otherwise. So no committed edge points at a
+node that does not exist.
 
 ## Edge Storage
 
@@ -183,6 +324,56 @@ Payload entry:
 This keeps traversal efficient in either direction without duplicating large
 edge properties. The stable `edge_id` lets callers update properties by ID and
 lets the storage layer restore or delete the exact edge during WAL recovery.
+
+Because the traversal keys carry no payload, changing an edge's properties
+rewrites only its payload entry (`EdgeStore.replaceProperties`, one B+Tree
+`replace`); the traversal keys are left alone. That is so on commit, for direct
+writes, for an undo and for a replayed log record. Setting one property on each
+of 20,000 edges in one transaction went from about 6.6 µs to 3.6 µs an edge,
+commit included.
+
+An edge is created as those three entries together, with one exception. A commit
+that creates 64 or more edges inserts the traversal keys of all of them first, in
+key order, and the payload entries after, so that each page of the traversal tree
+is changed once instead of once per edge that touches it (see
+[the order of a commit](./transaction-manager.md#3-commit)). If that commit is
+interrupted, the file can hold traversal keys whose payload entry is missing;
+[recovery](./recovery.md#replaying-twice-is-safe) adds whatever an edge lacks.
+The traversal keys of a relationship between two nodes land near those nodes'
+other relationships, which are anywhere in the tree, so a load that creates
+relationships between arbitrary nodes gets faster the more of them one
+transaction holds: see [Bulk loading](../configuration/durability.md#bulk-loading).
+
+### Edge-ID Index
+
+The edge-ID tree is a separate B+Tree from the traversal tree. Its keys are u64
+edge IDs in the file's id key order (see [Id Key Order](#id-key-order)):
+big-endian in a format-5 file, so a walk of the whole tree comes back in
+ascending ID order; little-endian in a file created earlier, where the walk is
+in a stable order that is not numeric (edge 256 before edge 2). Lookups are by
+exact ID in either.
+
+| Key | Value |
+|-----|-------|
+| `0` (`EDGE_ID_META_KEY`, all zero bytes in either order) | `next_edge_id: u64`, little-endian |
+| `edge_id` (≥ 1) | Edge payload, see below |
+
+Key 0 is reserved: it stores the next edge ID to hand out, so IDs survive a
+reopen and are never reused. Edge IDs therefore start at 1. If the metadata
+entry is missing, the store derives it from the largest edge ID in the tree and
+writes it back. If the tree cannot be read when an existing database is opened
+for writing, the open fails rather than counting from 1 again, which would hand
+out the IDs of existing edges.
+
+**Edge payload** (all integers little-endian)
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `source` | u64 | Source node id |
+| `target` | u64 | Target node id |
+| `edge_type` | u16 | Interned edge type |
+| `num_properties` | u16 | |
+| `properties` | `PropertyEntry` × `num_properties` | Same encoding as node properties |
 
 ### Key Format
 
@@ -242,7 +433,7 @@ const properties = [_]Property{
 };
 const edge_id = try store.createAndGetId(alice_id, bob_id, knows_id, &properties);
 
-// Get an edge
+// Get an edge (the lowest edge ID among parallel edges; use getById for an exact edge)
 var edge = try store.get(alice_id, bob_id, knows_id);
 defer edge.deinit(allocator);
 
@@ -255,7 +446,8 @@ try store.delete(alice_id, bob_id, knows_id);
 // Iterate all outgoing edges from a node
 var iter = try store.getOutgoing(alice_id);
 defer iter.deinit();
-while (try iter.next()) |edge| {
+while (try iter.next()) |e| {
+    var edge = e; // deinit needs a mutable Edge
     defer edge.deinit(allocator);
     // Process edge...
 }
@@ -276,6 +468,22 @@ const in_count = try store.countIncoming(bob_id);
 try db.setEdgePropertyById(null, edge_id, "since", .{ .int_val = 2020 });
 ```
 
+The C API exposes typed traversal with a caller-provided limit:
+
+```c
+lattice_edge_get_outgoing_by_type(txn, alice_id, "KNOWS", 100, &edges);
+lattice_edge_get_incoming_by_type(txn, bob_id, "KNOWS", 100, &edges);
+```
+
+For these APIs, `limit == 0` means unlimited. The limit is applied while
+collecting visible edge references, before edge type strings are materialized
+for the result handle.
+
+`lattice_edge_scan(txn, edge_type_or_null, limit, &edges)` walks native edge
+identities once via the edge-ID index. It is intended for administrative work
+such as index rebuilds, consistency checks, and export jobs, not for hot-path
+graph expansion. Use node-local traversal for request-path graph walks.
+
 ## Label Index
 
 For queries like `MATCH (n:Person)`, we need to find all nodes with a given label efficiently. The Label Index provides this.
@@ -290,8 +498,8 @@ LABEL_INDEX B+Tree:
 
 ```
 When creating node Alice with labels [Person, Employee]:
-  Insert: (Person, Alice) → ∅
-  Insert: (Employee, Alice) → ∅
+  Insert: (Person, Alice) → empty
+  Insert: (Employee, Alice) → empty
 
 Query "all Person nodes":
   Range scan: (Person, 0) to (Person, MAX)
@@ -330,6 +538,67 @@ while (try iter.next()) |node_id| {
 const person_count = try index.countNodesByLabel(person_id);
 ```
 
+## Property Indexes
+
+An explicit index on a label's (or a relationship type's) property lives in
+three B+Trees: a catalog of declarations, and one entry tree each for nodes and
+edges.
+
+| Tree | Key | Value |
+|------|-----|-------|
+| Catalog | kind (1 node, 2 edge), scope id u16 BE, property id u16 BE | encoding: empty = digest, `[1]` = ordered, `[2]` = ordered and dense |
+| Node / edge entries | scope id u16 BE, property id u16 BE, encoded value, entity id u64 BE | empty |
+
+Indexes created by this release key values in an **ordered** encoding, whose
+byte order is `ORDER BY`'s order, so a range of values is a range of keys. A
+label's index is also **dense**: every node with the label has an entry, the
+ones without the property under `0xF0`, after every value, where `ORDER BY`
+puts nulls. So the index read forward or backward is the label's nodes in
+ascending or descending order, nulls included; a node created without the
+property costs one more key per such index, about 0.1 to 0.2 µs (100,000
+nodes added to 100,000 with three such indexes: 3.0 to 3.2 µs a node with
+indexes that leave them out, 3.5 µs with these). A
+relationship type's index holds only the edges with the property, and an index
+whose keys hold no nulls is used for ranges and equality only. The tags:
+
+| Tag | Values | Bytes after the tag |
+|-----|--------|---------------------|
+| `0x10` | lists, maps, vectors | SHA-256 digest (equality only) |
+| `0x20` | byte arrays | as strings |
+| `0x30` | strings | the first 128 bytes, `0x00` written `00 FF`, then `00 00` if that was all of it or `00 01` if the value is longer |
+| `0x40` | booleans | one byte |
+| `0x50` | integers and floats | the largest double not above the value, as 8 bytes that sort like it (`-0` as `+0`), then a u16 BE remainder for integers a double cannot hold |
+| `0x51` | NaN | nothing; after every number |
+| `0xF0` | null (property missing) | nothing; dense indexes only |
+
+So `3` and `3.0` share a key, and an integer and a float compare exactly, as
+the query engine compares them. A truncated string or a digest stands for
+several values; lookups re-read the entity and compare, so neither can produce
+a wrong row. Indexes created by 0.16.0 have an empty catalog value and key a
+SHA-256 digest of the value: they answer equality only, and keep doing so, until
+rebuilt. `Database.upgradePropertyIndexes` (`lattice compact
+--upgrade-indexes`) rebuilds each declaration whose catalog value is not the
+current encoding for its kind (a node index created by a development build
+between the two is ordered but not dense): it raises `min_reader_version`,
+removes the declaration's entries, writes them again from the label's nodes or
+the type's edges, then stores the new encoding in the catalog, all in one
+step, so a crash leaves the old index or the new one.
+
+Creating an ordered index raises the file header's `min_reader_version` to 4
+before the first key is written, so 0.16.0, which would read the keys as
+digests and find nothing, refuses to open the file. A file without one stays at
+`min_reader_version` 3. The raise is not undone when the index is dropped.
+
+Declarations are cached in memory (up to 32 per kind), so a write does not read
+the catalog. A transaction's own staged nodes and edges are found by indexed
+value through a per-transaction table (`OverlayLookup`), filled on the first
+lookup for a declaration and kept up to date by later staged writes, so a
+lookup inside a transaction that staged 100,000 nodes costs about 1 µs rather
+than a walk of all of them.
+
+How queries use these indexes is in
+[Query Execution](./query-execution.md#scan-operators).
+
 ## Putting It Together
 
 A complete graph operation involves multiple B+Trees:
@@ -347,7 +616,7 @@ Creating node Alice:Person with name="Alice":
    - Insert: 1 → serialized_data
 
 3. Label Index:
-   - Insert: (1000, 1) → ∅
+   - Insert: (1000, 1) → empty
 
 
 Creating edge (Alice)-[:KNOWS]->(Bob):
@@ -357,8 +626,9 @@ Creating edge (Alice)-[:KNOWS]->(Bob):
 
 2. Edge Store:
    - Allocate edge_id = 1
-   - Insert traversal keys: (1, OUT, 1002, 2, 1) → ∅ and (2, IN, 1002, 1, 1) → ∅
+   - Insert traversal keys: (1, OUT, 1002, 2, 1) → empty and (2, IN, 1002, 1, 1) → empty
    - Insert payload: 1 → serialized edge data and properties
+   - Update edge-ID key 0: next_edge_id = 2
 ```
 
 ## Performance Characteristics
@@ -368,7 +638,7 @@ Creating edge (Alice)-[:KNOWS]->(Bob):
 | Create node | O(log n) | One B+Tree insert + label index inserts |
 | Get node | O(log n) | Single B+Tree lookup |
 | Delete node | O(log n) | One B+Tree delete |
-| Create edge | O(log n) | Two traversal inserts + one edge-ID payload insert |
+| Create edge | O(log n) | Two traversal inserts + one edge-ID payload insert + `next_edge_id` update |
 | Get edge | O(log n + k) | Prefix scan to edge ID, then payload lookup |
 | Delete edge | O(log n) | Two traversal deletes + one edge-ID payload delete |
 | Check label | O(log n) | Single B+Tree lookup |
@@ -380,14 +650,28 @@ Where n = total items in the respective B+Tree.
 
 ## Current Limitations
 
-The public database API is not yet fully transaction-isolated end-to-end. The transaction manager contains snapshot-oriented MVCC machinery above this layer, but this chapter only describes the underlying graph-storage structures.
+The stores described here have no notion of transactions. Isolation is
+provided above them by the database layer (a single writer plus per-transaction
+overlays; see [Transaction Manager](./transaction-manager.md)); this chapter only
+describes the underlying graph-storage structures.
 
 1. **Property updates rewrite records**: No in-place partial property update at the storage-record level
+2. **No index from relationship type to edge.** The header's sixteen tree roots
+   are all in use, and an index kept in the label tree would be read by 0.16.0
+   as labels and left stale by its writes, so every file with an edge would have
+   to be closed to 0.16.0; a prototype also cost 7% on edge creation. A pattern
+   that starts from a type, `()-[r:KNOWS]->()`, walks the edge-ID index once
+   instead (66 ms to 20 ms for a count over 1,000,000 edges).
+3. **In a file created before format 5 the edge-ID index walks in a
+   non-numeric order** (its keys are little-endian), and that is the row order
+   of a type-only pattern. In a format-5 file the walk, and so the row order of
+   a type-only pattern, is ascending edge ID. Neither is a promise: a query that
+   needs an order says `ORDER BY`. `MATCH (n)` sorts its node ids and is
+   ascending in both.
 
 ## Future Enhancements
 
-1. **Edge type index**: Fast lookup by edge type across all nodes
-2. **Cross-node edge type scans**: Dedicated indexes for type-wide traversals
+1. **Edge type index**, if a file format change frees a tree root for it.
 
 ## Summary
 
@@ -395,13 +679,13 @@ The public database API is not yet fully transaction-isolated end-to-end. The tr
 |-----------|------------|---------|
 | Symbol Table (forward) | string | String → ID mapping |
 | Symbol Table (reverse) | symbol_id | ID → String mapping |
-| Node Store | node_id | Node data storage |
+| Node Store | node_id (file's id key order) | Node data storage |
 | Edge Store | (src, dir, type, tgt, edge_id) | Traversal keys |
-| Edge ID Index | edge_id | Stable edge identity and property payload |
+| Edge ID Index | edge_id (file's id key order) | Stable edge identity and property payload |
 | Label Index | (label_id, node_id) | Label-based queries |
 | Property Index Catalog | (entity_kind, scope_id, property_id) | Durable explicit index definitions |
-| Node Property Index | (scope_id, property_id, value_digest, node_id) | Indexed node-property equality lookup |
-| Edge Property Index | (scope_id, property_id, value_digest, edge_id) | Indexed edge-property equality lookup |
+| Node Property Index | (scope_id, property_id, encoded value, node_id) | Indexed node-property equality, range and prefix lookup |
+| Edge Property Index | (scope_id, property_id, encoded value, edge_id) | Indexed edge-property lookup |
 
 The graph storage layer transforms B+Trees into a full property graph database
 through careful key design, stable edge IDs, and a traversal/payload split for

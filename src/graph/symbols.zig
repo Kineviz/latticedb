@@ -8,7 +8,7 @@
 //! Symbol ID ranges:
 //!   - 0: Reserved (null/invalid)
 //!   - 1-999: Reserved for system use
-//!   - 1000-65535: User-defined symbols
+//!   - 1000-65534: User-defined symbols (65535 is never handed out)
 
 const std = @import("std");
 const lattice = @import("lattice");
@@ -71,6 +71,30 @@ pub const SymbolTable = struct {
         return self;
     }
 
+    /// `init` for trees that are known to hold a database's symbols.
+    ///
+    /// `init` starts the counter at the first user id when the id -> name
+    /// tree cannot be scanned, which is right for trees that do not exist yet
+    /// and wrong for ones that do: the next string interned would take an id
+    /// already in use, and a new label or property name would silently become
+    /// another name for an existing one. Here a failed scan is an error.
+    pub fn initChecked(allocator: Allocator, forward: *BTree, reverse: *BTree) SymbolError!Self {
+        var self = Self{
+            .allocator = allocator,
+            .forward = forward,
+            .reverse = reverse,
+            .next_id = USER_SYMBOL_START,
+        };
+        self.next_id = try self.loadNextId();
+        return self;
+    }
+
+    /// The next free id, found by walking the id -> name tree. Unlike the
+    /// node id counter this is not kept in the file header, because the walk
+    /// is cheap at any size the table can reach (ReleaseFast, Apple M-series,
+    /// warm cache: about 1 us for 200 symbols, 5 us for 2,000, 170 us at
+    /// 64,000, against an open of 120-830 us), and a symbol id is never freed,
+    /// so the highest one in the tree is always the last handed out.
     fn loadNextId(self: *Self) SymbolError!SymbolId {
         var max_id: SymbolId = USER_SYMBOL_START - 1;
         var iter = self.reverse.range(null, null) catch |err| {
@@ -129,14 +153,15 @@ pub const SymbolTable = struct {
 
     /// Look up a symbol ID by string
     pub fn lookup(self: *Self, string: []const u8) SymbolError!SymbolId {
-        const result = self.forward.get(string) catch |err| {
+        const result = self.forward.getBorrowed(string) catch |err| {
             return mapBTreeError(err);
         };
 
-        if (result) |value| {
-            defer self.forward.freeValue(value);
-            if (value.len == 2) {
-                return std.mem.readInt(u16, value[0..2], .little);
+        if (result) |borrowed| {
+            var value = borrowed;
+            defer value.release();
+            if (value.bytes.len == 2) {
+                return std.mem.readInt(u16, value.bytes[0..2], .little);
             }
         }
 

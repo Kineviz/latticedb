@@ -6,6 +6,7 @@
 //! - Graph pattern syntax: ->, <-, -[]->, etc.
 //! - Parameters: $name
 //! - Literals: integers, floats, strings
+//! - Backtick-quoted names: `my label`, with a doubled backtick for one
 
 const std = @import("std");
 const parser = @import("parser.zig");
@@ -58,6 +59,8 @@ pub const Lexer = struct {
                     _ = self.advance();
                     return self.makeTokenAt(.dotdot, start);
                 }
+                // `.5`: no name starts with a digit, so this is a number.
+                if (self.peek() != null and isDigit(self.peek().?)) return self.scanNumber(start);
                 return self.makeTokenAt(.dot, start);
             },
             '+' => {
@@ -72,13 +75,21 @@ pub const Lexer = struct {
             '%' => return self.makeTokenAt(.percent, start),
             '^' => return self.makeTokenAt(.caret, start),
             '|' => return self.makeTokenAt(.pipe, start),
-            '=' => return self.makeTokenAt(.eq, start),
+            '&' => return self.makeTokenAt(.ampersand, start),
+            '=' => {
+                if (self.peek() == '~') {
+                    _ = self.advance();
+                    return self.makeTokenAt(.regex_match, start); // =~
+                }
+                return self.makeTokenAt(.eq, start);
+            },
             '-' => return self.scanDash(start),
             '<' => return self.scanLessThan(start),
             '>' => return self.scanGreaterThan(start),
             '@' => return self.scanAt(start),
             '$' => return self.scanParameter(start),
             '"', '\'' => return self.scanString(c, start),
+            '`' => return self.scanQuotedName(start),
             '!' => return self.scanBang(start),
             else => {
                 if (isDigit(c)) return self.scanNumber(start);
@@ -203,13 +214,13 @@ pub const Lexer = struct {
         return self.makeTokenAt(.invalid, start);
     }
 
-    /// Scan !: != (alternative to <>)
+    /// Scan !: != (alternative to <>), or ! of a label expression
     fn scanBang(self: *Self, start: usize) Token {
         if (self.peek() == '=') {
             _ = self.advance();
             return self.makeTokenAt(.neq, start);
         }
-        return self.makeTokenAt(.invalid, start);
+        return self.makeTokenAt(.bang, start);
     }
 
     /// Scan parameter: $name
@@ -249,6 +260,26 @@ pub const Lexer = struct {
         return self.makeTokenAt(.invalid, start);
     }
 
+    /// Scan a backtick-quoted name, after the opening backtick. A doubled
+    /// backtick stands for one and does not end the name. The token's text
+    /// keeps the backticks; the parser takes the name out of it. An empty
+    /// name, or one with no closing backtick on its line, is invalid.
+    fn scanQuotedName(self: *Self, start: usize) Token {
+        while (!self.isAtEnd()) {
+            const c = self.peek().?;
+            if (c == '\n') break;
+            _ = self.advance();
+            if (c != '`') continue;
+            if (self.peek() == '`') {
+                _ = self.advance();
+                continue;
+            }
+            if (self.position - start == 2) return self.makeTokenAt(.invalid, start);
+            return self.makeTokenAt(.quoted_identifier, start);
+        }
+        return self.makeTokenAt(.invalid, start);
+    }
+
     /// Scan number (integer or float)
     fn scanNumber(self: *Self, start: usize) Token {
         // Integer part
@@ -256,7 +287,30 @@ pub const Lexer = struct {
             _ = self.advance();
         }
 
-        var is_float = false;
+        // Hexadecimal: 0x1F.
+        if (self.position - start == 1 and self.source[start] == '0' and
+            (self.peek() == 'x' or self.peek() == 'X') and
+            self.peekAhead(1) != null and std.ascii.isHex(self.peekAhead(1).?))
+        {
+            _ = self.advance();
+            while (!self.isAtEnd() and std.ascii.isHex(self.peek().?)) _ = self.advance();
+            return self.makeTokenAt(.integer, start);
+        }
+
+        // Octal: 0o17. An 8 or 9 is read into the token, so that the parser
+        // can say the digit is not octal instead of reading `0o18` as
+        // `0o1` followed by 8.
+        if (self.position - start == 1 and self.source[start] == '0' and
+            (self.peek() == 'o' or self.peek() == 'O') and
+            self.peekAhead(1) != null and isDigit(self.peekAhead(1).?))
+        {
+            _ = self.advance();
+            while (!self.isAtEnd() and isDigit(self.peek().?)) _ = self.advance();
+            return self.makeTokenAt(.integer, start);
+        }
+
+        // Started at the '.' of `.5`.
+        var is_float = self.source[start] == '.';
 
         // Check for decimal point
         if (self.peek() == '.' and self.peekAhead(1) != null and isDigit(self.peekAhead(1).?)) {
@@ -368,6 +422,12 @@ fn lookupKeyword(text: []const u8) ?TokenType {
     if (std.mem.eql(u8, lower, "asc")) return .kw_asc;
     if (std.mem.eql(u8, lower, "desc")) return .kw_desc;
     if (std.mem.eql(u8, lower, "xor")) return .kw_xor;
+    if (std.mem.eql(u8, lower, "case")) return .kw_case;
+    if (std.mem.eql(u8, lower, "when")) return .kw_when;
+    if (std.mem.eql(u8, lower, "then")) return .kw_then;
+    if (std.mem.eql(u8, lower, "else")) return .kw_else;
+    if (std.mem.eql(u8, lower, "end")) return .kw_end;
+    if (std.mem.eql(u8, lower, "union")) return .kw_union;
 
     return null;
 }
@@ -421,6 +481,20 @@ test "tokenize vector distance operator" {
     try std.testing.expectEqual(TokenType.identifier, lexer.nextToken().token_type);
     try std.testing.expectEqual(TokenType.vector_distance, lexer.nextToken().token_type);
     try std.testing.expectEqual(TokenType.parameter, lexer.nextToken().token_type);
+}
+
+test "tokenize regex match operator" {
+    var lexer = Lexer.init("n.name =~ 'A.*' AND x = ~y");
+
+    try std.testing.expectEqual(TokenType.identifier, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.dot, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.identifier, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.regex_match, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.string, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.kw_and, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.identifier, lexer.nextToken().token_type);
+    // `= ~` with a space between is not the operator.
+    try std.testing.expectEqual(TokenType.eq, lexer.nextToken().token_type);
 }
 
 test "tokenize fts match operator" {
@@ -523,4 +597,34 @@ test "tokenize arrows" {
     try std.testing.expectEqual(TokenType.arrow_right, lexer.nextToken().token_type);
     try std.testing.expectEqual(TokenType.arrow_left, lexer.nextToken().token_type);
     try std.testing.expectEqual(TokenType.dash, lexer.nextToken().token_type);
+}
+
+test "tokenize CASE keywords in any case" {
+    var lexer = Lexer.init("case When THEN else END");
+    try std.testing.expectEqual(TokenType.kw_case, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.kw_when, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.kw_then, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.kw_else, lexer.nextToken().token_type);
+    try std.testing.expectEqual(TokenType.kw_end, lexer.nextToken().token_type);
+}
+
+test "tokenize backtick-quoted names" {
+    var lexer = Lexer.init("`my label` `match` `a``b` `````` `` `open\n`x");
+    var t = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.quoted_identifier, t.token_type);
+    try std.testing.expectEqualStrings("`my label`", t.text);
+    try std.testing.expectEqual(TokenType.quoted_identifier, lexer.nextToken().token_type);
+    t = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.quoted_identifier, t.token_type);
+    try std.testing.expectEqualStrings("`a``b`", t.text);
+    // A name of two backticks.
+    t = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.quoted_identifier, t.token_type);
+    try std.testing.expectEqualStrings("``````", t.text);
+    // Empty, then unterminated at the end of the line.
+    try std.testing.expectEqual(TokenType.invalid, lexer.nextToken().token_type);
+    t = lexer.nextToken();
+    try std.testing.expectEqual(TokenType.invalid, t.token_type);
+    try std.testing.expectEqualStrings("`open", t.text);
+    try std.testing.expectEqual(TokenType.invalid, lexer.nextToken().token_type);
 }

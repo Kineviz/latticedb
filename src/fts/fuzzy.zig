@@ -163,7 +163,10 @@ pub fn expandFuzzyTerms(
     max_distance: u32,
 ) ![]FuzzyMatch {
     var matches: std.ArrayListUnmanaged(FuzzyMatch) = .empty;
-    errdefer matches.deinit(allocator);
+    errdefer {
+        for (matches.items) |m| allocator.free(m.term);
+        matches.deinit(allocator);
+    }
 
     // Iterate all dictionary terms
     var iter: Dictionary.DictionaryIterator = undefined;
@@ -173,11 +176,18 @@ pub fn expandFuzzyTerms(
     while (try iter.next()) |item| {
         // Check if within edit distance
         if (levenshteinDistanceBounded(query_term, item.term, max_distance)) |distance| {
-            try matches.append(allocator, .{
-                .term = item.term,
+            // The iterator's term lives in a leaf page that is unpinned once
+            // the walk moves past it, and the sort below compares terms, so
+            // the match keeps its own copy.
+            const term = try allocator.dupe(u8, item.term);
+            matches.append(allocator, .{
+                .term = term,
                 .distance = distance,
                 .entry = item.entry,
-            });
+            }) catch |err| {
+                allocator.free(term);
+                return err;
+            };
         }
     }
 
@@ -194,8 +204,9 @@ pub fn expandFuzzyTerms(
     return matches.toOwnedSlice(allocator);
 }
 
-/// Free fuzzy match results
+/// Free fuzzy match results, including each match's copy of its term
 pub fn freeMatches(allocator: Allocator, matches: []FuzzyMatch) void {
+    for (matches) |m| allocator.free(m.term);
     allocator.free(matches);
 }
 
@@ -204,17 +215,21 @@ pub fn freeMatches(allocator: Allocator, matches: []FuzzyMatch) void {
 // ============================================================================
 
 /// Calculate the distance penalty for fuzzy matches.
-/// Uses quadratic decay: penalty = 1.0 - (distance / max_distance)^2
+/// Uses quadratic decay: penalty = 1.0 - (distance / (max_distance + 1))^2
+///
+/// Every match a fuzzy search returns, up to `max_distance` edits away,
+/// keeps a positive share of its score, and a closer match always a larger
+/// one. (Dividing by `max_distance` instead scored a match at the full
+/// distance 0, below documents that did not match at all.)
 ///
 /// Examples (max_distance = 2):
 /// - distance 0: 1.0 (exact match, no penalty)
-/// - distance 1: 0.75 (25% penalty)
-/// - distance 2: 0.0 (full penalty, effectively filtered)
+/// - distance 1: 0.889
+/// - distance 2: 0.556
 pub fn distancePenalty(distance: u32, max_distance: u32) f32 {
-    if (max_distance == 0) return if (distance == 0) 1.0 else 0.0;
-    if (distance >= max_distance) return 0.0;
+    if (distance > max_distance) return 0.0;
 
-    const ratio = @as(f32, @floatFromInt(distance)) / @as(f32, @floatFromInt(max_distance));
+    const ratio = @as(f32, @floatFromInt(distance)) / @as(f32, @floatFromInt(max_distance + 1));
     return 1.0 - (ratio * ratio);
 }
 
@@ -277,14 +292,24 @@ test "levenshtein distance bounded - exceeds threshold" {
 test "distance penalty" {
     // max_distance = 2
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), distancePenalty(0, 2), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), distancePenalty(1, 2), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), distancePenalty(2, 2), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.889), distancePenalty(1, 2), 0.001); // 1 - (1/3)^2
+    try std.testing.expectApproxEqAbs(@as(f32, 0.556), distancePenalty(2, 2), 0.001); // 1 - (2/3)^2
 
-    // max_distance = 3
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), distancePenalty(0, 3), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.889), distancePenalty(1, 3), 0.001); // 1 - (1/3)^2
-    try std.testing.expectApproxEqAbs(@as(f32, 0.556), distancePenalty(2, 3), 0.001); // 1 - (2/3)^2
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), distancePenalty(3, 3), 0.001);
+    // max_distance = 4
+    try std.testing.expectApproxEqAbs(@as(f32, 0.96), distancePenalty(1, 4), 0.001); // 1 - (1/5)^2
+    try std.testing.expectApproxEqAbs(@as(f32, 0.36), distancePenalty(4, 4), 0.001); // 1 - (4/5)^2
+
+    // A match at the full distance still scores, below every closer one.
+    for ([_]u32{ 1, 2, 3, 4, 8 }) |max| {
+        var previous: f32 = 2.0;
+        for (0..max + 1) |d| {
+            const penalty = distancePenalty(@intCast(d), max);
+            try std.testing.expect(penalty > 0);
+            try std.testing.expect(penalty < previous);
+            previous = penalty;
+        }
+        try std.testing.expectEqual(@as(f32, 0.0), distancePenalty(max + 1, max));
+    }
 
     // Edge cases
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), distancePenalty(0, 0), 0.001);

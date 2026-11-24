@@ -3,7 +3,8 @@
 //! Maps doc_id -> [terms] to enable efficient document removal.
 //! Uses B+Tree storage with length-prefixed term lists.
 //!
-//! Key: doc_id (8 bytes, little-endian)
+//! Key: doc_id (8 bytes, in the file's id key order: big-endian in a
+//!      format-5 file, little-endian in one created earlier)
 //! Value: num_terms (u16) | [term_len (u16) | term_bytes]...
 
 const std = @import("std");
@@ -17,6 +18,7 @@ const BTree = btree.BTree;
 const ScopedTree = @import("scoped_tree.zig").ScopedTree;
 const BTreeError = btree.BTreeError;
 const NodeId = lattice.core.types.NodeId;
+const IdKeyOrder = lattice.core.id_key.IdKeyOrder;
 
 /// Document ID (alias for NodeId)
 pub const DocId = NodeId;
@@ -37,21 +39,26 @@ pub const ReverseIndexError = error{
     ValueTooLarge,
 };
 
-/// Maximum total size for serialized term list (limit to keep values reasonable)
-const MAX_VALUE_SIZE: usize = 32768; // 32KB max per document
+/// Largest serialized term list kept for one document: a 2-byte count, then
+/// 2 bytes plus the term for each distinct term. The B-tree would hold more,
+/// spilling to overflow pages; this cap is the reverse index's own.
+const MAX_VALUE_SIZE: usize = 32768;
 
 /// Reverse index for document term tracking
 pub const ReverseIndex = struct {
     allocator: Allocator,
     tree: ScopedTree,
+    /// How document keys encode document ids; the file decides it.
+    id_keys: IdKeyOrder,
 
     const Self = @This();
 
-    /// Initialize reverse index with a B+Tree
-    pub fn init(allocator: Allocator, tree: ScopedTree) Self {
+    /// Initialize reverse index with a B+Tree keyed in `id_keys` order.
+    pub fn init(allocator: Allocator, tree: ScopedTree, id_keys: IdKeyOrder) Self {
         return Self{
             .allocator = allocator,
             .tree = tree,
+            .id_keys = id_keys,
         };
     }
 
@@ -68,9 +75,8 @@ pub const ReverseIndex = struct {
             return ReverseIndexError.ValueTooLarge;
         }
 
-        // Serialize key (doc_id as 8 bytes little-endian)
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        // Serialize key (doc_id in the file's id key order)
+        const key_buf = self.id_keys.encode(doc_id);
 
         // Serialize value
         const value_buf = self.allocator.alloc(u8, total_size) catch {
@@ -117,8 +123,7 @@ pub const ReverseIndex = struct {
     /// Caller must free the returned slice and each term within it
     pub fn getDocTerms(self: *Self, doc_id: DocId) ReverseIndexError!?[][]const u8 {
         // Serialize key
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         const result = self.tree.get(&key_buf) catch |err| {
             return mapBTreeError(err);
@@ -134,8 +139,7 @@ pub const ReverseIndex = struct {
 
     /// Remove a document's entry from the reverse index
     pub fn removeDoc(self: *Self, doc_id: DocId) ReverseIndexError!void {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         self.tree.delete(&key_buf) catch |err| {
             if (err != BTreeError.KeyNotFound) {
@@ -146,8 +150,7 @@ pub const ReverseIndex = struct {
 
     /// Check if a document exists in the reverse index
     pub fn contains(self: *Self, doc_id: DocId) bool {
-        var key_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key_buf, doc_id, .little);
+        const key_buf = self.id_keys.encode(doc_id);
 
         return self.tree.contains(&key_buf) catch false;
     }
@@ -251,7 +254,7 @@ test "reverse index basic operations" {
     defer bp.deinit();
 
     var tree = try BTree.init(allocator, &bp);
-    var ri = ReverseIndex.init(allocator, ScopedTree.unscoped(&tree));
+    var ri = ReverseIndex.init(allocator, ScopedTree.unscoped(&tree), .big);
 
     // Store terms for a document
     const doc_id: DocId = 42;
@@ -303,7 +306,7 @@ test "reverse index overwrite" {
     defer bp.deinit();
 
     var tree = try BTree.init(allocator, &bp);
-    var ri = ReverseIndex.init(allocator, ScopedTree.unscoped(&tree));
+    var ri = ReverseIndex.init(allocator, ScopedTree.unscoped(&tree), .big);
 
     const doc_id: DocId = 100;
 
@@ -323,4 +326,47 @@ test "reverse index overwrite" {
     try std.testing.expectEqualStrings("gamma", retrieved[0]);
     try std.testing.expectEqualStrings("delta", retrieved[1]);
     try std.testing.expectEqualStrings("epsilon", retrieved[2]);
+}
+
+test "reverse index keeps a term list larger than a page, up to its own cap" {
+    const allocator = std.testing.allocator;
+
+    const vfs = lattice.storage.vfs;
+    const buffer_pool = lattice.storage.buffer_pool;
+    const page_manager = lattice.storage.page_manager;
+
+    var posix_vfs = vfs.PosixVfs.init(allocator);
+    const vfs_impl = posix_vfs.vfs();
+
+    const db_path = "/tmp/s3_lattice_reverse_index_large.db";
+    vfs_impl.delete(db_path) catch {};
+
+    var pm = try page_manager.PageManager.init(allocator, vfs_impl, db_path, .{ .create = true });
+    defer {
+        pm.deinit();
+        vfs_impl.delete(db_path) catch {};
+    }
+
+    var bp = try buffer_pool.BufferPool.init(allocator, &pm, 64 * 4096);
+    defer bp.deinit();
+
+    var tree = try BTree.init(allocator, &bp);
+    var ri = ReverseIndex.init(allocator, ScopedTree.unscoped(&tree), .big);
+
+    // Each "tNNNNNN" term costs 2 + 7 bytes, so 3640 of them serialize to
+    // 32762 bytes: eight pages' worth, and just under the cap.
+    var storage: [3641][7]u8 = undefined;
+    var terms: [3641][]const u8 = undefined;
+    for (&storage, &terms, 0..) |*buf, *term, i| {
+        _ = try std.fmt.bufPrint(buf, "t{d:0>6}", .{i});
+        term.* = buf;
+    }
+
+    try ri.setDocTerms(1, terms[0..3640]);
+    const kept = (try ri.getDocTerms(1)).?;
+    defer ri.freeTerms(kept);
+    try std.testing.expectEqual(@as(usize, 3640), kept.len);
+    try std.testing.expectEqualStrings("t003639", kept[3639]);
+
+    try std.testing.expectError(ReverseIndexError.ValueTooLarge, ri.setDocTerms(2, terms[0..]));
 }

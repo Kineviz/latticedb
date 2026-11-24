@@ -1,56 +1,73 @@
-<svg width="531" height="204"
- viewBox="0.00 0.00 398.00 153.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
-<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 148.72)">
+<svg width="736" height="356"
+ viewBox="0.00 0.00 552.00 267.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 262.94)">
 <title>checkpointer_integration</title>
-<!-- ckpt -->
+<!-- db -->
 <g id="node1" class="node">
-<title>ckpt</title>
-<path fill="#dbe9f8" stroke="#4a90d9" stroke-width="1.2" d="M282.49,-144.72C282.49,-144.72 133.69,-144.72 133.69,-144.72 127.69,-144.72 121.69,-138.72 121.69,-132.72 121.69,-132.72 121.69,-120.72 121.69,-120.72 121.69,-114.72 127.69,-108.72 133.69,-108.72 133.69,-108.72 282.49,-108.72 282.49,-108.72 288.49,-108.72 294.49,-114.72 294.49,-120.72 294.49,-120.72 294.49,-132.72 294.49,-132.72 294.49,-138.72 288.49,-144.72 282.49,-144.72"/>
-<text xml:space="preserve" text-anchor="middle" x="208.09" y="-121.69" font-family="Helvetica,Arial,sans-serif" font-size="12.00" fill="#1a1a1a">Checkpointer</text>
+<title>db</title>
+<path fill="#f6f8fa" stroke="#c7d0da" stroke-width="1.2" d="M367.06,-258.94C367.06,-258.94 136.62,-258.94 136.62,-258.94 130.62,-258.94 124.62,-252.94 124.62,-246.94 124.62,-246.94 124.62,-198.22 124.62,-198.22 124.62,-192.22 130.62,-186.22 136.62,-186.22 136.62,-186.22 367.06,-186.22 367.06,-186.22 373.06,-186.22 379.06,-192.22 379.06,-198.22 379.06,-198.22 379.06,-246.94 379.06,-246.94 379.06,-252.94 373.06,-258.94 367.06,-258.94"/>
+<text xml:space="preserve" text-anchor="start" x="140.47" y="-239.13" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">Database.runCheckpoint</text>
+<text xml:space="preserve" text-anchor="start" x="140.47" y="-225.63" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">refuse: failed handle, or a txn</text>
+<text xml:space="preserve" text-anchor="start" x="140.47" y="-212.13" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a"> &#160;with records in the log</text>
+<text xml:space="preserve" text-anchor="start" x="140.47" y="-198.63" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">save HNSW node map and tree roots</text>
 </g>
-<!-- pool -->
+<!-- ckpt -->
 <g id="node2" class="node">
-<title>pool</title>
-<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M114.18,-72.72C114.18,-72.72 12,-72.72 12,-72.72 6,-72.72 0,-66.72 0,-60.72 0,-60.72 0,-12 0,-12 0,-6 6,0 12,0 12,0 114.18,0 114.18,0 120.18,0 126.18,-6 126.18,-12 126.18,-12 126.18,-60.72 126.18,-60.72 126.18,-66.72 120.18,-72.72 114.18,-72.72"/>
-<text xml:space="preserve" text-anchor="start" x="15.84" y="-52.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">BufferPool</text>
-<text xml:space="preserve" text-anchor="start" x="15.84" y="-39.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">frames</text>
-<text xml:space="preserve" text-anchor="start" x="15.84" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">dirty tracking</text>
-<text xml:space="preserve" text-anchor="start" x="15.84" y="-12.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">latches</text>
+<title>ckpt</title>
+<path fill="#dbe9f8" stroke="#4a90d9" stroke-width="1.2" d="M326.24,-154.22C326.24,-154.22 177.44,-154.22 177.44,-154.22 171.44,-154.22 165.44,-148.22 165.44,-142.22 165.44,-142.22 165.44,-130.22 165.44,-130.22 165.44,-124.22 171.44,-118.22 177.44,-118.22 177.44,-118.22 326.24,-118.22 326.24,-118.22 332.24,-118.22 338.24,-124.22 338.24,-130.22 338.24,-130.22 338.24,-142.22 338.24,-142.22 338.24,-148.22 332.24,-154.22 326.24,-154.22"/>
+<text xml:space="preserve" text-anchor="middle" x="251.84" y="-131.19" font-family="Helvetica,Arial,sans-serif" font-size="12.00" fill="#1a1a1a">Checkpointer</text>
 </g>
-<!-- ckpt&#45;&gt;pool -->
+<!-- db&#45;&gt;ckpt -->
 <g id="edge1" class="edge">
-<title>ckpt&#45;&gt;pool</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M179.44,-108.26C164.94,-99.43 146.7,-88.31 128.98,-77.51"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="130.64,-75.65 123.38,-74.1 128.09,-79.84 130.64,-75.65"/>
-</g>
-<!-- pgm -->
-<g id="node3" class="node">
-<title>pgm</title>
-<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M249.06,-65.97C249.06,-65.97 167.13,-65.97 167.13,-65.97 161.13,-65.97 155.13,-59.97 155.13,-53.97 155.13,-53.97 155.13,-18.75 155.13,-18.75 155.13,-12.75 161.13,-6.75 167.13,-6.75 167.13,-6.75 249.06,-6.75 249.06,-6.75 255.06,-6.75 261.06,-12.75 261.06,-18.75 261.06,-18.75 261.06,-53.97 261.06,-53.97 261.06,-59.97 255.06,-65.97 249.06,-65.97"/>
-<text xml:space="preserve" text-anchor="start" x="170.97" y="-46.16" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">PageManager</text>
-<text xml:space="preserve" text-anchor="start" x="170.97" y="-32.66" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">writePage</text>
-<text xml:space="preserve" text-anchor="start" x="170.97" y="-19.16" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">sync</text>
-</g>
-<!-- ckpt&#45;&gt;pgm -->
-<g id="edge2" class="edge">
-<title>ckpt&#45;&gt;pgm</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M208.09,-108.26C208.09,-98.63 208.09,-86.28 208.09,-74.6"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="210.54,-74.92 208.09,-67.92 205.64,-74.92 210.54,-74.92"/>
+<title>db&#45;&gt;ckpt</title>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M251.84,-185.8C251.84,-178.23 251.84,-170.37 251.84,-163.23"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="254.29,-163.33 251.84,-156.33 249.39,-163.33 254.29,-163.33"/>
 </g>
 <!-- wal -->
-<g id="node4" class="node">
+<g id="node3" class="node">
 <title>wal</title>
-<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M377.68,-72.72C377.68,-72.72 302.5,-72.72 302.5,-72.72 296.5,-72.72 290.5,-66.72 290.5,-60.72 290.5,-60.72 290.5,-12 290.5,-12 290.5,-6 296.5,0 302.5,0 302.5,0 377.68,0 377.68,0 383.68,0 389.68,-6 389.68,-12 389.68,-12 389.68,-60.72 389.68,-60.72 389.68,-66.72 383.68,-72.72 377.68,-72.72"/>
-<text xml:space="preserve" text-anchor="start" x="306.34" y="-52.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">WalManager</text>
-<text xml:space="preserve" text-anchor="start" x="306.34" y="-39.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">append</text>
-<text xml:space="preserve" text-anchor="start" x="306.34" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">sync</text>
-<text xml:space="preserve" text-anchor="start" x="306.34" y="-12.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">setLsn</text>
+<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M127.68,-86.22C127.68,-86.22 12,-86.22 12,-86.22 6,-86.22 0,-80.22 0,-74.22 0,-74.22 0,-12 0,-12 0,-6 6,0 12,0 12,0 127.68,0 127.68,0 133.68,0 139.68,-6 139.68,-12 139.68,-12 139.68,-74.22 139.68,-74.22 139.68,-80.22 133.68,-86.22 127.68,-86.22"/>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-66.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">WalManager</text>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-52.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">appendRecord</text>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-39.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">sync</text>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">setCheckpointLsn</text>
+<text xml:space="preserve" text-anchor="start" x="15.84" y="-12.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">truncateToEmpty</text>
 </g>
 <!-- ckpt&#45;&gt;wal -->
-<g id="edge3" class="edge">
+<g id="edge2" class="edge">
 <title>ckpt&#45;&gt;wal</title>
-<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M234.17,-108.26C248.23,-98.85 266.17,-86.84 283.26,-75.4"/>
-<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="284.18,-77.74 288.63,-71.81 281.45,-73.66 284.18,-77.74"/>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M216.91,-117.77C198.2,-108.42 174.76,-96.69 153.84,-86.22 151.72,-85.16 149.57,-84.08 147.4,-83"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="148.81,-80.96 141.45,-80.02 146.61,-85.34 148.81,-80.96"/>
+</g>
+<!-- pgm -->
+<g id="node4" class="node">
+<title>pgm</title>
+<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M323.18,-72.72C323.18,-72.72 180.5,-72.72 180.5,-72.72 174.5,-72.72 168.5,-66.72 168.5,-60.72 168.5,-60.72 168.5,-25.5 168.5,-25.5 168.5,-19.5 174.5,-13.5 180.5,-13.5 180.5,-13.5 323.18,-13.5 323.18,-13.5 329.18,-13.5 335.18,-19.5 335.18,-25.5 335.18,-25.5 335.18,-60.72 335.18,-60.72 335.18,-66.72 329.18,-72.72 323.18,-72.72"/>
+<text xml:space="preserve" text-anchor="start" x="184.34" y="-52.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">PageManager</text>
+<text xml:space="preserve" text-anchor="start" x="184.34" y="-39.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">advanceCheckpointSeq</text>
+<text xml:space="preserve" text-anchor="start" x="184.34" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">(header, in memory)</text>
+</g>
+<!-- ckpt&#45;&gt;pgm -->
+<g id="edge3" class="edge">
+<title>ckpt&#45;&gt;pgm</title>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M251.84,-117.65C251.84,-107.4 251.84,-94.06 251.84,-81.56"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="254.29,-81.76 251.84,-74.76 249.39,-81.76 254.29,-81.76"/>
+</g>
+<!-- pool -->
+<g id="node5" class="node">
+<title>pool</title>
+<path fill="#eef4fb" stroke="#4a90d9" stroke-width="1.2" d="M531.93,-86.22C531.93,-86.22 375.75,-86.22 375.75,-86.22 369.75,-86.22 363.75,-80.22 363.75,-74.22 363.75,-74.22 363.75,-12 363.75,-12 363.75,-6 369.75,0 375.75,0 375.75,0 531.93,0 531.93,0 537.93,0 543.93,-6 543.93,-12 543.93,-12 543.93,-74.22 543.93,-74.22 543.93,-80.22 537.93,-86.22 531.93,-86.22"/>
+<text xml:space="preserve" text-anchor="start" x="379.59" y="-66.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">BufferPool</text>
+<text xml:space="preserve" text-anchor="start" x="379.59" y="-52.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">flushAll: dirty pages,</text>
+<text xml:space="preserve" text-anchor="start" x="379.59" y="-39.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">freed pages and header</text>
+<text xml:space="preserve" text-anchor="start" x="379.59" y="-25.91" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">through the journal,</text>
+<text xml:space="preserve" text-anchor="start" x="379.59" y="-12.41" font-family="Menlo,Consolas,monospace" font-size="11.00" fill="#1a1a1a">then fsync the file</text>
+</g>
+<!-- ckpt&#45;&gt;pool -->
+<g id="edge4" class="edge">
+<title>ckpt&#45;&gt;pool</title>
+<path fill="none" stroke="#6b7280" stroke-width="1.1" d="M290.79,-117.65C309.43,-109.24 332.68,-98.76 355.73,-88.36"/>
+<polygon fill="#6b7280" stroke="#6b7280" stroke-width="1.1" points="356.64,-90.64 362.01,-85.53 354.62,-86.17 356.64,-90.64"/>
 </g>
 </g>
 </svg>

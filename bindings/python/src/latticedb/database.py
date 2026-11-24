@@ -6,7 +6,7 @@ import ctypes
 import warnings
 from ctypes import POINTER, byref, c_size_t, c_ubyte, c_void_p
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     import numpy as np
@@ -22,18 +22,130 @@ from latticedb._bindings import (
     OpenOptionsV2,
     OpenOptionsV3,
     OpenOptionsV4,
+    OpenOptionsV5,
+    LATTICE_CHANGEFEED_RETENTION_AGE,
+    LATTICE_CHANGEFEED_RETENTION_ALL,
+    LATTICE_CHANGEFEED_RETENTION_LAST,
+    LATTICE_CHANGEFEED_RETENTION_OFF,
+    LATTICE_FULL_FSYNC_OFF,
+    LATTICE_FULL_FSYNC_ON,
+    LATTICE_SYNC_MODE_FULL,
+    LATTICE_SYNC_MODE_NORMAL,
+    LATTICE_VECTOR_METRIC_COSINE,
+    LATTICE_VECTOR_METRIC_DOT_PRODUCT,
+    LATTICE_VECTOR_METRIC_EUCLIDEAN,
+    LATTICE_CHECKPOINT_FULL,
+    LATTICE_CHECKPOINT_PASSIVE,
+    LATTICE_CHECKPOINT_TRUNCATE,
+    LatticeCheckpointStats,
     LATTICE_OK,
     LATTICE_ERROR_IO,
     LATTICE_ERROR_UNSUPPORTED,
+    LatticeChangesTrimmedError,
+    LatticeNotFoundError,
     LatticeUnsupportedError,
     check_error,
     check_query_error,
+    check_vector_error,
     get_lib,
     python_to_value,
     value_to_python,
 )
 from latticedb.transaction import Transaction
-from latticedb.types import QueryResult, VectorSearchResult, FtsSearchResult, StreamRecord
+from latticedb.types import (
+    ChangefeedStatus,
+    CheckpointStats,
+    QueryResult,
+    VectorSearchResult,
+    FtsSearchResult,
+    StreamRecord,
+)
+
+
+_SYNC_MODES = {"full": LATTICE_SYNC_MODE_FULL, "normal": LATTICE_SYNC_MODE_NORMAL}
+_VECTOR_METRICS = {
+    "cosine": LATTICE_VECTOR_METRIC_COSINE,
+    "euclidean": LATTICE_VECTOR_METRIC_EUCLIDEAN,
+    "dot_product": LATTICE_VECTOR_METRIC_DOT_PRODUCT,
+}
+_CHECKPOINT_MODES = {
+    "passive": LATTICE_CHECKPOINT_PASSIVE,
+    "full": LATTICE_CHECKPOINT_FULL,
+    "truncate": LATTICE_CHECKPOINT_TRUNCATE,
+}
+_MAX_U64 = 2**64 - 1
+
+
+def _sync_mode_code(sync_mode: Optional[str]) -> int:
+    if sync_mode is None:
+        return 0
+    try:
+        return _SYNC_MODES[sync_mode]
+    except KeyError:
+        raise ValueError(
+            f"sync_mode must be 'full' or 'normal', not {sync_mode!r}"
+        ) from None
+
+
+# Duration suffixes of an "age:" policy, longest-named first so "ms" is not
+# read as "s".
+_DURATION_UNITS = (("ms", 1), ("s", 1000), ("m", 60_000), ("h", 3_600_000), ("d", 86_400_000))
+_U64_MAX = (1 << 64) - 1
+
+
+def _changefeed_retention_code(policy: Optional[str]) -> Tuple[int, int]:
+    """Turn a policy such as ``"last:1000"`` into the C API's mode and value."""
+    if policy is None:
+        return (0, 0)
+    if not isinstance(policy, str):
+        raise TypeError(f"changefeed_retention must be a string, not {type(policy).__name__}")
+    lowered = policy.lower()
+    if lowered == "all":
+        return (LATTICE_CHANGEFEED_RETENTION_ALL, 0)
+    if lowered == "off":
+        return (LATTICE_CHANGEFEED_RETENTION_OFF, 0)
+    if policy.startswith("last:"):
+        digits = policy[5:]
+        if digits.isdigit() and 0 < int(digits) <= _U64_MAX:
+            return (LATTICE_CHANGEFEED_RETENTION_LAST, int(digits))
+    elif policy.startswith("age:"):
+        text = policy[4:]
+        for suffix, ms in _DURATION_UNITS:
+            number = text[: -len(suffix)]
+            if text.endswith(suffix) and number.isdigit():
+                value = int(number) * ms
+                if 0 < value <= _U64_MAX:
+                    return (LATTICE_CHANGEFEED_RETENTION_AGE, value)
+                break
+    raise ValueError(
+        "changefeed_retention must be 'all', 'off', 'last:<events>' or "
+        f"'age:<duration>' (such as 'age:7d', 'age:12h', 'age:500ms'), not {policy!r}"
+    )
+
+
+def _changefeed_retention_text(mode: int, value: int) -> str:
+    if mode == LATTICE_CHANGEFEED_RETENTION_OFF:
+        return "off"
+    if mode == LATTICE_CHANGEFEED_RETENTION_LAST:
+        return f"last:{value}"
+    if mode == LATTICE_CHANGEFEED_RETENTION_AGE:
+        for suffix, ms in reversed(_DURATION_UNITS[1:]):
+            if value % ms == 0:
+                return f"age:{value // ms}{suffix}"
+        return f"age:{value}ms"
+    return "all"
+
+
+def _vector_metric_code(vector_metric: Optional[str]) -> int:
+    if vector_metric is None:
+        return 0
+    try:
+        return _VECTOR_METRICS[vector_metric]
+    except KeyError:
+        raise ValueError(
+            "vector_metric must be 'cosine', 'euclidean' or 'dot_product', "
+            f"not {vector_metric!r}"
+        ) from None
 
 
 def _is_numpy_array(value: Any) -> bool:
@@ -58,13 +170,19 @@ class Database:
         *,
         create: bool = False,
         read_only: bool = False,
-        cache_size_mb: int = 100,
+        cache_size_mb: Optional[int] = None,
         enable_wal: bool = True,
         enable_adjacency_cache: bool = False,
         enable_vectors: Optional[bool] = None,
         enable_vector: Optional[bool] = None,
         vector_dimensions: int = 128,
         lock: bool = True,
+        sync_mode: Optional[str] = None,
+        full_fsync: Optional[bool] = None,
+        vector_metric: Optional[str] = None,
+        vector_m: Optional[int] = None,
+        vector_ef_construction: Optional[int] = None,
+        changefeed_retention: Optional[str] = None,
     ) -> None:
         """
         Open a Lattice database.
@@ -73,28 +191,75 @@ class Database:
             path: Path to the database file.
             create: Create the database if it doesn't exist.
             read_only: Open in read-only mode.
-            cache_size_mb: Size of the page cache in megabytes.
-            enable_wal: Enable WAL-backed transactions.
-            enable_adjacency_cache: Enable the in-memory graph adjacency cache.
-            enable_vectors: Enable vector storage and indexing.
+            cache_size_mb: Size of the page cache in megabytes. Unset, the
+                ``LATTICE_BUFFER_POOL_MB`` environment variable decides if it is
+                set, else 100; a size given here wins over the variable.
+            enable_wal: Log every commit, so it survives a crash. Without the
+                log, transactions work the same and changes reach the file
+                when it is next flushed (at close, for one).
+            enable_adjacency_cache: Accepted for compatibility. Queries and the
+                other methods here read edges from storage either way, so it
+                does not change their speed or results.
+            enable_vectors: Create a vector index if the database has none. A
+                database that already has one opens with it whatever this says.
             enable_vector: Compatibility alias for ``enable_vectors``.
-            vector_dimensions: Dimension of vectors when vector support is enabled.
+            vector_dimensions: Dimension of vectors when ``enable_vectors`` is set.
+                It must match the index the file records, if it has one, or
+                opening raises :class:`LatticeConfigMismatchError`; pass ``0``
+                to take the file's dimensions.
             lock: Take a lock on the file so two processes cannot tread on each
                 other. A read-write handle takes it exclusively and a read-only
                 handle shares it, so opening raises
                 :class:`LatticeDatabaseLockedError` rather than waiting. Turn this
                 off only where locking does not work, such as some network
                 filesystems; it does not make concurrent access safe.
+            sync_mode: When a commit waits for the disk. ``"full"`` syncs the
+                log on every commit, so a commit that has returned survives a
+                power cut. ``"normal"`` hands the commit to the operating
+                system and returns: it survives the process being killed, but a
+                power cut or OS crash can lose the most recent commits. Unset
+                uses the ``LATTICE_SYNC_MODE`` environment variable, else full.
+            full_fsync: On macOS, whether syncs ask the drive to flush its cache
+                (``F_FULLFSYNC``). No effect elsewhere. Unset uses the
+                ``LATTICE_FULL_FSYNC`` environment variable, else off.
+            vector_metric: How a new vector index measures distance:
+                ``"cosine"`` (``1 - cos``, vectors stored at unit length),
+                ``"euclidean"`` (L2 distance) or ``"dot_product"`` (negative
+                dot product). Unset means the file's metric, or cosine for a new
+                index.
+            vector_m: HNSW connections per node for a new index, 2..32. Unset
+                means the file's, or 16.
+            vector_ef_construction: HNSW candidate list size while building a
+                new index, 1..4096. Unset means the file's, or 200.
+            changefeed_retention: How much of the changefeed (see
+                :meth:`changes`) to keep: ``"all"``, ``"off"``,
+                ``"last:<events>"`` or ``"age:<duration>"`` with a duration
+                such as ``"500ms"``, ``"90s"``, ``"30m"``, ``"12h"`` or
+                ``"7d"``. The file records its policy. Unset keeps the
+                file's, which is ``"all"`` unless something set another (for
+                a new database, the ``LATTICE_CHANGEFEED_RETENTION``
+                environment variable). A value set here replaces the file's
+                policy when the database is opened for writing; a read-only
+                open never changes it. Retention drops the oldest events at
+                checkpoints; :meth:`trim_changefeed` applies it at once.
+
+        The vector settings are fixed once the index exists: any that is set
+        must match the file, or opening raises
+        :class:`LatticeConfigMismatchError`. ``sync_mode``, ``full_fsync``,
+        ``vector_metric``, ``vector_m`` and ``vector_ef_construction`` need a
+        native library with ``lattice_open_v5``, and ``changefeed_retention``
+        one with ``lattice_changefeed_status``; setting one against an older
+        library raises :class:`LatticeUnsupportedError`.
         """
         self._path = Path(path)
         self._create = create
         self._read_only = read_only
-        self._cache_size_mb = cache_size_mb
+        self._cache_size_mb = 0 if cache_size_mb is None else cache_size_mb
         self._enable_wal = enable_wal
         self._enable_adjacency_cache = enable_adjacency_cache
         if enable_vector is not None:
             warnings.warn(
-                "Database(..., enable_vector=...) is deprecated; use enable_vectors=.... Earliest removal is v0.6.0.",
+                "Database(..., enable_vector=...) is deprecated; use enable_vectors=....",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -103,6 +268,15 @@ class Database:
         )
         self._vector_dimensions = vector_dimensions
         self._lock = lock
+        self._sync_mode = _sync_mode_code(sync_mode)
+        if full_fsync is None:
+            self._full_fsync = 0
+        else:
+            self._full_fsync = LATTICE_FULL_FSYNC_ON if full_fsync else LATTICE_FULL_FSYNC_OFF
+        self._vector_metric = _vector_metric_code(vector_metric)
+        self._vector_m = vector_m or 0
+        self._vector_ef_construction = vector_ef_construction or 0
+        self._changefeed_retention = _changefeed_retention_code(changefeed_retention)
         self._handle: Optional[Any] = None
         self._closed = False
         # Set by deserialize when it points the database at a caller's buffer
@@ -136,7 +310,8 @@ class Database:
         code = lib._lib.lattice_serialize(self._handle, byref(out), byref(length))
         check_error(code)
         try:
-            return bytes(bytearray(out[: length.value]))
+            # One copy; slicing the POINTER would build a list of ints first.
+            return ctypes.string_at(out, length.value)
         finally:
             lib._lib.lattice_free_bytes(out, length)
 
@@ -156,6 +331,52 @@ class Database:
 
         lib = get_lib()
         db_ptr = c_void_p()
+        if self._changefeed_retention[0] and not getattr(lib, "_has_changefeed_status", False):
+            raise LatticeUnsupportedError(
+                "the native library is too old to support changefeed_retention",
+                LATTICE_ERROR_UNSUPPORTED,
+            )
+        if getattr(lib, "_has_lattice_open_v5", False):
+            opts_v5 = OpenOptionsV5(
+                struct_size=ctypes.sizeof(OpenOptionsV5),
+                create=self._create,
+                read_only=self._read_only,
+                cache_size_mb=self._cache_size_mb,
+                page_size=4096,
+                enable_vector=self._enable_vectors,
+                vector_dimensions=self._vector_dimensions,
+                enable_wal=self._enable_wal,
+                enable_adjacency_cache=self._enable_adjacency_cache,
+                lock=self._lock,
+                sync_mode=self._sync_mode,
+                full_fsync=self._full_fsync,
+                vector_metric=self._vector_metric,
+                vector_m=self._vector_m,
+                vector_ef_construction=self._vector_ef_construction,
+                changefeed_retention=self._changefeed_retention[0],
+                changefeed_retention_value=self._changefeed_retention[1],
+            )
+            code = lib._lib.lattice_open_v5(
+                str(self._path).encode("utf-8"),
+                byref(opts_v5),
+                byref(db_ptr),
+            )
+            check_error(code)
+            self._handle = db_ptr
+            return
+
+        if (
+            self._sync_mode
+            or self._full_fsync
+            or self._vector_metric
+            or self._vector_m
+            or self._vector_ef_construction
+        ):
+            raise LatticeUnsupportedError(
+                "lattice_open_v5 is required for sync_mode, full_fsync, vector_metric, "
+                "vector_m and vector_ef_construction",
+                LATTICE_ERROR_UNSUPPORTED,
+            )
         if getattr(lib, "_has_lattice_open_v4", False):
             opts_v4 = OpenOptionsV4(
                 struct_size=ctypes.sizeof(OpenOptionsV4),
@@ -396,8 +617,12 @@ class Database:
 
             if writes:
                 # The rollback in `finally` would otherwise discard the write.
+                # Only a successful commit ends the transaction: after a failed
+                # one it is still open and holds the writer slot, so leave it
+                # for `finally` to roll back.
                 code = lib._lib.lattice_commit(txn_ptr)
-                txn_ptr = c_void_p()
+                if code == LATTICE_OK:
+                    txn_ptr = c_void_p()
                 check_error(code)
 
             return QueryResult(columns=columns, _rows=rows)
@@ -568,13 +793,80 @@ class Database:
         limit: int = 100,
         timeout_ms: int = 0,
     ) -> List[StreamRecord]:
-        """Read graph changefeed records from ``__lattice_changes``."""
-        return self.read_stream(
-            "__lattice_changes",
-            after_sequence=after_sequence,
-            limit=limit,
-            timeout_ms=timeout_ms,
+        """Read graph changefeed records from ``__lattice_changes``.
+
+        Returns up to ``limit`` records with a sequence greater than
+        ``after_sequence``, oldest first; ``after_sequence=0`` reads from the
+        oldest event held. With ``timeout_ms`` it waits that long for a
+        record when there is none yet.
+
+        Raises :class:`LatticeChangesTrimmedError` (a
+        :class:`LatticeNotFoundError`) when retention or a trim has dropped
+        the events after ``after_sequence``: the reader has missed changes.
+        Raises :class:`LatticeUnsupportedError` when the retention policy is
+        ``"off"``.
+        """
+        try:
+            return self.read_stream(
+                "__lattice_changes",
+                after_sequence=after_sequence,
+                limit=limit,
+                timeout_ms=timeout_ms,
+            )
+        except LatticeNotFoundError as exc:
+            raise LatticeChangesTrimmedError(
+                f"the changefeed no longer holds the events after sequence {after_sequence}: "
+                "its retention policy or a trim dropped them",
+                exc.code,
+            ) from None
+        except LatticeUnsupportedError as exc:
+            raise LatticeUnsupportedError(
+                "the changefeed is off (changefeed_retention='off')", exc.code
+            ) from None
+
+    def changefeed_status(self) -> ChangefeedStatus:
+        """Return the changefeed's retention policy and the events it holds."""
+        if self._handle is None:
+            raise RuntimeError("Database is not open")
+        lib = get_lib()
+        if not getattr(lib, "_has_changefeed_status", False):
+            raise LatticeUnsupportedError(
+                "the native library is too old to report the changefeed's status",
+                LATTICE_ERROR_UNSUPPORTED,
+            )
+        mode = ctypes.c_uint8()
+        value = ctypes.c_uint64()
+        oldest = ctypes.c_uint64()
+        last = ctypes.c_uint64()
+        code = lib._lib.lattice_changefeed_status(
+            self._handle, byref(mode), byref(value), byref(oldest), byref(last)
         )
+        check_error(code)
+        return ChangefeedStatus(
+            retention=_changefeed_retention_text(mode.value, value.value),
+            oldest_sequence=oldest.value or None,
+            last_sequence=last.value,
+        )
+
+    def trim_changefeed(self) -> int:
+        """Apply the changefeed's retention policy in full now.
+
+        Checkpoints apply it a bounded number of events at a time; this
+        drops everything the policy no longer keeps and makes that durable.
+        Returns the number of events dropped. Raises
+        :class:`LatticeLockTimeoutError` while a write transaction is open.
+        """
+        if self._handle is None:
+            raise RuntimeError("Database is not open")
+        lib = get_lib()
+        if not getattr(lib, "_has_changefeed_status", False):
+            raise LatticeUnsupportedError(
+                "the native library is too old to trim the changefeed",
+                LATTICE_ERROR_UNSUPPORTED,
+            )
+        removed = ctypes.c_uint64()
+        check_error(lib._lib.lattice_changefeed_trim(self._handle, byref(removed)))
+        return removed.value
 
     def vector_search(
         self,
@@ -593,6 +885,10 @@ class Database:
 
         Returns:
             List of search results with node IDs and distances, sorted by similarity.
+
+        Raises:
+            LatticeUnsupportedError: If the database was created without a
+                vector index.
         """
         if self._handle is None:
             raise RuntimeError("Database is not open")
@@ -619,7 +915,7 @@ class Database:
             ef_search,
             byref(result_ptr),
         )
-        check_error(code)
+        check_vector_error(code, "search vectors")
 
         try:
             # Get result count
@@ -861,6 +1157,101 @@ class Database:
             if result_ptr.value:
                 lib._lib.lattice_fts_result_free(result_ptr)
 
+    def checkpoint(self, mode: str = "truncate") -> CheckpointStats:
+        """Fold the log (the ``-wal`` file) into the database file now.
+
+        A commit is durable once it is in the log; a checkpoint writes the
+        pages the log's commits changed into the database file and can then
+        empty the log.
+
+        Args:
+            mode: ``"passive"`` writes the changed pages unless one is in use,
+                in which case it writes nothing and reports 0 pages; the log is
+                left in place. ``"full"`` writes every changed page and leaves
+                the log in place. ``"truncate"`` (the default, and what automatic
+                checkpoints do) is ``"full"`` and then empties the log; it is the
+                only mode that bounds the log's size.
+
+        Returns:
+            A :class:`CheckpointStats` saying what the checkpoint did.
+
+        Raises:
+            ValueError: ``mode`` is not one of the three above.
+            LatticeReadOnlyError: The database was opened read-only.
+            LatticeLockTimeoutError: A transaction already has records in the
+                log, so a checkpoint would cut its commit off from them.
+            LatticeIOError: Writing failed; the log still holds every commit.
+            LatticeUnsupportedError: The native library has no
+                ``lattice_checkpoint``.
+        """
+        try:
+            mode_code = _CHECKPOINT_MODES[mode]
+        except (KeyError, TypeError):
+            raise ValueError(
+                f"mode must be 'passive', 'full' or 'truncate', not {mode!r}"
+            ) from None
+        if self._handle is None:
+            raise RuntimeError("Database is not open")
+
+        lib = get_lib()
+        if not getattr(lib, "_has_checkpoint", False):
+            raise LatticeUnsupportedError(
+                "the native library is too old to support checkpoint"
+            )
+
+        stats = LatticeCheckpointStats()
+        code = lib._lib.lattice_checkpoint(self._handle, mode_code, byref(stats))
+        check_error(code)
+        return CheckpointStats(
+            pages_flushed=int(stats.pages_flushed),
+            duration_ns=int(stats.duration_ns),
+            checkpoint_lsn=int(stats.checkpoint_lsn),
+            wal_truncated=bool(stats.wal_truncated),
+        )
+
+    def set_auto_checkpoint(self, max_wal_frames: int, min_interval_ms: int = 0) -> None:
+        """Set when commits checkpoint from now on.
+
+        A commit runs a ``"truncate"`` checkpoint once the log holds
+        ``max_wal_frames`` frames (one frame is one page, usually 4096 bytes),
+        and no sooner than ``min_interval_ms`` after the last automatic one.
+        ``max_wal_frames=0`` switches automatic checkpoints off: the log grows
+        until :meth:`checkpoint` runs, though closing still folds it into the
+        file. Without this call the
+        ``LATTICE_AUTO_CHECKPOINT_FRAMES`` environment variable sets the frame
+        count (0 for none), and without that the log may grow to an eighth of
+        the page cache, from 1000 frames up to 64 MB. This call wins over the
+        variable, and its count is used as given, not scaled to the cache. It has no effect on a read-only
+        database.
+
+        A larger interval means fewer checkpoints, each a longer pause for the
+        commit that runs it, a longer log on disk and more to replay after a
+        crash. A smaller one means shorter pauses, more often.
+
+        Raises:
+            TypeError: An argument is not an ``int``.
+            ValueError: An argument is negative or does not fit in 64 bits.
+            LatticeUnsupportedError: The native library has no
+                ``lattice_set_auto_checkpoint``.
+        """
+        args = (("max_wal_frames", max_wal_frames), ("min_interval_ms", min_interval_ms))
+        for name, value in args:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int, not {type(value).__name__}")
+            if value < 0 or value > _MAX_U64:
+                raise ValueError(f"{name} must be between 0 and 2**64 - 1, not {value}")
+        if self._handle is None:
+            raise RuntimeError("Database is not open")
+
+        lib = get_lib()
+        if not getattr(lib, "_has_set_auto_checkpoint", False):
+            raise LatticeUnsupportedError(
+                "the native library is too old to support set_auto_checkpoint"
+            )
+
+        code = lib._lib.lattice_set_auto_checkpoint(self._handle, max_wal_frames, min_interval_ms)
+        check_error(code)
+
     def cache_clear(self) -> None:
         """
         Clear the query cache.
@@ -915,12 +1306,18 @@ class Database:
 def deserialize(
     data: bytes,
     *,
-    cache_size_mb: int = 100,
+    cache_size_mb: Optional[int] = None,
     enable_wal: bool = True,
     enable_adjacency_cache: bool = False,
     enable_vectors: bool = False,
     vector_dimensions: int = 128,
     lock: bool = True,
+    sync_mode: Optional[str] = None,
+    full_fsync: Optional[bool] = None,
+    vector_metric: Optional[str] = None,
+    vector_m: Optional[int] = None,
+    vector_ef_construction: Optional[int] = None,
+    changefeed_retention: Optional[str] = None,
     copy: bool = True,
 ) -> Database:
     """Open a database from bytes produced by :meth:`Database.serialize`.
@@ -934,6 +1331,17 @@ def deserialize(
         db = latticedb.deserialize(blob)
         db.query("CREATE (n:Note {text: 'hello'})")
         s3.put_object(Bucket=b, Key=k, Body=db.serialize(), IfMatch=etag)
+
+    The options mean what they mean to :class:`Database`. The vector settings
+    are fixed once the index exists, so bytes with an index open with the one
+    they record: any vector option that is set must match it, or this raises
+    :class:`LatticeConfigMismatchError`. ``enable_vectors`` creates an index in
+    bytes that have none, configured by the vector options.
+    ``changefeed_retention`` sets the changefeed's policy, as it does for
+    :class:`Database`. ``sync_mode``, ``full_fsync``, ``vector_metric``,
+    ``vector_m``, ``vector_ef_construction`` and ``changefeed_retention`` need a
+    native library with ``lattice_deserialize_v5``; setting one against an older
+    library raises :class:`LatticeUnsupportedError`.
 
     The bytes are copied, so you may discard ``data`` as soon as this returns.
     Changes made afterwards do not travel back to it; call
@@ -955,36 +1363,86 @@ def deserialize(
         raise LatticeUnsupportedError(
             "the native library is too old to support deserialize"
         )
+    if not copy and not getattr(lib, "_has_deserialize_borrowed", False):
+        raise LatticeUnsupportedError(
+            "the native library is too old to deserialize without copying"
+        )
 
-    opts = OpenOptionsV4(
-        struct_size=ctypes.sizeof(OpenOptionsV4),
-        create=False,
-        read_only=False,
-        cache_size_mb=cache_size_mb,
-        page_size=4096,
-        enable_vector=enable_vectors,
-        vector_dimensions=vector_dimensions,
-        enable_wal=enable_wal,
-        enable_adjacency_cache=enable_adjacency_cache,
-        lock=lock,
-    )
-
-    db_ptr = c_void_p()
-    if copy:
-        owned = (c_ubyte * len(data)).from_buffer_copy(data)
-        code = lib._lib.lattice_deserialize(owned, len(data), byref(opts), byref(db_ptr))
+    sync_mode_code = _sync_mode_code(sync_mode)
+    if full_fsync is None:
+        full_fsync_code = 0
     else:
-        if not getattr(lib, "_has_deserialize_borrowed", False):
-            raise LatticeUnsupportedError(
-                "the native library is too old to deserialize without copying"
-            )
+        full_fsync_code = LATTICE_FULL_FSYNC_ON if full_fsync else LATTICE_FULL_FSYNC_OFF
+    vector_metric_code = _vector_metric_code(vector_metric)
+    vector_m_value = vector_m or 0
+    vector_ef_construction_value = vector_ef_construction or 0
+    retention_mode, retention_value = _changefeed_retention_code(changefeed_retention)
+    cache_size = 0 if cache_size_mb is None else cache_size_mb
+
+    if copy:
+        # One copy, owned here for the length of the call.
+        buffer: Any = (c_ubyte * len(data)).from_buffer_copy(data)
+    else:
         # Going through c_char_p points at the caller's buffer rather than
         # duplicating it, which is the whole point of this branch. from_buffer
         # refuses immutable bytes, and from_buffer_copy would copy.
-        borrowed = ctypes.cast(ctypes.c_char_p(data), POINTER(c_ubyte))
-        code = lib._lib.lattice_deserialize_borrowed(
-            borrowed, len(data), byref(opts), byref(db_ptr)
+        buffer = ctypes.cast(ctypes.c_char_p(data), POINTER(c_ubyte))
+
+    db_ptr = c_void_p()
+    has_v5 = getattr(
+        lib, "_has_deserialize_v5" if copy else "_has_deserialize_borrowed_v5", False
+    )
+    if has_v5:
+        opts_v5 = OpenOptionsV5(
+            struct_size=ctypes.sizeof(OpenOptionsV5),
+            create=False,
+            read_only=False,
+            cache_size_mb=cache_size,
+            page_size=4096,
+            enable_vector=enable_vectors,
+            vector_dimensions=vector_dimensions,
+            enable_wal=enable_wal,
+            enable_adjacency_cache=enable_adjacency_cache,
+            lock=lock,
+            sync_mode=sync_mode_code,
+            full_fsync=full_fsync_code,
+            vector_metric=vector_metric_code,
+            vector_m=vector_m_value,
+            vector_ef_construction=vector_ef_construction_value,
+            changefeed_retention=retention_mode,
+            changefeed_retention_value=retention_value,
         )
+        fn = lib._lib.lattice_deserialize_v5 if copy else lib._lib.lattice_deserialize_borrowed_v5
+        code = fn(buffer, len(data), byref(opts_v5), byref(db_ptr))
+    else:
+        if (
+            sync_mode_code
+            or full_fsync_code
+            or vector_metric_code
+            or vector_m_value
+            or vector_ef_construction_value
+            or retention_mode
+        ):
+            raise LatticeUnsupportedError(
+                "lattice_deserialize_v5 is required for sync_mode, full_fsync, "
+                "vector_metric, vector_m, vector_ef_construction and "
+                "changefeed_retention",
+                LATTICE_ERROR_UNSUPPORTED,
+            )
+        opts = OpenOptionsV4(
+            struct_size=ctypes.sizeof(OpenOptionsV4),
+            create=False,
+            read_only=False,
+            cache_size_mb=cache_size,
+            page_size=4096,
+            enable_vector=enable_vectors,
+            vector_dimensions=vector_dimensions,
+            enable_wal=enable_wal,
+            enable_adjacency_cache=enable_adjacency_cache,
+            lock=lock,
+        )
+        fn = lib._lib.lattice_deserialize if copy else lib._lib.lattice_deserialize_borrowed
+        code = fn(buffer, len(data), byref(opts), byref(db_ptr))
     check_error(code)
 
     # The handle is already open, so the wrapper is built around it rather than
@@ -993,12 +1451,18 @@ def deserialize(
     db._path = Path("<deserialized>")
     db._create = False
     db._read_only = False
-    db._cache_size_mb = cache_size_mb
+    db._cache_size_mb = cache_size
     db._enable_wal = enable_wal
     db._enable_adjacency_cache = enable_adjacency_cache
     db._enable_vectors = enable_vectors
     db._vector_dimensions = vector_dimensions
     db._lock = lock
+    db._sync_mode = sync_mode_code
+    db._full_fsync = full_fsync_code
+    db._vector_metric = vector_metric_code
+    db._vector_m = vector_m_value
+    db._vector_ef_construction = vector_ef_construction_value
+    db._changefeed_retention = (retention_mode, retention_value)
     db._handle = db_ptr
     db._closed = False
     # Borrowed bytes have to outlive the database. Holding the reference here is

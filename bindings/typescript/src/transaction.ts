@@ -8,6 +8,7 @@ import {
   PropertyValue,
   CreateNodeOptions,
   CreateEdgeOptions,
+  DeleteNodeOptions,
   QueryResult,
   VectorSearchOptions,
   VectorSearchResult,
@@ -15,9 +16,23 @@ import {
 } from './types';
 import {
   LatticeFFI,
+  LatticeError,
+  LatticeErrorCode,
   DatabaseHandle,
   TransactionHandle,
 } from './ffi';
+
+/**
+ * The properties a create call stores: a null (or undefined) value stores
+ * nothing, as in Cypher, so the returned node or edge leaves it out too.
+ */
+function withoutNulls(properties: Record<string, PropertyValue>): Record<string, PropertyValue> {
+  const stored: Record<string, PropertyValue> = {};
+  for (const [key, value] of Object.entries(properties)) {
+    if (value !== null && value !== undefined) stored[key] = value;
+  }
+  return stored;
+}
 
 /**
  * A database transaction.
@@ -51,6 +66,10 @@ export class Transaction {
 
   /**
    * Commit the transaction.
+   *
+   * If the commit fails with code -7 (TxnAborted), the native transaction is
+   * already gone and this one is over: rolling it back afterwards does
+   * nothing. After any other failure it stays open for `rollback()`.
    */
   commit(): void {
     if (this.committed) {
@@ -62,7 +81,17 @@ export class Transaction {
     if (this.txnHandle === null) {
       throw new Error('Transaction closed');
     }
-    this.ffi.commit(this.txnHandle);
+    try {
+      this.ffi.commit(this.txnHandle);
+    } catch (error) {
+      if (error instanceof LatticeError && error.code === LatticeErrorCode.TxnAborted) {
+        // The native side has retired the handle; it cannot be committed or
+        // rolled back again, so the transaction ended without committing.
+        this.txnHandle = null;
+        this.rolledBack = true;
+      }
+      throw error;
+    }
     this.txnHandle = null;
     this.committed = true;
   }
@@ -133,18 +162,31 @@ export class Transaction {
     return {
       id: nodeId,
       labels,
-      properties,
+      properties: withoutNulls(properties),
     };
   }
 
   /**
    * Delete a node.
    *
+   * A node that still has relationships is not deleted unless `detach` is set,
+   * since deleting it alone would leave edges pointing at nothing; this matches
+   * Cypher's DELETE and DETACH DELETE. Deleting a node that does not exist does
+   * nothing.
+   *
    * @param nodeId - ID of the node to delete
+   * @param options - `detach: true` also deletes the node's relationships
+   * @throws LatticeError with code -17 (HasRelationships) if the node has
+   *   relationships this transaction can see and `detach` is not set; nothing
+   *   is deleted
    */
-  async deleteNode(nodeId: bigint): Promise<void> {
+  async deleteNode(nodeId: bigint, options: DeleteNodeOptions = {}): Promise<void> {
     this.ensureWritable();
-    this.ffi.deleteNode(this.txnHandle!, nodeId);
+    if (options.detach) {
+      this.ffi.detachDeleteNode(this.txnHandle!, nodeId);
+    } else {
+      this.ffi.deleteNode(this.txnHandle!, nodeId);
+    }
   }
 
   /**
@@ -186,6 +228,10 @@ export class Transaction {
   /**
    * Set a property on a node.
    *
+   * A null value removes the property, as Cypher's `SET n.x = null` does;
+   * removing one the node does not have does nothing. (Up to 0.18.0 it
+   * stored the null.)
+   *
    * @param nodeId - The node ID
    * @param key - Property key
    * @param value - Property value
@@ -215,8 +261,10 @@ export class Transaction {
    * Set a vector embedding on a node.
    *
    * @param nodeId - The node ID
-   * @param key - Vector property key
+   * @param key - Vector key: `'embedding'` or `''`
    * @param vector - Vector data
+   * @throws LatticeError with code -14 (Unsupported) if the database was
+   *   created without a vector index, or the key is another name
    */
   async setVector(
     nodeId: bigint,
@@ -228,11 +276,46 @@ export class Transaction {
   }
 
   /**
+   * Get a node's vector as this transaction sees it.
+   *
+   * Under the cosine metric, the default, a committed vector reads back
+   * scaled to unit length: `[3, 4]` reads back as `[0.6, 0.8]`. The
+   * direction, and so every cosine distance, is unchanged. Under the
+   * euclidean and dot-product metrics it reads back as stored. A vector set
+   * earlier in this transaction reads back as written.
+   *
+   * @param nodeId - The node ID
+   * @param key - Vector key: `'embedding'` (the default) or `''`
+   * @returns The vector, or null if the node has none
+   * @throws LatticeError with code -4 (NotFound) if the node does not exist
+   */
+  async getVector(nodeId: bigint, key: string = 'embedding'): Promise<Float32Array | null> {
+    this.ensureActive();
+    return this.ffi.getVector(this.txnHandle!, nodeId, key);
+  }
+
+  /**
+   * Remove a node's vector. The node keeps its labels and properties; vector
+   * search no longer returns it. Removing a vector the node does not have
+   * does nothing.
+   *
+   * @param nodeId - The node ID
+   * @param key - Vector key: `'embedding'` (the default) or `''`
+   * @throws LatticeError with code -4 (NotFound) if the node does not exist
+   */
+  async removeVector(nodeId: bigint, key: string = 'embedding'): Promise<void> {
+    this.ensureWritable();
+    this.ffi.removeVector(this.txnHandle!, nodeId, key);
+  }
+
+  /**
    * Insert multiple vector-bearing nodes in a single call.
    *
    * @param label - Label for all nodes
    * @param vectors - Array of vectors (one per node)
    * @returns Array of created node IDs
+   * @throws LatticeError with code -14 (Unsupported) if the database was
+   *   created without a vector index; no node is created
    */
   async batchInsertVectors(
     label: string,
@@ -244,7 +327,7 @@ export class Transaction {
   }
 
   /**
-   * @deprecated Use batchInsertVectors(). Earliest removal is v0.6.0.
+   * @deprecated Use batchInsertVectors().
    */
   async batchInsert(
     label: string,
@@ -261,6 +344,8 @@ export class Transaction {
    * @param edgeType - Edge type/label
    * @param options - Edge creation options
    * @returns The created edge
+   * @throws LatticeError with code -4 (NotFound) if either node does not exist
+   *   as this transaction sees it
    */
   async createEdge(
     sourceId: bigint,
@@ -282,7 +367,7 @@ export class Transaction {
       sourceId,
       targetId,
       type: edgeType,
-      properties,
+      properties: withoutNulls(properties),
     };
   }
 
@@ -304,6 +389,8 @@ export class Transaction {
 
   /**
    * Set a property on an edge.
+   *
+   * A null value removes the property, as `setProperty` does.
    *
    * @param edgeId - The stable edge ID
    * @param key - Property key
@@ -565,6 +652,9 @@ export class Transaction {
 
   /**
    * Search for similar vectors inside this transaction.
+   *
+   * @throws LatticeError with code -14 (Unsupported) if the database was
+   *   created without a vector index
    */
   async vectorSearch(
     vector: Float32Array,

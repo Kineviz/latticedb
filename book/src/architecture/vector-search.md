@@ -5,7 +5,7 @@
 Lattice provides approximate nearest neighbor (ANN) search using the HNSW (Hierarchical Navigable Small World) algorithm. This enables semantic search over high-dimensional embedding vectors—a core requirement for AI/RAG applications.
 
 <img class="diagram" src="../assets/diagrams/vector-search-stack.svg"
-     alt="The vector search stack: an optional EmbeddingClient produces float32 vectors, the HnswIndex provides a multi-layer graph with logarithmic search, and VectorStorage persists vectors in pages backed by the buffer pool">
+     alt="The vector search stack: an optional EmbeddingClient or hash_embed helper produces float32 vectors, which the caller passes to the HnswIndex. The index persists into three structures backed by the buffer pool: VectorStorage pages holding the vectors, connection-pool pages holding each node's neighbour lists, and the hnsw_node_tree B+Tree registry, which is saved at every flush and checkpoint and loaded or rebuilt on open">
 
 ## Embedding Generation
 
@@ -58,7 +58,8 @@ const config = lattice.EmbeddingConfig{
     // Optional API key for authenticated endpoints
     .api_key = null,
 
-    // Request timeout in milliseconds (default: 30000)
+    // Request timeout in milliseconds (default: 30000).
+    // Not currently enforced: the client does not read this field.
     .timeout_ms = 30_000,
 };
 ```
@@ -117,34 +118,76 @@ HNSW (Hierarchical Navigable Small World) is a graph-based algorithm for approxi
 
 ```zig
 const config = lattice.HnswConfig{
-    .m = 16,                    // Connections per node (layers 1+)
+    .dimensions = 384,         // Required: vector length (1-4096)
+    .m = 16,                   // Connections per node (layers 1+)
     .m_max0 = 32,              // Connections at layer 0
     .ef_construction = 200,    // Search width during insert
     .ef_search = 64,           // Search width during query
-    .ml = 0.36067977,          // Level multiplier (1/ln(2))
+    .ml = 1.0 / @log(2.0),     // Level multiplier, ≈ 1.4427 (the default)
     .metric = .cosine,         // Distance metric
 };
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `m` | 16 | Max connections per node (higher = better recall, more memory) |
+| `dimensions` | none (required) | Vector length, 1 to 4096 |
+| `m` | 16 | Max connections per node on layers 1+ (higher = better recall, more memory) |
 | `m_max0` | 32 | Max connections at layer 0 (typically 2×m) |
 | `ef_construction` | 200 | Beam width during insert (higher = better graph quality) |
 | `ef_search` | 64 | Beam width during search (higher = better recall, slower) |
+| `ml` | 1/ln 2 ≈ 1.4427 | Level multiplier; a new node's top layer is `floor(-ln(U) × ml)` |
 | `metric` | `.cosine` | Distance metric: `.euclidean`, `.cosine`, `.inner_product` |
+
+With `ml = 1/ln 2`, about half of all vectors reach layer 1 or higher, a
+quarter reach layer 2, and so on. (The HNSW paper suggests `ml = 1/ln M`, which
+for M = 16 is ≈ 0.36 and puts about 6% of vectors above layer 0.)
+
+`m` and `m_max0` are capped at 64: neighbour lists are read into fixed 64-entry
+buffers during insert and search, so `init` lowers a larger value to 64. With
+`m_max0 = 2 × m`, that makes 32 the largest `m` that keeps the usual ratio.
+
+**What a database lets you choose.** A database builds its index from its
+configuration when the index is created: `dimensions`, `metric`, `m` (2 to 32,
+with `m_max0 = 2 × m`) and `ef_construction` (1 to 4096), defaulting to cosine,
+16, 32 and 200. In Zig these are `DatabaseConfig.vector_dimensions`,
+`vector_metric`, `vector_m` and `vector_ef_construction`; the C API's
+`lattice_open_options_v5`, the bindings and `lattice create`
+(`--vector-metric=cosine|euclidean|dot_product`, `--vector-m`, `--vector-ef-construction`)
+pass the same values.
+
+The file's header records all five from the moment the index exists, and every
+later open builds the index from what the file records, whatever the options say,
+so a database with vectors opens, and recovers its log, without being told its
+dimensions. An option that contradicts the file (a different dimension count,
+metric, `m` or `ef_construction`) is refused with `VectorConfigMismatch`
+(`LATTICE_ERROR_CONFIG_MISMATCH`) before anything is read, rather than reading the
+pages with the wrong layout. None of them can be changed afterwards: `m` decides
+the layout of the index's pages and the metric what its distances mean. To change
+them, export the database and import it into one created with the new settings.
+
+A file written by 0.16.0 has no such record. Its index can only be the one 0.16.0
+built (cosine, 16, 32, 200), so the dimension count is read from its first vector
+page, and the record is written at the first read-write open. An index whose metric
+is not cosine, or whose `m` is not 16, marks the file as needing a newer reader,
+and 0.16.0 refuses to open it.
+
+The one setting exposed per query is `ef_search`, as the `ef_search` argument of
+`lattice_vector_search` (0 means the default of 64) and the equivalent binding
+parameters.
 
 ### API Usage
 
 ```zig
 const lattice = @import("lattice");
 
-// Initialize vector storage
+// `buffer_pool` is a *lattice.BufferPool set up by the caller.
+
+// Initialize vector storage (pages are owned by the buffer pool; no deinit)
 var vector_storage = try lattice.VectorStorage.init(allocator, buffer_pool, 384);
-defer vector_storage.deinit();
 
 // Initialize HNSW index
 var hnsw = lattice.HnswIndex.init(allocator, buffer_pool, &vector_storage, .{
+    .dimensions = 384,
     .metric = .cosine,
     .ef_search = 100,
 });
@@ -160,9 +203,26 @@ const results = try hnsw.search(query_vector, 10, null);
 defer hnsw.freeResults(results);
 
 for (results) |result| {
-    std.debug.print("ID: {}, Distance: {d:.4}\n", .{ result.id, result.distance });
+    std.debug.print("ID: {}, Distance: {d:.4}\n", .{ result.node_id, result.distance });
 }
 ```
+
+`search(query, k, ef_override)` returns up to `k` results ordered by
+distance; pass a value for `ef_override` to change the beam width for one
+query. The beam is never narrower than `k`: the search uses `max(ef, k)`
+(capped at 65535), so asking for more neighbours than `ef_search` still returns
+`k` of them.
+
+The index itself accepts any `f32` values, so that recovery can replay a log
+written by an older release. The database rejects a vector with a NaN or
+infinite component, whether stored or used as a query, with `InvalidArgument`
+(`LATTICE_ERROR_INVALID_ARG` through the C API): such a value makes every
+distance to it NaN or infinite and breaks the ordering the search relies on.
+
+`insert` and `remove` are all or nothing. Every neighbour-list write records the
+list's previous contents, and a failure part way (out of memory, a full buffer
+pool, an I/O error) puts the lists, the node map entry, the entry point, the top
+layer and the vector count back as they were.
 
 ### Distance Metrics
 
@@ -172,28 +232,90 @@ for (results) |result| {
 | `.cosine` | 1 - (a·b)/(‖a‖‖b‖) | Text embeddings (normalized) |
 | `.inner_product` | -Σ(aᵢ × bᵢ) | When vectors are pre-normalized |
 
-For text embeddings from most models (OpenAI, Cohere, etc.), use `.cosine`.
+Everywhere outside the index itself the third metric is called `dot_product`:
+`DatabaseConfig.vector_metric = .dot_product`, `--vector-metric=dot_product`,
+`lattice info`, `LATTICE_VECTOR_METRIC_DOT_PRODUCT`, and the bindings' `"dot_product"`,
+`VectorMetricDotProduct` and `DOT_PRODUCT`. The HNSW index's own `DistanceMetric` keeps
+the name `.inner_product` it had in 0.16.0. Smaller is nearer under all three, so
+the inner product is negated, and its distances can be negative. For text
+embeddings from most models (OpenAI, Cohere, etc.), use `.cosine`.
+
+A database's search, Cypher's `<=>` (including `<=>` between two literal lists),
+and the scoring of vectors a transaction has set but not yet committed all use the
+metric the file records; a database without a vector index measures `<=>` with
+cosine. Under `.euclidean` and `.inner_product` vectors are stored and read back as
+given.
+
+With `.cosine`, the index normalizes each vector before storing it and
+normalizes each query, then computes the distance as `1 - a·b`. The index's
+copy of a vector is therefore its unit-length version, and it is the only copy
+the file keeps: a committed vector reads back normalised (`n.embedding` in
+Cypher, `getNodeVectorInTxn` in Zig). A vector a transaction has set but not yet
+committed is scored the same way, normalised on both sides, so it ranks among
+committed results on the same scale.
 
 ## Vector Storage
 
 Vectors are stored in pages managed by the buffer pool, separate from the HNSW graph structure.
 
+Vector pages use a 4096-byte layout. Each starts with the common 8-byte page
+header, followed by a 16-byte vector header (all integers little-endian):
+
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 1 B | `page_type: u8` = `0x04` (vector data) |
-| 1–2 | 2 B | `dimensions: u16` |
-| 3–4 | 2 B | `vector_count: u16` |
-| 5–8 | 4 B | `next_page: u32` — overflow chain |
-| 9–23 | 15 B | Reserved (header is 24 bytes total) |
-| 24 → | variable | Slots, one per vector: `[vector_id: u64][f32 × dimensions]` |
+| 0–7 | 8 B | Common page header: `page_type` = `0x04` (`vector_data`), flags, reserved, checksum |
+| 8–9 | 2 B | `dimensions: u16` |
+| 10–11 | 2 B | `vector_count: u16` — records on this page |
+| 12–15 | 4 B | `bytes_per_vector: u32` — record size |
+| 16–19 | 4 B | `next_page: u32` — next vector page in the chain (0 if none) |
+| 20–23 | 4 B | Layout marker: `0` = inline, `0x564F4631` (`"VOF1"`) = overflow |
+| 24 → | variable | Records |
 
-Pages are 4096 bytes, so a page holds `(4096 - 24) / (8 + 4 × dimensions)` vectors
-before spilling into the next page in the overflow chain.
+Vectors up to 4096 dimensions are supported. Vectors that fit in one page use
+the inline layout: each record is `[vector_id: u64][f32 × dimensions]`, and a
+page holds `(4096 - 24) / (8 + 4 × dimensions)` of them. That covers up to 1016
+dimensions. Larger embeddings use a compact head record in the vector page:
+
+```
+[vector_id: u64][first_overflow_page: u32][reserved: u32]
+```
+
+The f32 payload is stored across linked overflow pages (page type `overflow`),
+each with an 8-byte `[next_page: u32][bytes_used: u32]` header after the common
+header, leaving room for 1020 floats per page. Common embedding sizes such as
+1536, 3072, and 4096 dimensions therefore persist normally; they just span
+multiple pages.
 
 Vectors per page depends on dimensions:
-- 384-dim (1536 bytes): 2 vectors/page
-- 768-dim (3072 bytes): 1 vector/page
-- 1536-dim (6144 bytes): spans multiple pages
+- 384-dim (1544-byte record): 2 vectors/page
+- 768-dim (3080-byte record): 1 vector/page
+- 1536-dim (6144 bytes): head record plus 2 overflow pages
+- 3072-dim (12288 bytes): head record plus 4 overflow pages
+- 4096-dim (16384 bytes): head record plus 5 overflow pages
+
+The graph itself is stored apart from the vectors:
+
+- **Neighbour lists** live in connection-pool pages (page type `hnsw_layer`).
+  Nodes are grouped by their top layer, and each group's pages hold fixed-size
+  slots with room for `m_max0` neighbours at layer 0 and `m` at each layer above.
+- **The node registry** maps each vector ID to its top layer, its vector
+  location and its connection slot. It is kept in memory while the database is
+  open and written to a dedicated B+Tree (`hnsw_node_tree`), keyed by the
+  vector ID in the file's id key order (big-endian in a file created in format
+  5, little-endian before; see [Graph Storage](./graph-storage.md#id-key-order)),
+  together with the entry point and layer count under the all-`0xFF` key,
+  before every flush of the buffer pool: at each
+  checkpoint, at `sync` and close, and at the early flushes a large transaction
+  triggers. So the file never holds vector pages newer than the registry that
+  describes them. A save writes only the entries added, changed or removed since
+  the last one (the whole registry after a rebuild). On open the registry is
+  loaded from that tree and validated; if the tree is missing or fails
+  validation, the index is rebuilt from the stored vectors. The old graph's
+  connection pages are freed first and the rebuilt graph reuses them, so a rebuild
+  does not grow the file.
+- **Free vector records** are kept in an in-memory list, built by one walk of the
+  vector page chain the first time a store needs it, so storing a vector reuses
+  a deleted record without scanning the chain.
 
 ## Performance Characteristics
 
@@ -201,41 +323,54 @@ Vectors per page depends on dimensions:
 |-----------|------------|-------|
 | Insert | O(log n) | Builds graph connections |
 | Search (k-NN) | O(log n) | Independent of k for small k |
-| Delete | O(m × log n) | Removes connections |
+| Delete | Local, plus an occasional full pass | Repairs the removed vector's neighbours (see below) |
 | Memory | O(n × m × layers) | ~1KB per vector at m=16 |
+
+Removing a vector, which includes replacing one, finds the nodes that link to it
+through its own neighbour lists. Each drops the link and, if that leaves room,
+takes the nearest of the removed node's other neighbours that passes the same
+diversity rule as neighbour selection. Links from nodes the removed one had
+pruned from its own lists cannot be found that way; those ids are remembered and
+dropped in one pass over every list before the next save, or sooner once they
+reach about 3% of the index, or before the same id is inserted again. Search
+skips ids that are no longer in the index, so a saved graph never names a
+missing one.
 
 ### Tuning Guidelines
 
+Through a database, `ef_search` is the only knob once the index exists; `m` and
+`ef_construction` are chosen when it is created:
+
 **For higher recall:**
 - Increase `ef_search` (e.g., 100-200)
-- Increase `m` (e.g., 32-64)
-- Use more `ef_construction` (e.g., 400)
 
 **For faster search:**
 - Decrease `ef_search` (e.g., 32)
 - Accept lower recall
 
-**Typical configuration for 1M vectors:**
-```zig
-.m = 16,
-.m_max0 = 32,
-.ef_construction = 200,
-.ef_search = 64,  // Adjust based on recall/speed tradeoff
-```
+A `k` larger than `ef_search` widens the beam to `k` on its own, so there is no
+need to raise `ef_search` just to get more results.
+
+When you create the database, or build an `HnswIndex` directly, you can also
+raise `ef_construction` (e.g., 400) for a better-connected graph, or raise `m` up
+to 32 (with `m_max0` up to 64; see [Configuration](#configuration)).
 
 ## Complete Example
+
+This uses the index directly, below the database layer. Opening the
+`PageManager` is left out; `page_manager` is a `*lattice.PageManager`.
 
 ```zig
 const std = @import("std");
 const lattice = @import("lattice");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Setup storage (abbreviated)
-    var buffer_pool = try lattice.BufferPool.init(allocator, page_manager, 1000);
+    // Setup storage (abbreviated): a 4 MiB buffer pool over an open PageManager
+    var buffer_pool = try lattice.BufferPool.init(allocator, page_manager, 4 * 1024 * 1024);
     defer buffer_pool.deinit();
 
     // Initialize embedding client (optional)
@@ -246,9 +381,9 @@ pub fn main() !void {
 
     // Initialize vector storage and HNSW index
     var vector_storage = try lattice.VectorStorage.init(allocator, &buffer_pool, 384);
-    defer vector_storage.deinit();
 
     var hnsw = lattice.HnswIndex.init(allocator, &buffer_pool, &vector_storage, .{
+        .dimensions = 384, // must match the embedding model's output
         .metric = .cosine,
     });
     defer hnsw.deinit();
@@ -274,7 +409,7 @@ pub fn main() !void {
     defer hnsw.freeResults(results);
 
     for (results) |result| {
-        std.debug.print("Doc {}: distance {d:.4}\n", .{ result.id, result.distance });
+        std.debug.print("Doc {}: distance {d:.4}\n", .{ result.node_id, result.distance });
     }
 }
 ```
@@ -297,18 +432,36 @@ lattice.vector.distance.normalize(vec);  // in-place
 
 Implementation details:
 - Processes 8 floats at a time (AVX-256 compatible)
+- The dot product and squared Euclidean distance unroll four SIMD steps into
+  four independent accumulators, so long vectors are not held to the latency of
+  one chain of adds; fused multiply-add is not used
 - Handles non-aligned remainder with scalar fallback
 - Works on ARM NEON (128-bit, processed as 2×4)
 
 ## Current Limitations
 
-1. **In-memory graph**: Node connections stored in memory (persisted to pages on write)
-2. **No incremental persistence**: Full graph rebuild on restart
-3. **Single-threaded**: No concurrent insert/search yet
+1. **Fixed index settings per database**: the metric, `m` and `ef_construction`
+   are chosen when the index is created and cannot be changed for it; only
+   `ef_search` can be set per query. Changing them means exporting and importing
+   into a new database.
+2. **Registry saved at flush**: the node registry is written to `hnsw_node_tree`
+   before each flush of the buffer pool, not on every insert. If it is missing
+   or invalid on open, the whole graph is rebuilt from the stored vectors.
+3. **Cosine reads back normalised**: the file keeps only the unit-length copy
+   of each vector, so the original magnitude is not recoverable.
+4. **Filtered search is exact or approximate by size**: Cypher `<=>` searches
+   among the pattern's candidate nodes (`Database.vectorSearchAmongInTxn`). A set
+   of `count` nodes with `count² ≤ ef_search × m_max0 × vectors` is measured node
+   by node (exact); a larger one goes through the graph with the set as a filter
+   (`HnswIndex.searchFiltered`), whose beam keeps only members as results and
+   walks through the rest. The crossover is where the two measured the same at
+   10k and 100k vectors of 128 dimensions. A threshold with no `LIMIT` still
+   doubles `k` until the farthest result passes it.
+5. **Single-threaded**: No concurrent insert/search yet
 
 ## Future Enhancements
 
-1. **Persistent graph**: Load HNSW structure from disk
-2. **Concurrent access**: Reader-writer locks for parallel search
-3. **Product quantization**: Compress vectors for larger datasets
-4. **Filtered search**: Combine with label/property predicates
+1. **Concurrent access**: Reader-writer locks for parallel search
+2. **Product quantization**: Compress vectors for larger datasets
+3. **Predicate push-down**: a `<=>` predicate combined with others through `AND`
+   is evaluated row by row; those predicates could become the search's filter

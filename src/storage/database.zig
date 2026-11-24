@@ -12,6 +12,7 @@ const lattice = @import("lattice");
 
 // Core types
 const types = lattice.core.types;
+const IdKeyOrder = lattice.core.id_key.IdKeyOrder;
 const PageId = types.PageId;
 const NodeId = types.NodeId;
 const EdgeId = types.EdgeId;
@@ -22,6 +23,7 @@ const NULL_PAGE = types.NULL_PAGE;
 const vfs_mod = lattice.storage.vfs;
 const PosixVfs = vfs_mod.PosixVfs;
 const memory_vfs_mod = lattice.storage.memory_vfs;
+const overlay_vfs_mod = lattice.storage.overlay_vfs;
 const Vfs = vfs_mod.Vfs;
 
 const page_mod = lattice.storage.page;
@@ -43,9 +45,11 @@ const WalManager = wal_mod.WalManager;
 const WalError = wal_mod.WalError;
 
 const recovery_mod = lattice.storage.recovery;
+const journal_mod = lattice.storage.journal;
 const checkpoint_mod = lattice.storage.checkpoint;
 const stream_store_mod = lattice.stream.store;
 const stream_payload_mod = lattice.stream.payload;
+const changefeed_mod = lattice.stream.changefeed;
 pub const StreamBatch = stream_store_mod.Batch;
 pub const StreamRecord = stream_store_mod.Record;
 
@@ -75,6 +79,7 @@ pub const BackupStats = struct {
 };
 
 const replicate_mod = @import("replicate.zig");
+pub const id_key_upgrade = lattice.storage.id_key_upgrade;
 
 const label_index_mod = lattice.graph.label_index;
 const LabelIndex = label_index_mod.LabelIndex;
@@ -84,6 +89,8 @@ const PropertyIndex = property_index_mod.PropertyIndex;
 const PropertyIndexError = property_index_mod.PropertyIndexError;
 const PropertyIndexDefinition = property_index_mod.Definition;
 const PropertyIndexEntityKind = property_index_mod.EntityKind;
+const PropertyIndexEncoding = property_index_mod.Encoding;
+const OverlayLookup = lattice.storage.overlay_lookup.OverlayLookup;
 
 const adjacency_cache_mod = lattice.graph.adjacency_cache;
 const AdjacencyCache = adjacency_cache_mod.AdjacencyCache;
@@ -100,6 +107,7 @@ const scorer_mod = lattice.fts.scorer;
 const fts_catalog_mod = lattice.fts.catalog;
 const FtsCatalog = fts_catalog_mod.FtsCatalog;
 const FtsCatalogError = fts_catalog_mod.FtsCatalogError;
+const fts_legacy = lattice.fts.legacy;
 const FtsDefinition = fts_catalog_mod.FtsDefinition;
 const FtsEntityKind = fts_catalog_mod.FtsEntityKind;
 pub const FtsSearchResult = scorer_mod.ScoredDoc;
@@ -116,6 +124,10 @@ const HnswIndex = hnsw_mod.HnswIndex;
 const HnswConfig = hnsw_mod.HnswConfig;
 const HnswError = hnsw_mod.HnswError;
 pub const VectorSearchResult = hnsw_mod.SearchResult;
+pub const VectorMetric = page_mod.FileHeader.VectorMetric;
+pub const VectorConfig = page_mod.FileHeader.VectorConfig;
+/// Which nodes a filtered vector search may return; see `vectorSearchWhere`.
+pub const VectorFilter = hnsw_mod.Filter;
 
 // Transactions
 const txn_mod = lattice.transaction.manager;
@@ -165,11 +177,32 @@ pub const DatabaseError = error{
     /// Serialized node/edge payload exceeds the B-tree value limit or could
     /// not be represented by the on-disk value layout.
     ValueTooLarge,
-    /// The requested explicit property index does not exist.
+    /// The index the call needs does not exist: an explicit property or
+    /// full-text index that was never declared, or the vector index of a
+    /// database created without one.
     MissingIndex,
     /// Another process holds this database. A writer takes it exclusively and a
     /// reader shares it, so a reader is refused while a writer has it open.
     DatabaseLocked,
+    /// `deleteNode` was asked to delete a node that still has relationships.
+    /// `detachDeleteNode` deletes them with it.
+    NodeHasRelationships,
+    /// The open options contradict the vector index configuration the file
+    /// records: a different dimension count, metric, or HNSW parameter.
+    VectorConfigMismatch,
+    /// The file was written by a newer release that allows only releases of
+    /// its format or later to write it. It can still be opened read-only.
+    NeedsNewerWriter,
+    /// The changefeed no longer holds the events after the position a reader
+    /// asked to read from: retention or a trim dropped them. The reader has
+    /// missed changes; it can start again from the oldest event held.
+    ChangesTrimmed,
+    /// The changefeed's retention policy is `off`: there are no events to read.
+    ChangefeedOff,
+    /// The file, or its log, was written by a newer release in a format this
+    /// one cannot read at all (its `min_reader_version`, or the log's version,
+    /// is above what this build knows). Open it with that release.
+    VersionTooNew,
 };
 
 /// Query execution errors
@@ -208,6 +241,12 @@ pub const QueryFailure = struct {
     message: []const u8,
     code: ?[]const u8 = null,
     location: ?QueryFailureLocation = null,
+    /// What failed, beyond the stage: a fault in the query or its data, or
+    /// the database underneath it. An execution failure can be either, and
+    /// the caller has to be able to tell them apart.
+    cause: Cause = .query,
+
+    pub const Cause = enum { query, storage, out_of_memory };
 
     pub fn deinit(self: *QueryFailure) void {
         self.allocator.free(self.message);
@@ -359,8 +398,11 @@ pub const QueryResult = struct {
 
 /// Database configuration
 pub const DatabaseConfig = struct {
-    /// Buffer pool size in bytes (default 4MB, auto-scales for vector/FTS)
-    /// Set to 0 to use automatic sizing based on enabled features
+    /// Buffer pool size in bytes. 0, the default, means not set: the
+    /// `LATTICE_BUFFER_POOL_MB` environment variable if it is set, else a size
+    /// from the enabled features (16 MB, plus 12 MB each for full-text search
+    /// and vectors). A size set here wins over the environment, as with
+    /// `sync_mode` and `full_fsync`.
     buffer_pool_size: usize = 0,
     /// Enable write-ahead logging
     enable_wal: bool = true,
@@ -368,11 +410,31 @@ pub const DatabaseConfig = struct {
     enable_fts: bool = true,
     /// FTS configuration
     fts_config: FtsConfig = .{},
-    /// Enable vector storage
+    /// Create the vector index if the database does not have one.
+    ///
+    /// A database whose file records a vector index opens with it whatever
+    /// this says, configured as the file records it. Setting this as well
+    /// asserts the configuration below: `vector_dimensions` and every vector
+    /// field that is not null must match the file, or the open fails with
+    /// `VectorConfigMismatch` rather than reading the index wrongly.
     enable_vector: bool = false,
-    /// Vector dimensions (required if enable_vector is true)
+    /// Vector dimensions, 1..4096, for a new index. With `enable_vector`,
+    /// 0 means "the file's": it opens a database that has an index, and
+    /// fails with `InvalidArgument` where one would have to be created.
     vector_dimensions: u16 = 128,
-    /// Enable in-memory adjacency cache for accelerated graph traversals
+    /// How the vector index measures distance, for a new index. Null means
+    /// the file's, or cosine for a new index. Fixed once the index exists.
+    vector_metric: ?VectorMetric = null,
+    /// HNSW connections per node, 2..32, for a new index (layer 0 keeps
+    /// twice as many). Null means the file's, or 16. Fixed once the index
+    /// exists: it decides the layout of the index's pages.
+    vector_m: ?u16 = null,
+    /// HNSW candidate list size while building, 1..4096, for a new index.
+    /// Null means the file's, or 200. Fixed once the index exists.
+    vector_ef_construction: ?u16 = null,
+    /// Keep an in-memory adjacency cache. Only `getOutgoingEdgesCached` reads
+    /// it; the query engine and the C API do not, so for them it speeds up
+    /// nothing and costs a hash lookup for each committed edge change.
     enable_adjacency_cache: bool = false,
     /// Enable query cache for parsed ASTs
     enable_query_cache: bool = true,
@@ -383,32 +445,115 @@ pub const DatabaseConfig = struct {
     /// Without this the WAL only resets when the database is closed, so a
     /// long-running process accumulates frames without limit and pays for them
     /// again in recovery time. Set to null to opt out and manage checkpoints by
-    /// hand.
+    /// hand. The default leaves `max_wal_frames` unset, which scales the
+    /// interval to the buffer pool the database opens with (see
+    /// `AutoCheckpointConfig.defaultMaxWalFrames`).
     auto_checkpoint: ?checkpoint_mod.AutoCheckpointConfig = .{},
 
+    /// On macOS, make every sync ask the drive to flush its cache
+    /// (F_FULLFSYNC). Plain fsync there returns once the drive has the data,
+    /// so a commit survives a process or OS crash but not necessarily a power
+    /// cut. Off by default because it costs several milliseconds per commit.
+    /// No effect on other platforms, where fsync already asks for the flush.
+    ///
+    /// Null, the default, means off unless `LATTICE_FULL_FSYNC` is set to
+    /// `1`/`true` or `0`/`false` in the environment. A value set here wins
+    /// over the environment: the variable is a default for code that does
+    /// not choose, not an override of code that does.
+    full_fsync: ?bool = null,
+
+    /// When a commit waits for the disk.
+    ///
+    /// `.full`, the default, syncs the log on every commit: a transaction
+    /// that has returned survives a power cut. `.normal` hands the commit to
+    /// the operating system and returns; it survives the process being
+    /// killed, and reaches the disk at the next checkpoint or `sync()`, so a
+    /// power cut or an OS crash can lose the most recent commits. They are
+    /// lost from the end only, and the database stays consistent. Most of
+    /// the time a small write transaction takes is this one fsync.
+    ///
+    /// Null, the default, means `.full` unless `LATTICE_SYNC_MODE` is set to
+    /// `normal` or `full` in the environment. A value set here wins over the
+    /// environment, as with `full_fsync`.
+    sync_mode: ?SyncMode = null,
+
+    /// How much of the changefeed (`__lattice_changes`) to keep.
+    ///
+    /// The file records its policy. Null, the default, keeps whatever the
+    /// file records, which for a file that records none is to keep every
+    /// event. A value set here replaces the file's policy when the database
+    /// is opened for writing; a read-only open never changes it. A new
+    /// database with no value here takes `LATTICE_CHANGEFEED_RETENTION` from
+    /// the environment if it is set (`all`, `off`, `last:<n>`, `age:<d>`).
+    ///
+    /// Retention acts at checkpoints (without a log, at flushes) and on
+    /// `trimChangefeed`, oldest events first. `off` writes no events at all.
+    changefeed_retention: ?changefeed_mod.Retention = null,
+
+    /// How a database this open creates writes ids as B-tree keys.
+    ///
+    /// `.big`, the default, is format 5: node, edge and document ids are
+    /// stored in id order, so ids handed out in sequence append to the
+    /// trees, which stay full, and scans return ascending ids. Such a file
+    /// needs this release or a later one to open it. `.little` lays the
+    /// file out as 0.17 and 0.18 do, slower to load and larger, but those
+    /// releases can still open it (read-only, once this release has written
+    /// it; see `FileHeader.min_writer_version`).
+    ///
+    /// Only a new database takes this. An existing file keeps the order it
+    /// was created with, whatever this says: the order is part of the file.
+    new_database_id_keys: IdKeyOrder = .big,
+
+    pub const SyncMode = enum { full, normal };
+
+    pub fn effectiveSyncMode(self: DatabaseConfig) SyncMode {
+        if (self.sync_mode) |mode| return mode;
+        if (std.c.getenv("LATTICE_SYNC_MODE")) |value| {
+            const text = std.mem.span(value);
+            if (std.ascii.eqlIgnoreCase(text, "normal")) return .normal;
+            if (std.ascii.eqlIgnoreCase(text, "full")) return .full;
+        }
+        return .full;
+    }
+
+    pub fn effectiveFullFsync(self: DatabaseConfig) bool {
+        if (self.full_fsync) |enabled| return enabled;
+        if (std.c.getenv("LATTICE_FULL_FSYNC")) |value| {
+            const text = std.mem.span(value);
+            if (std.mem.eql(u8, text, "1") or std.ascii.eqlIgnoreCase(text, "true")) return true;
+            if (std.mem.eql(u8, text, "0") or std.ascii.eqlIgnoreCase(text, "false")) return false;
+        }
+        return false;
+    }
+
     /// Compute effective buffer pool size based on enabled features.
-    /// Priority: LATTICE_BUFFER_POOL_MB env var > explicit buffer_pool_size > auto-sizing.
+    /// Priority: explicit buffer_pool_size > LATTICE_BUFFER_POOL_MB > auto-sizing.
+    /// The variable is a default for code that does not choose a size, not an
+    /// override of code that does.
     /// Auto-sizing:
     /// - Base: 16MB for graph operations (covers ~50K edges comfortably)
     /// - FTS enabled: +12MB (dictionary B+Tree, posting lists)
     /// - Vector enabled: +12MB (HNSW connections, vector pages)
     pub fn effectiveBufferPoolSize(self: DatabaseConfig) usize {
-        // Environment variable override (useful for tuning without recompilation)
-        if (std.c.getenv("LATTICE_BUFFER_POOL_MB")) |mb_z| {
-            if (std.fmt.parseInt(usize, std.mem.span(mb_z), 10)) |mb| {
-                if (mb > 0) return mb * 1024 * 1024;
-            } else |_| {}
-        }
-
         if (self.buffer_pool_size > 0) {
             return self.buffer_pool_size;
         }
+        if (environmentBufferPoolSize()) |size| return size;
 
         const base_size: usize = 16 * 1024 * 1024; // 16MB
         const fts_size: usize = if (self.enable_fts) 12 * 1024 * 1024 else 0; // +12MB
         const vector_size: usize = if (self.enable_vector) 12 * 1024 * 1024 else 0; // +12MB
 
         return base_size + fts_size + vector_size;
+    }
+
+    /// The size `LATTICE_BUFFER_POOL_MB` asks for, or null when it is unset or
+    /// not a positive whole number of megabytes.
+    pub fn environmentBufferPoolSize() ?usize {
+        const mb_z = std.c.getenv("LATTICE_BUFFER_POOL_MB") orelse return null;
+        const mb = std.fmt.parseInt(usize, std.mem.span(mb_z), 10) catch return null;
+        if (mb == 0) return null;
+        return std.math.mul(usize, mb, 1024 * 1024) catch null;
     }
 };
 
@@ -435,9 +580,114 @@ pub const OpenOptions = struct {
     lock: bool = true,
 };
 
+/// The vector configuration the open options ask for, for a new index.
+fn requestedVectorConfig(config: DatabaseConfig) DatabaseError!VectorConfig {
+    if (!types.isValidVectorDimensions(config.vector_dimensions)) return DatabaseError.InvalidArgument;
+    const m = config.vector_m orelse 16;
+    const ef_construction = config.vector_ef_construction orelse 200;
+    return .{
+        .dimensions = config.vector_dimensions,
+        .metric = config.vector_metric orelse .cosine,
+        .m = m,
+        .m_max0 = 2 * m,
+        .ef_construction = ef_construction,
+    };
+}
+
+/// Refuse vector options this release cannot honour, whatever the file holds.
+fn validateVectorOptions(config: DatabaseConfig) DatabaseError!void {
+    // Zero dimensions with vectors on means "whatever the file has", which
+    // only a database that has an index can answer.
+    if (config.enable_vector and config.vector_dimensions != 0 and
+        !types.isValidVectorDimensions(config.vector_dimensions))
+    {
+        return DatabaseError.InvalidArgument;
+    }
+    if (config.vector_metric) |metric| switch (metric) {
+        .cosine, .euclidean, .dot_product => {},
+        _ => return DatabaseError.InvalidArgument,
+    };
+    if (config.vector_m) |m| if (m < 2 or m > 32) return DatabaseError.InvalidArgument;
+    if (config.vector_ef_construction) |ef| if (ef < 1 or ef > 4096) return DatabaseError.InvalidArgument;
+}
+
+/// Whether the open options contradict the configuration the file holds.
+///
+/// Everything the caller states must match: the dimensions when vectors are
+/// asked for, and each of metric, m and ef_construction that is not left
+/// null. Dimensions, metric and m decide how the stored pages are read and
+/// what a distance means. ef_construction does neither, but a caller who
+/// names one expects the index to be built with it, and silently building
+/// with another would be the same surprise in a smaller form.
+fn checkVectorOptions(config: DatabaseConfig, file: VectorConfig) DatabaseError!void {
+    if (config.enable_vector and config.vector_dimensions != 0 and config.vector_dimensions != file.dimensions) {
+        return DatabaseError.VectorConfigMismatch;
+    }
+    if (config.vector_metric) |metric| if (metric != file.metric) return DatabaseError.VectorConfigMismatch;
+    if (config.vector_m) |m| if (m != file.m) return DatabaseError.VectorConfigMismatch;
+    if (config.vector_ef_construction) |ef| if (ef != file.ef_construction) return DatabaseError.VectorConfigMismatch;
+}
+
+/// The dimensions a file written before format 4 gave its vector index.
+///
+/// Such a file records no configuration, but everything else about it is
+/// known: 0.16.0 could set only the dimensions, and it wrote them into the
+/// header of every vector page. Null when the page cannot be read as one.
+fn legacyVectorDimensions(allocator: Allocator, pm: *PageManager, first_page: PageId) ?u16 {
+    if (first_page == NULL_PAGE or !pm.isValidPage(first_page)) return null;
+    const page_alignment = comptime std.mem.Alignment.fromByteUnits(4096);
+    const buf = allocator.alignedAlloc(u8, page_alignment, pm.getPageSize()) catch return null;
+    defer allocator.free(buf);
+    pm.readPage(first_page, buf) catch return null;
+    if (buf[0] != @intFromEnum(page_mod.PageType.vector_data)) return null;
+    const dimensions = vector_storage_mod.VectorPageHeader.read(buf).dimensions;
+    if (!types.isValidVectorDimensions(dimensions)) return null;
+    return dimensions;
+}
+
+/// The vector index a database opens with, or null for none.
+///
+/// The file decides when it has an index: its recorded configuration, or for
+/// a file from before format 4, the one inferred from its vector pages. Only
+/// when it has none do the options decide, by asking for one.
+fn resolveVectorConfig(allocator: Allocator, pm: *PageManager, config: DatabaseConfig) DatabaseError!?VectorConfig {
+    try validateVectorOptions(config);
+    const header = pm.getHeader();
+    if (header.storedVectorConfig()) |stored| {
+        try checkVectorOptions(config, stored);
+        return stored;
+    }
+    const file_has_vectors = header.vector_segment_page != NULL_PAGE or
+        header.getTreeRoot(.hnsw_node) != NULL_PAGE;
+    if (file_has_vectors) {
+        if (legacyVectorDimensions(allocator, pm, header.vector_segment_page)) |dimensions| {
+            const legacy = VectorConfig.legacy(dimensions);
+            try checkVectorOptions(config, legacy);
+            return legacy;
+        }
+    }
+    if (!config.enable_vector) return null;
+    return try requestedVectorConfig(config);
+}
+
+fn hnswConfigFor(config: VectorConfig) HnswConfig {
+    return .{
+        .dimensions = config.dimensions,
+        .m = config.m,
+        .m_max0 = config.m_max0,
+        .ef_construction = config.ef_construction,
+        .metric = switch (config.metric) {
+            .euclidean => .euclidean,
+            .dot_product => .inner_product,
+            else => .cosine,
+        },
+    };
+}
+
 fn mapWalInitError(err: WalError) DatabaseError {
     return switch (err) {
         WalError.IoError => DatabaseError.IoError,
+        WalError.VersionTooNew => DatabaseError.VersionTooNew,
         WalError.InvalidMagic,
         WalError.UuidMismatch,
         WalError.VersionMismatch,
@@ -489,6 +739,7 @@ fn mapFtsError(err: FtsError) DatabaseError {
         FtsError.NotFound => DatabaseError.NotFound,
         FtsError.OutOfMemory => DatabaseError.OutOfMemory,
         FtsError.InvalidQuery => DatabaseError.InvalidArgument,
+        FtsError.PhraseNeedsPositions => DatabaseError.InvalidArgument,
         else => DatabaseError.IoError,
     };
 }
@@ -498,6 +749,7 @@ fn shouldResetWalForNewDatabase(err: WalError) bool {
         WalError.InvalidMagic,
         WalError.UuidMismatch,
         WalError.VersionMismatch,
+        WalError.VersionTooNew,
         WalError.ChecksumMismatch,
         WalError.CorruptedFrame,
         => true,
@@ -511,17 +763,21 @@ const TxnNodeState = struct {
     properties: []node_mod.Property,
 
     fn clone(self: TxnNodeState, allocator: Allocator) Allocator.Error!TxnNodeState {
+        const labels = try cloneSymbolIds(allocator, self.labels);
+        errdefer allocator.free(labels);
         return .{
             .exists = self.exists,
-            .labels = try cloneSymbolIds(allocator, self.labels),
+            .labels = labels,
             .properties = try cloneProperties(allocator, self.properties),
         };
     }
 
     fn toNode(self: TxnNodeState, allocator: Allocator, node_id: NodeId) Allocator.Error!node_mod.Node {
+        const labels = try cloneSymbolIds(allocator, self.labels);
+        errdefer allocator.free(labels);
         return .{
             .id = node_id,
-            .labels = try cloneSymbolIds(allocator, self.labels),
+            .labels = labels,
             .properties = try cloneProperties(allocator, self.properties),
         };
     }
@@ -586,7 +842,6 @@ const TxnVectorState = union(enum) {
     }
 };
 
-
 const TxnStreamAppend = struct {
     stream: []u8,
     kind: []u8,
@@ -626,11 +881,40 @@ const TxnStreamTrim = struct {
 const TxnOverlay = struct {
     node_states: std.AutoHashMapUnmanaged(NodeId, TxnNodeState) = .{},
     edge_states: std.AutoHashMapUnmanaged(EdgeId, TxnEdgeState) = .{},
+    /// The edges in `edge_states` that exist, under each of their two
+    /// endpoints, so reading one node's relationships looks at that node's
+    /// pending edges instead of every pending edge of the transaction.
+    /// Endpoints never change, so an edge is added once, when it first
+    /// exists here, and never removed; a later state that deletes it fails
+    /// the `exists` check where it is read.
+    edges_by_node: std.AutoHashMapUnmanaged(NodeId, std.ArrayListUnmanaged(EdgeId)) = .{},
     vector_states: std.AutoHashMapUnmanaged(NodeId, TxnVectorState) = .{},
     stream_appends: std.ArrayListUnmanaged(TxnStreamAppend) = .empty,
     stream_offsets: std.ArrayListUnmanaged(TxnStreamOffset) = .empty,
     stream_trims: std.ArrayListUnmanaged(TxnStreamTrim) = .empty,
+    /// Highest sequence staged so far for each stream this transaction
+    /// appends to, so the next append costs one lookup instead of a scan of
+    /// every earlier append. Keys borrow the `stream` slice of the first
+    /// append to that stream, which lives as long as the overlay.
+    stream_last_sequences: std.StringHashMapUnmanaged(u64) = .empty,
+    /// The changefeed events of this transaction, staged at commit.
+    changefeed: changefeed_mod.Batch = .{},
+    /// The ids of `node_states` and `edge_states` in ascending order, sorted
+    /// once at commit when the stored states are read, and used again to
+    /// stage the changefeed and to apply.
+    sorted_node_ids: ?[]NodeId = null,
+    sorted_edge_ids: ?[]EdgeId = null,
     has_staged_writes: bool = false,
+    /// Staged nodes by indexed value, for index lookups in the transaction.
+    node_lookup: OverlayLookup = .{},
+    /// Staged edges by indexed value.
+    edge_lookup: OverlayLookup = .{},
+    /// What the store holds for each node and edge in `node_states` and
+    /// `edge_states`, read once when the transaction commits, for the
+    /// readers' snapshots, the changefeed, the log and the apply alike. A
+    /// record the store does not hold has no entry.
+    stored_nodes: std.AutoHashMapUnmanaged(NodeId, TxnNodeState) = .{},
+    stored_edges: std.AutoHashMapUnmanaged(EdgeId, TxnEdgeState) = .{},
 
     fn hasChanges(self: *const TxnOverlay) bool {
         return self.has_staged_writes;
@@ -638,6 +922,25 @@ const TxnOverlay = struct {
 
     fn markDirty(self: *TxnOverlay) void {
         self.has_staged_writes = true;
+    }
+
+    fn clearSortedIds(self: *TxnOverlay, allocator: Allocator) void {
+        if (self.sorted_node_ids) |ids| allocator.free(ids);
+        if (self.sorted_edge_ids) |ids| allocator.free(ids);
+        self.sorted_node_ids = null;
+        self.sorted_edge_ids = null;
+    }
+
+    /// The sorted node ids, if they were sorted for the overlay as it is.
+    fn sortedNodeIds(self: *const TxnOverlay) ?[]const NodeId {
+        const ids = self.sorted_node_ids orelse return null;
+        return if (ids.len == self.node_states.count()) ids else null;
+    }
+
+    /// The sorted edge ids, if they were sorted for the overlay as it is.
+    fn sortedEdgeIds(self: *const TxnOverlay) ?[]const EdgeId {
+        const ids = self.sorted_edge_ids orelse return null;
+        return if (ids.len == self.edge_states.count()) ids else null;
     }
 
     fn deinit(self: *TxnOverlay, allocator: Allocator) void {
@@ -653,13 +956,19 @@ const TxnOverlay = struct {
         }
         self.edge_states.deinit(allocator);
 
+        var by_node_iter = self.edges_by_node.valueIterator();
+        while (by_node_iter.next()) |list| list.deinit(allocator);
+        self.edges_by_node.deinit(allocator);
+
         var vector_iter = self.vector_states.iterator();
         while (vector_iter.next()) |entry| {
             entry.value_ptr.deinit(allocator);
         }
         self.vector_states.deinit(allocator);
 
-
+        self.stream_last_sequences.deinit(allocator);
+        self.changefeed.deinit(allocator);
+        self.clearSortedIds(allocator);
         for (self.stream_appends.items) |*append| {
             append.deinit(allocator);
         }
@@ -675,7 +984,22 @@ const TxnOverlay = struct {
         }
         self.stream_trims.deinit(allocator);
 
+        self.node_lookup.deinit(allocator);
+        self.edge_lookup.deinit(allocator);
+        self.clearStored(allocator);
+        self.stored_nodes.deinit(allocator);
+        self.stored_edges.deinit(allocator);
+
         self.* = .{};
+    }
+
+    fn clearStored(self: *TxnOverlay, allocator: Allocator) void {
+        var node_iter = self.stored_nodes.valueIterator();
+        while (node_iter.next()) |state| state.deinit(allocator);
+        self.stored_nodes.clearRetainingCapacity();
+        var edge_iter = self.stored_edges.valueIterator();
+        while (edge_iter.next()) |state| state.deinit(allocator);
+        self.stored_edges.clearRetainingCapacity();
     }
 };
 
@@ -712,12 +1036,78 @@ fn freeProperties(allocator: Allocator, properties: []node_mod.Property) void {
     allocator.free(properties);
 }
 
+/// Set property `key_id` to a copy of `value` in an owned property list, or
+/// remove it when `value` is null, changing nothing else: the other values
+/// stay where they are rather than being copied. Returns whether the list
+/// changed. On failure the list is as it was.
+fn editProperties(
+    allocator: Allocator,
+    properties: *[]node_mod.Property,
+    key_id: symbols_mod.SymbolId,
+    value: ?PropertyValue,
+) Allocator.Error!bool {
+    const index: ?usize = for (properties.*, 0..) |prop, i| {
+        if (prop.key_id == key_id) break i;
+    } else null;
+
+    const new_value = value orelse {
+        const i = index orelse return false;
+        const kept = try allocator.alloc(node_mod.Property, properties.len - 1);
+        @memcpy(kept[0..i], properties.*[0..i]);
+        @memcpy(kept[i..], properties.*[i + 1 ..]);
+        var removed = properties.*[i].value;
+        removed.deinit(allocator);
+        allocator.free(properties.*);
+        properties.* = kept;
+        return true;
+    };
+
+    var copy = try new_value.clone(allocator);
+    if (index) |i| {
+        var old = properties.*[i].value;
+        properties.*[i].value = copy;
+        old.deinit(allocator);
+        return true;
+    }
+    const grown = allocator.realloc(properties.*, properties.len + 1) catch |err| {
+        copy.deinit(allocator);
+        return err;
+    };
+    grown[grown.len - 1] = .{ .key_id = key_id, .value = copy };
+    properties.* = grown;
+    return true;
+}
+
 fn emptySymbolIds(allocator: Allocator) Allocator.Error![]symbols_mod.SymbolId {
     return allocator.alloc(symbols_mod.SymbolId, 0);
 }
 
 fn emptyProperties(allocator: Allocator) Allocator.Error![]node_mod.Property {
     return allocator.alloc(node_mod.Property, 0);
+}
+
+/// The keys of an id-keyed map in ascending order, or null when there are
+/// fewer than two or the copy cannot be allocated (the caller then walks
+/// the map in its own order).
+fn sortedKeysAlloc(comptime K: type, allocator: Allocator, map: anytype) ?[]K {
+    if (map.count() < 2) return null;
+    const keys = allocator.alloc(K, map.count()) catch return null;
+    var iter = map.keyIterator();
+    var i: usize = 0;
+    while (iter.next()) |key| : (i += 1) keys[i] = key.*;
+    std.mem.sortUnstable(K, keys, {}, std.sort.asc(K));
+    return keys;
+}
+
+/// The keys of an id-keyed map in ascending order, always (unlike
+/// sortedKeysAlloc, which may fall back to the map's own order).
+fn sortedIdsAlloc(comptime K: type, allocator: Allocator, map: anytype) Allocator.Error![]K {
+    const keys = try allocator.alloc(K, map.count());
+    var iter = map.keyIterator();
+    var i: usize = 0;
+    while (iter.next()) |key| : (i += 1) keys[i] = key.*;
+    std.mem.sortUnstable(K, keys, {}, std.sort.asc(K));
+    return keys;
 }
 
 fn containsSymbolId(values: []const symbols_mod.SymbolId, needle: symbols_mod.SymbolId) bool {
@@ -768,11 +1158,10 @@ fn ftsTextOf(definition: FtsDefinition, properties: []const node_mod.Property) ?
 /// concurrent readers each pin pages of their own. Sixteen times the observed
 /// requirement is cheap insurance at 256 KB.
 ///
-/// Note also where this floor actually applies. The pool is the smaller of the
-/// configured budget and the database plus this floor, so for anything but a very
-/// small database the database term dominates and the floor is irrelevant. A
-/// database small enough for the floor to matter has too few pages to pin many of
-/// them, which is the opposite of the dangerous case.
+/// Note also where this number applies. An in-memory database gets the smaller
+/// of the configured budget and this many frames, so in practice it is the size
+/// of that pool rather than a floor under it. Dirty pages are held in overflow
+/// frames beyond it until the next flush.
 const MIN_MEMORY_POOL_FRAMES: usize = 64;
 
 /// The path that asks for a database with no files behind it.
@@ -795,11 +1184,21 @@ pub fn isMemoryPath(path: []const u8) bool {
 pub const Backend = union(enum) {
     posix: PosixVfs,
     memory: memory_vfs_mod.MemoryVfs,
+    /// A filesystem the caller owns and keeps alive for the life of the
+    /// database. Treated like a disk: the database keeps a flush journal on
+    /// it. For tests that need to see every write, such as the power-loss
+    /// simulation.
+    external: vfs_mod.Vfs,
+    /// A read-only open that had work to recover: the files underneath are
+    /// read, and recovery's writes stay in memory. See `openReadOnly`.
+    overlay: *ReplayFs,
 
     pub fn vfs(self: *Backend) vfs_mod.Vfs {
         return switch (self.*) {
             .posix => |*p| p.vfs(),
             .memory => |*m| m.vfs(),
+            .external => |v| v,
+            .overlay => |r| r.overlay.vfs(),
         };
     }
 
@@ -809,9 +1208,28 @@ pub const Backend = union(enum) {
             // closed by whoever opened them.
             .posix => {},
             .memory => |*m| m.deinit(),
+            .external => {},
+            .overlay => |r| {
+                r.overlay.deinit();
+                r.allocator.destroy(r);
+            },
         }
     }
 };
+
+/// What a read-only open with recovery to do runs on.
+pub const ReplayFs = struct {
+    allocator: Allocator,
+    posix: PosixVfs,
+    overlay: overlay_vfs_mod.OverlayVfs,
+};
+
+/// What a read-only open may hold in memory to recover a database: this much,
+/// plus four times the size of the log and the journal it has to apply.
+pub const READ_ONLY_RECOVERY_BASE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// Replaces `READ_ONLY_RECOVERY_BASE_BUDGET` when set, for tests.
+pub var read_only_recovery_budget_for_testing: ?usize = null;
 
 /// Central database coordinator
 pub const Database = struct {
@@ -825,6 +1243,9 @@ pub const Database = struct {
     vfs: Backend,
     page_manager: PageManager,
     buffer_pool: BufferPool,
+    /// Where the buffer pool records a flush before writing it in place.
+    /// Null for a read-only handle and for a database with no file.
+    journal: ?journal_mod.Journal,
     wal: ?WalManager,
 
     // B+Trees (8 trees for different stores)
@@ -868,10 +1289,40 @@ pub const Database = struct {
     txn_overlays: std.AutoHashMap(u64, TxnOverlay),
     /// When the last automatic checkpoint ran, for the minimum-interval check.
     last_auto_checkpoint_ns: i128,
+    /// The policy commits checkpoint by: `config.auto_checkpoint` as opened,
+    /// then whatever `setAutoCheckpoint` last set, always with
+    /// `max_wal_frames` filled in. Whether the log is folded in at open and
+    /// close stays with `config.auto_checkpoint`.
+    auto_checkpoint: ?checkpoint_mod.AutoCheckpointConfig,
     active_writer_txn_id: ?u64,
+    /// Set when a commit that is already in the log could not be applied, or
+    /// when the log could not be synced. What this handle holds in memory no
+    /// longer matches the log, so it refuses new transactions and stops
+    /// writing checkpoints; reopening replays the log and puts things right.
+    failed: bool = false,
+    /// Test hook: fail the next commit after its commit record is durable,
+    /// in place of applying it.
+    fail_next_apply_for_testing: bool = false,
+    /// Fail a commit's apply once it has inserted this many of the traversal
+    /// keys `applyNewEdgeKeysSorted` sorts, after writing those keys to the
+    /// file as a full buffer pool would. For tests of recovery from a
+    /// transaction applied in part.
+    fail_apply_after_edge_keys_for_testing: ?usize = null,
+    /// Test hook: fail the next commit once its changefeed is staged, before
+    /// anything is logged, leaving the transaction open.
+    fail_after_changefeed_staging_for_testing: bool = false,
+    /// Test hook: where `upgradeIdKeysTo` is made to fail.
+    upgrade_fault_for_testing: ?id_key_upgrade.Fault = null,
     stream_mutex: @import("compat").Mutex,
     stream_cond: @import("compat").Condition,
     stream_epoch: u64,
+    /// The changefeed retention policy in force.
+    changefeed_retention: changefeed_mod.Retention,
+    /// Events committed since retention last trimmed, which bounds how much
+    /// a checkpoint's trimming pass takes on.
+    changefeed_appended_since_trim: u64,
+    /// Where property values are encoded for the changefeed.
+    changefeed_scratch: std.ArrayListUnmanaged(u8),
 
     // Caches
     adjacency_cache: ?AdjacencyCache,
@@ -879,6 +1330,10 @@ pub const Database = struct {
 
     // Configuration
     config: DatabaseConfig,
+    /// How this file writes ids as keys in the node tree, the edge id index,
+    /// the full-text document trees and the vector index's node tree. Read
+    /// from the header when the file is opened and fixed from then on.
+    id_key_order: IdKeyOrder,
     path: []const u8,
     read_only: bool,
     /// Set when the file at `path` was created by `deserialize` and exists only
@@ -891,7 +1346,100 @@ pub const Database = struct {
     ///
     /// Pass `:memory:` as the path for a database with no files behind it.
     pub fn open(allocator: Allocator, path: []const u8, options: OpenOptions) DatabaseError!*Self {
+        if (options.read_only and !isMemoryPath(path)) return openReadOnly(allocator, path, options, null);
         return openWithBackend(allocator, path, options, null);
+    }
+
+    /// Open a database on a filesystem the caller supplies, which has to
+    /// outlive the database. It is used like a disk, journal included.
+    pub fn openWithVfs(allocator: Allocator, path: []const u8, options: OpenOptions, vfs: vfs_mod.Vfs) DatabaseError!*Self {
+        if (options.read_only) return openReadOnly(allocator, path, options, vfs);
+        return openWithBackend(allocator, path, options, Backend{ .external = vfs });
+    }
+
+    /// Open a database for reading, recovering it in memory if it needs it.
+    ///
+    /// A crash can leave committed transactions in the log that the file does
+    /// not have yet, and a flush half done that the journal has to finish. A
+    /// read-only open used to read the file as it was and so served a state
+    /// from before those commits, or refused when the journal held a flush.
+    /// Now, when the log holds frames or the journal holds anything, the
+    /// database is opened on an overlay: the files are read and never
+    /// written, and recovery runs as it would in a writable open, with every
+    /// write it makes kept in memory. What that memory may hold is bounded
+    /// (`READ_ONLY_RECOVERY_BASE_BUDGET`); a recovery that needs more fails
+    /// the open with `BufferPoolFull`, and a writable open recovers it.
+    ///
+    /// The shared lock a reader takes keeps a writer out while the files are
+    /// read, as before. Without locking, a log that a live writer is still
+    /// appending to is recovered as far as it was written.
+    fn openReadOnly(allocator: Allocator, path: []const u8, options: OpenOptions, external: ?vfs_mod.Vfs) DatabaseError!*Self {
+        var posix = PosixVfs.init(allocator);
+        const base = external orelse posix.vfs();
+
+        const work = recoveryWorkSize(allocator, base, path, options.config.enable_wal) catch |err| return err;
+        const pending = work orelse {
+            const backend: ?Backend = if (external) |v| Backend{ .external = v } else null;
+            return openWithBackend(allocator, path, options, backend);
+        };
+
+        const replay = allocator.create(ReplayFs) catch return DatabaseError.OutOfMemory;
+        replay.* = .{ .allocator = allocator, .posix = PosixVfs.init(allocator), .overlay = undefined };
+        const overlay_base = external orelse replay.posix.vfs();
+        const budget = read_only_recovery_budget_for_testing orelse READ_ONLY_RECOVERY_BASE_BUDGET +| (pending *| 4);
+        replay.overlay = overlay_vfs_mod.OverlayVfs.init(allocator, overlay_base, budget);
+        var exceeded = false;
+        replay.overlay.exceeded_out = &exceeded;
+
+        var writable = options;
+        writable.read_only = false;
+        writable.create = false;
+        // A reader never changes the file's changefeed policy, not even in
+        // the memory the overlay keeps.
+        writable.config.changefeed_retention = null;
+        const db = openWithBackend(allocator, path, writable, Backend{ .overlay = replay }) catch |err| {
+            if (exceeded) return DatabaseError.BufferPoolFull;
+            return err;
+        };
+        replay.overlay.exceeded_out = null;
+        db.read_only = true;
+        return db;
+    }
+
+    /// How many bytes of log and journal a read-only open has to apply, or
+    /// null when there is nothing to recover and the file can be read as it
+    /// is. A file too short to be a database is left to the ordinary open
+    /// to refuse.
+    fn recoveryWorkSize(allocator: Allocator, base: vfs_mod.Vfs, path: []const u8, wal_enabled: bool) DatabaseError!?u64 {
+        if (fileSize(base, path) < types.DEFAULT_PAGE_SIZE) return null;
+        var work: u64 = 0;
+        var needed = false;
+
+        const journal_path = std.fmt.allocPrint(allocator, "{s}-journal", .{path}) catch return DatabaseError.OutOfMemory;
+        defer allocator.free(journal_path);
+        const journal_size = fileSize(base, journal_path);
+        if (journal_size > 0) {
+            needed = true;
+            work += journal_size;
+        }
+
+        if (wal_enabled) {
+            const wal_path = std.fmt.allocPrint(allocator, "{s}-wal", .{path}) catch return DatabaseError.OutOfMemory;
+            defer allocator.free(wal_path);
+            const wal_size = fileSize(base, wal_path);
+            if (wal_size > wal_mod.WAL_HEADER_SIZE) {
+                needed = true;
+                work += wal_size;
+            }
+        }
+        return if (needed) work else null;
+    }
+
+    fn fileSize(base: vfs_mod.Vfs, path: []const u8) u64 {
+        if (!base.exists(path)) return 0;
+        const file = base.open(path, .{ .read = true }) catch return 0;
+        defer file.close();
+        return file.size() catch 0;
     }
 
     /// Open a database, optionally against a backend that already holds it.
@@ -908,9 +1456,7 @@ pub const Database = struct {
         if (!page_manager.isValidPageSize(options.page_size)) {
             return DatabaseError.InvalidArgument;
         }
-        if (options.config.enable_vector and !types.isValidVectorDimensions(options.config.vector_dimensions)) {
-            return DatabaseError.InvalidArgument;
-        }
+        try validateVectorOptions(options.config);
 
         var self = allocator.create(Self) catch return DatabaseError.OutOfMemory;
         errdefer allocator.destroy(self);
@@ -918,8 +1464,15 @@ pub const Database = struct {
         self.allocator = allocator;
         self.config = options.config;
         self.read_only = options.read_only;
+        // Read by the flush paths, which recovery reaches before the rest of
+        // this handle is set up.
+        self.failed = false;
         // Only `deserialize` sets this, once its file has actually been opened.
         self.owns_backing_file = false;
+        self.changefeed_retention = .keep_all;
+        self.changefeed_appended_since_trim = 0;
+        self.changefeed_scratch = .empty;
+        errdefer self.changefeed_scratch.deinit(allocator);
 
         // Copy path for later use
         self.path = allocator.dupe(u8, path) catch return DatabaseError.OutOfMemory;
@@ -931,6 +1484,10 @@ pub const Database = struct {
         else
             Backend{ .posix = PosixVfs.init(allocator) };
         errdefer self.vfs.deinit();
+        switch (self.vfs) {
+            .posix => |*posix| posix.full_fsync = options.config.effectiveFullFsync(),
+            .memory, .external, .overlay => {},
+        }
 
         // 2. Open/create PageManager
         //
@@ -942,11 +1499,23 @@ pub const Database = struct {
         // create finds it rather than replacing it.
         const effective_create = options.create or isMemoryPath(path);
 
+        // Options a new database cannot be created with are refused before
+        // the file is: a refused open must not leave an empty database
+        // behind for the next open to find. The range checks above already
+        // ran; what is left depends on whether there is a file.
+        if (effective_create and self.vfs != .memory and fileSize(self.vfs.vfs(), path) == 0) {
+            // Nothing to read, and a read-only handle may not write one.
+            if (options.read_only) return DatabaseError.FileNotFound;
+            // "The file's dimensions", with no file to ask.
+            if (options.config.enable_vector and options.config.vector_dimensions == 0) return DatabaseError.InvalidArgument;
+        }
+
         self.page_manager = PageManager.init(allocator, self.vfs.vfs(), path, .{
             .create = effective_create,
             .read_only = options.read_only,
             .page_size = options.page_size,
             .lock = options.lock,
+            .new_file_id_keys = options.config.new_database_id_keys,
         }) catch |err| {
             return switch (err) {
                 PageManagerError.FileNotFound => DatabaseError.FileNotFound,
@@ -955,10 +1524,21 @@ pub const Database = struct {
                 PageManagerError.InvalidPageSize => DatabaseError.InvalidArgument,
                 PageManagerError.OutOfMemory => DatabaseError.OutOfMemory,
                 PageManagerError.InvalidMagic, PageManagerError.InvalidHeader => DatabaseError.InvalidDatabase,
+                PageManagerError.WriterVersionTooNew => DatabaseError.NeedsNewerWriter,
+                PageManagerError.VersionTooNew => DatabaseError.VersionTooNew,
                 else => DatabaseError.IoError,
             };
         };
         errdefer self.page_manager.deinit();
+        self.id_key_order = self.page_manager.getHeader().idKeyOrder();
+
+        // 2b. The vector index, configured as the file records it. A file
+        // with a vector index opens with it whatever the options say, and
+        // options that contradict it are refused here, before any of its
+        // pages could be read the wrong way.
+        const vector_config = try resolveVectorConfig(allocator, &self.page_manager, options.config);
+        self.config.enable_vector = vector_config != null;
+        if (vector_config) |vc| self.config.vector_dimensions = vc.dimensions;
 
         // 3. Initialize BufferPool (auto-scales based on enabled features)
         // An in-memory database gets a small fixed pool, and the reason is that
@@ -980,16 +1560,41 @@ pub const Database = struct {
         // evictable the pool returns BufferPoolFull, which surfaces as a failed
         // query rather than a slow one, so there must be room for the largest set
         // of pages pinned at once.
-        const configured_pool_size = options.config.effectiveBufferPoolSize();
+        const configured_pool_size = self.config.effectiveBufferPoolSize();
         const memory_pool_size = MIN_MEMORY_POOL_FRAMES * @as(usize, self.page_manager.getPageSize());
         const effective_pool_size = switch (self.vfs) {
-            .posix => configured_pool_size,
+            .posix, .external, .overlay => configured_pool_size,
             .memory => @min(configured_pool_size, memory_pool_size),
         };
         self.buffer_pool = BufferPool.init(allocator, &self.page_manager, effective_pool_size) catch {
             return DatabaseError.BufferPoolFull;
         };
-        errdefer self.buffer_pool.deinit();
+        // An open that is refused leaves the file as it found it.
+        errdefer {
+            self.buffer_pool.abandonDirty();
+            self.buffer_pool.deinit();
+        }
+
+        // 3b. The journal that makes each flush of the pool all-or-nothing.
+        // Anything a crash left in it was applied when the page manager
+        // opened the file.
+        self.journal = null;
+        if (!options.read_only and self.vfs != .memory) {
+            const journal_path = std.fmt.allocPrint(allocator, "{s}-journal", .{path}) catch {
+                return DatabaseError.OutOfMemory;
+            };
+            defer allocator.free(journal_path);
+            self.journal = journal_mod.Journal.open(allocator, self.vfs.vfs(), journal_path) catch {
+                return DatabaseError.IoError;
+            };
+            self.journal.?.syncDirectoryOnFirstWrite(journal_path) catch {
+                self.journal.?.deinit();
+                self.journal = null;
+                return DatabaseError.OutOfMemory;
+            };
+            self.buffer_pool.journal = &self.journal.?;
+        }
+        errdefer if (self.journal) |*journal| journal.deinit();
 
         const opened_new_database = !self.page_manager.getHeader().hasInitializedTrees();
 
@@ -1023,10 +1628,15 @@ pub const Database = struct {
                 return mapWalInitError(err);
             };
         }
+        // An open can still be refused from here on, by recovery among
+        // others, and must not leave the log's file handle behind.
+        errdefer if (self.wal) |*wal| wal.deinit();
 
         // Initialize these early since saveTreeRoots() checks them
         self.vector_storage = null;
         self.hnsw_index = null;
+        errdefer if (self.vector_storage) |*vs| vs.deinit();
+        errdefer if (self.hnsw_index) |*hnsw| hnsw.deinit();
         self.hnsw_node_tree = null;
         self.stream_meta_tree = null;
         self.stream_events_tree = null;
@@ -1041,6 +1651,11 @@ pub const Database = struct {
         const header = self.page_manager.getHeader();
         const is_new = !header.hasInitializedTrees();
 
+        // Setting up the trees saves their roots, and saving the roots
+        // stores the node id counter. Until the node store is set up below,
+        // the counter stored is the one the header already holds.
+        self.node_store = .{ .allocator = allocator, .tree = &self.node_tree, .id_keys = self.id_key_order, .next_id = header.next_node_id };
+
         if (is_new) {
             try self.initNewTrees();
         } else {
@@ -1053,34 +1668,36 @@ pub const Database = struct {
         }
 
         // 6. Initialize Symbol Table
-        self.symbol_table = SymbolTable.init(allocator, &self.symbol_forward_tree, &self.symbol_reverse_tree);
+        // An existing database whose symbol tree cannot be read must not be
+        // opened for writing with the symbol id counter restarted: new names
+        // would take ids that existing labels and property names already have.
+        self.symbol_table = if (is_new or options.read_only)
+            SymbolTable.init(allocator, &self.symbol_forward_tree, &self.symbol_reverse_tree)
+        else
+            SymbolTable.initChecked(allocator, &self.symbol_forward_tree, &self.symbol_reverse_tree) catch return DatabaseError.IoError;
 
         // 7. Initialize Graph Stores
-        self.node_store = NodeStore.init(allocator, &self.node_tree);
-        self.edge_store = EdgeStore.init(allocator, &self.edge_tree, &self.edge_id_tree);
+        // The node id counter comes from the header, so opening does not
+        // walk every node to find the highest id, and a deleted node's id is
+        // never handed out again. A file without one (written by 0.16.0, or
+        // rewritten by it since) gets it by one scan, and the next flush
+        // stores it. A read-only handle creates no nodes and needs no counter.
+        // An existing database whose node tree cannot be scanned must not be
+        // opened for writing with its id counter reset to 1.
+        const stored_next_node_id = header.storedNextNodeId();
+        self.node_store = if (stored_next_node_id) |next_id|
+            NodeStore.initAt(allocator, &self.node_tree, self.id_key_order, next_id)
+        else if (is_new or options.read_only)
+            NodeStore.initAt(allocator, &self.node_tree, self.id_key_order, 1)
+        else
+            NodeStore.initChecked(allocator, &self.node_tree, self.id_key_order) catch return DatabaseError.IoError;
+        // The same goes for the edge id counter.
+        self.edge_store = if (is_new or options.read_only)
+            EdgeStore.init(allocator, &self.edge_tree, &self.edge_id_tree, self.id_key_order)
+        else
+            EdgeStore.initChecked(allocator, &self.edge_tree, &self.edge_id_tree, self.id_key_order) catch return DatabaseError.IoError;
         self.label_index = LabelIndex.init(allocator, &self.label_tree);
         self.initializePropertyIndex();
-
-        // 7b. Run WAL recovery if needed
-        if (self.wal) |*wal| {
-            var rm = recovery_mod.RecoveryManager.initWithLogicalContext(allocator, .{
-                .node_store = &self.node_store,
-                .edge_store = &self.edge_store,
-                .symbol_table = &self.symbol_table,
-                .label_index = &self.label_index,
-                .stream_trees = self.streamTrees(),
-            });
-            const stats = rm.recover(wal, &self.page_manager) catch |err| switch (err) {
-                error.MidLogCorruption => return DatabaseError.InvalidDatabase,
-                else => return DatabaseError.IoError,
-            };
-            // Persist recovered state if any redo operations were applied
-            if (stats.redo_operations > 0) {
-                try self.rebuildPropertyIndexes();
-                try self.rebuildFtsIndexes();
-                self.saveTreeRoots() catch {};
-            }
-        }
 
         // 8. Initialize FTS (optional)
         self.fts_index = null;
@@ -1092,6 +1709,7 @@ pub const Database = struct {
                 &self.fts_lengths_tree,
                 if (self.fts_reverse_tree) |*t| t else null,
                 options.config.fts_config,
+                self.id_key_order,
             );
         }
 
@@ -1099,8 +1717,9 @@ pub const Database = struct {
 
         // 8b. Initialize Vector Storage (optional)
         // (vector_storage and hnsw_index already initialized to null above)
-        const is_existing_vectors = options.config.enable_vector and header.vector_segment_page != NULL_PAGE;
-        if (options.config.enable_vector) {
+        const is_existing_vectors = vector_config != null and header.vector_segment_page != NULL_PAGE;
+        var vector_config_recorded = false;
+        if (vector_config) |vc| {
             // Check if vector storage already exists (from a previous session)
             if (header.vector_segment_page != NULL_PAGE) {
                 // Open existing vector storage
@@ -1108,15 +1727,21 @@ pub const Database = struct {
                     allocator,
                     &self.buffer_pool,
                     header.vector_segment_page,
-                    options.config.vector_dimensions,
+                    vc.dimensions,
                 ) catch |err| return mapVectorStorageError(err);
             } else {
                 // Create new vector storage
                 self.vector_storage = VectorStorage.init(
                     allocator,
                     &self.buffer_pool,
-                    options.config.vector_dimensions,
+                    vc.dimensions,
                 ) catch |err| return mapVectorStorageError(err);
+            }
+
+            // The file records the configuration from the moment the index
+            // exists, including a 0.16.0 file's, which had none.
+            if (!options.read_only) {
+                vector_config_recorded = self.page_manager.recordVectorConfig(vc) catch return DatabaseError.IoError;
             }
 
             // 8c. Initialize HNSW index if vector storage is available
@@ -1125,9 +1750,7 @@ pub const Database = struct {
                     allocator,
                     &self.buffer_pool,
                     vs,
-                    HnswConfig{
-                        .dimensions = options.config.vector_dimensions,
-                    },
+                    hnswConfigFor(vc),
                 );
 
                 // 8d. Load HNSW index from B+Tree, or rebuild from vectors
@@ -1135,7 +1758,7 @@ pub const Database = struct {
                     if (self.hnsw_index) |*hnsw| {
                         var loaded = false;
                         if (self.hnsw_node_tree) |*tree| {
-                            if (hnsw.loadFromTree(tree)) |ok| {
+                            if (hnsw.loadFromTree(tree, self.id_key_order)) |ok| {
                                 loaded = ok;
                             } else |_| {
                                 hnsw.resetForRebuild();
@@ -1149,14 +1772,88 @@ pub const Database = struct {
             }
         }
 
-        // 9. Initialize Transaction Manager
-        self.txn_manager = null;
+        // Recovery needs real empty tree pages, not the zeroed allocation
+        // placeholders. Persist the initial structure before accepting writes;
+        // subsequent transactions remain durable through the WAL.
+        if (is_new and !options.read_only) {
+            try self.sync();
+            self.page_manager.sync() catch return DatabaseError.IoError;
+            // The files are durable; make their names durable too.
+            self.vfs.vfs().syncParentDir(path);
+        }
+
+        // Recover only after the vector index is available for logical redo.
+        var recovered_max_txn_id: u64 = 0;
         if (self.wal) |*wal| {
-            self.txn_manager = TxnManager.init(allocator, wal);
+            var rm = recovery_mod.RecoveryManager.initWithLogicalContext(allocator, .{
+                .node_store = &self.node_store,
+                .edge_store = &self.edge_store,
+                .symbol_table = &self.symbol_table,
+                .label_index = &self.label_index,
+                .stream_trees = self.streamTrees(),
+                .hnsw_index = if (self.hnsw_index) |*hnsw| hnsw else null,
+                .file_has_vectors = header.vector_segment_page != NULL_PAGE or
+                    header.getTreeRoot(.hnsw_node) != NULL_PAGE,
+                .between_operations = .{ .context = self, .call = relieveBufferPressureHook },
+                .page_manager = &self.page_manager,
+            });
+            const stats = rm.recover(wal, &self.page_manager) catch |err| switch (err) {
+                // The log is damaged, or holds a committed record that cannot
+                // be applied. Opening without it would lose a commit.
+                error.MidLogCorruption, error.InvalidRecord, error.CorruptedWal => return DatabaseError.InvalidDatabase,
+                error.OutOfMemory => return DatabaseError.OutOfMemory,
+                // Includes a log of vector changes opened without vectors,
+                // which callers tell users how to fix.
+                else => return DatabaseError.IoError,
+            };
+            recovered_max_txn_id = stats.max_txn_id;
+            // Persist recovered state if any redo operations were applied
+            if (stats.redo_operations > 0) {
+                try self.rebuildPropertyIndexes();
+                try self.rebuildFtsIndexes();
+                try self.sync();
+                self.page_manager.sync() catch return DatabaseError.IoError;
+                vector_config_recorded = false;
+            }
+        }
+
+        // An index this open added to an existing file goes into the file
+        // now, before anything is logged against it. Left for the first
+        // checkpoint, a kill before then would leave a log of vector records
+        // and a header that does not say there is an index to replay them
+        // into, and an open without vector options would have to refuse.
+        if (vector_config_recorded and !is_new) {
+            try self.sync();
+            self.page_manager.sync() catch return DatabaseError.IoError;
+        }
+
+        try self.openChangefeedRetention(options, is_new);
+
+        // 9. Initialize Transaction Manager
+        //
+        // Every handle that can write has one, log or no log. Without a log
+        // its transactions write no records, and everything else about them
+        // is the same: a query or a transaction is applied whole or not at
+        // all, readers keep their snapshot, one writer at a time. Turning the
+        // log off gives up durability between flushes and nothing else.
+        self.txn_manager = null;
+        if (!options.read_only) {
+            self.txn_manager = TxnManager.init(allocator, if (self.wal) |*wal| wal else null);
+            // The log can outlive this session, so ids must not start over.
+            self.txn_manager.?.next_txn_id = recovered_max_txn_id + 1;
+            self.txn_manager.?.sync_on_commit = options.config.effectiveSyncMode() == .full;
         }
         self.txn_overlays = std.AutoHashMap(u64, TxnOverlay).init(allocator);
         self.last_auto_checkpoint_ns = @import("compat").nanoTimestamp();
+        // After the buffer pool and the log exist: a default interval is
+        // scaled to the pool's real size and the log's frame size.
+        self.setAutoCheckpoint(options.config.auto_checkpoint);
         self.active_writer_txn_id = null;
+        self.failed = false;
+        self.fail_next_apply_for_testing = false;
+        self.fail_apply_after_edge_keys_for_testing = null;
+        self.fail_after_changefeed_staging_for_testing = false;
+        self.upgrade_fault_for_testing = null;
         self.stream_epoch = 0;
 
         // 10. Initialize Adjacency Cache (optional)
@@ -1171,6 +1868,12 @@ pub const Database = struct {
         else
             null;
 
+        // Whatever the log held is in the trees now. Fold it into the file and
+        // empty the log, so the next open does not replay it all again and a
+        // torn frame at its tail does not sit in front of new ones. Best
+        // effort: if it fails the log simply stays.
+        self.checkpointLeftoverLog();
+
         return self;
     }
 
@@ -1181,7 +1884,7 @@ pub const Database = struct {
                 self.hnsw_node_tree = BTree.init(self.allocator, &self.buffer_pool) catch return DatabaseError.IoError;
             }
             if (self.hnsw_node_tree) |*tree| {
-                hnsw.saveToTree(tree) catch return DatabaseError.IoError;
+                hnsw.saveToTree(tree, self.id_key_order) catch return DatabaseError.IoError;
             }
         }
     }
@@ -1191,25 +1894,114 @@ pub const Database = struct {
     /// Returns an error if flushing fails - data may not be persisted.
     pub fn sync(self: *Self) DatabaseError!void {
         if (self.read_only) return;
+        // A failed handle's trees are missing a committed transaction, or
+        // hold part of one. The log has all of it; the file must not get
+        // the trees.
+        if (self.failed) return DatabaseError.IoError;
+        try self.applyChangefeedRetentionWithoutLog();
+        try self.flushPages();
+    }
 
+    /// Bring the database file up to date with memory, as one atomic step.
+    ///
+    /// The log is synced first: the pages may carry transactions whose
+    /// commit records have only been handed to the operating system, and a
+    /// page must never reach the file ahead of the log that explains it.
+    fn flushPages(self: *Self) DatabaseError!void {
         try self.persistHnswIndex();
 
-        // Save B+Tree root pages
+        // The roots go into the header in memory, and the header goes to the
+        // file with the pages.
         self.saveTreeRoots() catch {
             return DatabaseError.IoError;
         };
 
-        // Flush buffer pool
-        self.buffer_pool.close() catch {
-            return DatabaseError.IoError;
-        };
-
-        // Sync WAL if present
         if (self.wal) |*wal| {
             wal.sync() catch {
                 return DatabaseError.IoError;
             };
         }
+
+        self.buffer_pool.close() catch {
+            return DatabaseError.IoError;
+        };
+    }
+
+    fn relieveBufferPressureHook(context: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(context));
+        self.relieveBufferPressure();
+    }
+
+    /// Flush early when much of the buffer pool is dirty.
+    ///
+    /// Dirty pages are never evicted, so between flushes the pool grows to
+    /// hold them. This keeps that growth in check during a large commit, a
+    /// long recovery or a run of direct writes. It only acts when no page is
+    /// pinned, which is how it knows no B+Tree operation is half done, so it
+    /// is safe to call from anywhere and does nothing when it cannot act.
+    pub fn relieveBufferPressure(self: *Self) void {
+        if (self.read_only or self.failed) return;
+        if (self.buffer_pool.dirtyCount() * 2 < self.buffer_pool.frame_count) return;
+        if (self.buffer_pool.hasPinnedFrames()) return;
+        self.flushForBufferPressure();
+    }
+
+    /// The flush `relieveBufferPressure` does once it has decided to.
+    fn flushForBufferPressure(self: *Self) void {
+        self.applyChangefeedRetentionWithoutLog() catch return;
+
+        // The vector index's node map lives in memory, and the pages it
+        // describes are among those about to be written. An image with the
+        // pages and without the map is not a whole image.
+        self.persistHnswIndex() catch return;
+        self.saveTreeRoots() catch return;
+        if (self.wal) |*wal| wal.sync() catch return;
+        _ = self.buffer_pool.flushAll() catch {};
+    }
+
+    /// Change how commits checkpoint from now on: after `max_wal_frames`
+    /// frames, at most once per `min_interval_ns`; null stops them, leaving
+    /// checkpoints to `checkpoint`.
+    ///
+    /// Only commits follow it. Whether the log is folded into the file when
+    /// the database is opened and closed is decided by
+    /// `config.auto_checkpoint` as it was opened, so a handle opened with a
+    /// policy that switches it off here still leaves a single-file database
+    /// behind when it closes.
+    ///
+    /// The trade-off: a larger `max_wal_frames` means fewer checkpoints, each
+    /// longer (a checkpoint writes every page dirtied since the last one), a
+    /// longer log on disk and more to replay after a crash. A smaller one
+    /// means shorter pauses, more often. Left null, `max_wal_frames` is
+    /// scaled to this handle's buffer pool, as `defaultMaxWalFrames` says.
+    pub fn setAutoCheckpoint(self: *Self, policy: ?checkpoint_mod.AutoCheckpointConfig) void {
+        const p = policy orelse {
+            self.auto_checkpoint = null;
+            return;
+        };
+        self.auto_checkpoint = p.resolved(self.bufferPoolBytes(), self.walFrameSize());
+    }
+
+    /// The policy commits checkpoint by, as `setAutoCheckpoint` describes,
+    /// with `max_wal_frames` always set: a default one says what it was
+    /// scaled to.
+    pub fn autoCheckpoint(self: *const Self) ?checkpoint_mod.AutoCheckpointConfig {
+        return self.auto_checkpoint;
+    }
+
+    /// The size of the buffer pool this handle opened with: the frames it
+    /// keeps, not the overflow it grows into while pages are pinned or dirty.
+    /// An in-memory database's pool is smaller than the configured one.
+    fn bufferPoolBytes(self: *const Self) u64 {
+        return @as(u64, self.buffer_pool.frame_count) * self.page_manager.getPageSize();
+    }
+
+    /// The size of one log frame. A handle without a log (opened read-only,
+    /// or with the log off) never checkpoints on commit; its policy is still
+    /// reported, sized as a log would be, which takes the page size.
+    fn walFrameSize(self: *const Self) u32 {
+        if (self.wal) |*wal| return wal.frame_size;
+        return self.page_manager.getPageSize();
     }
 
     pub fn checkpointWal(self: *Self, mode: checkpoint_mod.CheckpointMode) DatabaseError!void {
@@ -1228,6 +2020,62 @@ pub const Database = struct {
     pub fn checkpoint(self: *Self, mode: checkpoint_mod.CheckpointMode) DatabaseError!?checkpoint_mod.CheckpointStats {
         if (self.read_only) return null;
         const wal = if (self.wal) |*w| w else return null;
+        return try self.runCheckpoint(wal, mode);
+    }
+
+    /// Fold a log that holds work into the file and empty it, at open and at
+    /// close. A log that ends at its own last checkpoint is left as it is.
+    ///
+    /// Skipped when automatic checkpoints are switched off: that setting
+    /// means the caller decides when the log is truncated.
+    fn checkpointLeftoverLog(self: *Self) void {
+        if (self.read_only) return;
+        if (self.failed) return;
+        if (self.config.auto_checkpoint == null) return;
+        const wal = if (self.wal) |*w| w else return;
+        if (wal.header.frame_count == 0) return;
+        // A log that ends at its own last checkpoint has nothing to fold in.
+        // Resetting it anyway would advance the reset counter for no change
+        // to the data, and replication reads that counter: taking a snapshot
+        // leaves exactly such a log behind, so every pass would find the
+        // counter moved by the pass before it and take another snapshot.
+        if (wal.getCurrentLsn() <= wal.getCheckpointLsn()) return;
+        _ = self.runCheckpoint(wal, .truncate) catch {};
+    }
+
+    /// The one place a checkpoint is run from, so that every checkpoint leaves
+    /// a file that can be opened without the log.
+    ///
+    /// Two pieces of state are not in the buffer pool and would otherwise be
+    /// left behind: the HNSW node map, which lives in memory until it is
+    /// written into its tree, and the tree root page numbers in the file
+    /// header. A `.truncate` checkpoint that skipped them emptied the log
+    /// while the header still named the roots from the last `sync`, and a
+    /// process that died after that reopened onto the old roots with nothing
+    /// to replay. Both are put in place here, and the checkpoint's flush
+    /// writes them with the pages they describe.
+    fn runCheckpoint(
+        self: *Self,
+        wal: *WalManager,
+        mode: checkpoint_mod.CheckpointMode,
+    ) DatabaseError!checkpoint_mod.CheckpointStats {
+        // The trees of a failed handle are missing a committed transaction
+        // that only the log still holds.
+        if (self.failed) return DatabaseError.IoError;
+
+        // A transaction with records already in the log would lose its
+        // beginning to a checkpoint, and recovery would then drop its commit.
+        if (self.txn_manager) |*tm| {
+            if (tm.hasLoggedActiveTxn()) return DatabaseError.TransactionConflict;
+        }
+
+        // Retention drops old changefeed events here, a bounded number per
+        // checkpoint, and this checkpoint's flush makes that durable.
+        _ = try self.applyChangefeedRetention(changefeed_trim_slack + self.changefeed_appended_since_trim);
+
+        // Into tree pages and the header first, so the flush carries them.
+        try self.persistHnswIndex();
+        self.saveTreeRoots() catch return DatabaseError.IoError;
 
         var checkpointer = checkpoint_mod.Checkpointer.init(
             self.allocator,
@@ -1249,15 +2097,19 @@ pub const Database = struct {
     ///
     /// Truncation discards the whole WAL, so it is only safe once every dirty
     /// page is durable in the main file and no other transaction is relying on
-    /// frames still being there. The checkpoint itself handles the first, and
-    /// the overlay count handles the second.
+    /// frames still being there. The checkpoint itself handles both: it
+    /// refuses to run while an open transaction has records in the log.
+    /// Open transactions that have logged nothing, readers above all, do not
+    /// hold it back, so a long-lived reader no longer lets the log grow
+    /// without limit.
     fn maybeAutoCheckpoint(self: *Self) void {
-        const policy = self.config.auto_checkpoint orelse return;
+        const policy = self.auto_checkpoint orelse return;
         if (self.read_only) return;
-        if (self.txn_overlays.count() != 0) return;
 
         const wal = if (self.wal) |*w| w else return;
-        if (wal.header.frame_count < policy.max_wal_frames) return;
+        const threshold = policy.max_wal_frames orelse
+            checkpoint_mod.AutoCheckpointConfig.defaultMaxWalFrames(self.bufferPoolBytes(), wal.frame_size);
+        if (wal.header.frame_count < threshold) return;
 
         const now = @import("compat").nanoTimestamp();
         const elapsed = now - self.last_auto_checkpoint_ns;
@@ -1267,41 +2119,19 @@ pub const Database = struct {
         // should not be retried on every single commit.
         self.last_auto_checkpoint_ns = now;
 
-        var checkpointer = checkpoint_mod.Checkpointer.init(
-            self.allocator,
-            &self.buffer_pool,
-            &self.page_manager,
-            wal,
-        );
-        _ = checkpointer.checkpoint(policy.mode) catch {};
+        _ = self.runCheckpoint(wal, policy.mode) catch {};
     }
 
-    /// Flush all durable state and remove contiguous freelist pages from EOF.
-    ///
-    /// Compaction is an exclusive maintenance operation. It never relocates a
-    /// live page, so stable IDs and persisted page references remain unchanged.
-    /// Copy this database to `dest_path` without closing it.
-    ///
-    /// The copy is a complete database on its own: a full checkpoint first
-    /// flushes every dirty page into the main file, so the write-ahead log is
-    /// redundant by the time the bytes are read and the destination needs no log
-    /// beside it.
-    ///
-    /// Exclusive for its duration, like compact. A file copy taken while writes
-    /// land underneath it is torn in ways no checksum on the source would catch,
-    /// so an open transaction is refused rather than worked around. The
-    /// checkpoint uses `.full` rather than `.truncate` so frame numbering is left
-    /// alone for anything following the log.
-    ///
-    /// The destination is written beside the target and renamed into place, so an
-    /// interrupted backup never leaves a partial file that looks usable.
     /// Fold everything pending into the database file, so that the bytes on disk
     /// are a complete database on their own.
     ///
-    /// The checkpoint is `.full` rather than `.truncate` so frame numbering is
-    /// left alone for anything following the log. Derived state that lives in
-    /// memory until asked, notably the vector index, has to be persisted first
-    /// or the copy comes out missing an index it claims to have.
+    /// With a log, committed pages are folded in by a checkpoint, which is `.full`
+    /// rather than `.truncate` so frame numbering is left alone for anything
+    /// following the log. Without one there is nothing to checkpoint: committed
+    /// pages sit dirty in the buffer pool until the next flush, so they are
+    /// flushed here, or the copy is missing all of them. Derived state that
+    /// lives in memory until asked, notably the vector index, has to be
+    /// persisted first or the copy comes out missing an index it claims to have.
     ///
     /// Returns the number of pages flushed.
     fn quiesceForCopy(self: *Self) DatabaseError!u32 {
@@ -1311,9 +2141,21 @@ pub const Database = struct {
         if (try self.checkpoint(.full)) |stats| {
             return stats.pages_flushed;
         }
-        return 0;
+        return self.buffer_pool.flushAll() catch DatabaseError.IoError;
     }
 
+    /// Copy this database to `dest_path` without closing it.
+    ///
+    /// The copy is a complete database on its own: every committed page is
+    /// flushed into the main file first, so the write-ahead log is redundant by
+    /// the time the bytes are read and the destination needs no log beside it.
+    ///
+    /// Exclusive for its duration, like compact. A file copy taken while writes
+    /// land underneath it is torn in ways no checksum on the source would catch,
+    /// so an open transaction is refused rather than worked around.
+    ///
+    /// The destination is written beside the target and renamed into place, so an
+    /// interrupted backup never leaves a partial file that looks usable.
     pub fn backup(self: *Self, dest_path: []const u8) DatabaseError!BackupStats {
         if (self.txn_overlays.count() != 0) return DatabaseError.TransactionConflict;
 
@@ -1600,10 +2442,57 @@ pub const Database = struct {
         return replicate_mod.replicate(self, dest_dir);
     }
 
+    /// Write a copy of this database with big-endian id keys (format 5) to
+    /// `dest_path`, and check it, leaving this database as it is.
+    ///
+    /// For a file created before format 5, whose node, edge and document ids
+    /// are little-endian keys. The copy holds the same data with the keys
+    /// in id order, which is what a file created by this release has. It
+    /// needs a format-5 reader: 0.18 and earlier cannot open it.
+    ///
+    /// The copy is taken with `backup`, so pending work is folded into this
+    /// database's file first, as a backup does. The copy is then converted
+    /// (see `id_key_upgrade.zig`), opened the ordinary way, and compared with
+    /// this database entry by entry through the stores: nodes, edges, the
+    /// next ids, full-text lengths and reverse entries, and the vector index.
+    /// Every page of the copy must read back, no page may belong to two
+    /// structures, and every page the conversion had no reason to change
+    /// (vector data, postings, the trees it does not convert) must be byte
+    /// for byte the same as in this database's file. If anything fails, the
+    /// copy is deleted and the error returned, with what went wrong in
+    /// `diagnostic` when one is given.
+    ///
+    /// Memory: the conversion holds every key of the tree it is converting
+    /// at once, 13 bytes per entry, so the largest tree decides (about
+    /// 1.3 GB for 100 million edges). Disk: a second copy of the database,
+    /// plus the new trees. Running out of either fails like any other step.
+    ///
+    /// Putting the copy in this database's place is the caller's job:
+    /// `closeKeepingLock`, then `id_key_upgrade.replaceWithUpgraded`, which
+    /// is what `lattice compact --upgrade-id-keys` does.
+    ///
+    /// Refused for a database in memory, a read-only handle, a handle that
+    /// has failed, and while a transaction is open; nothing must write to
+    /// the database while it runs. `dest_path`, and its `-wal`, `-journal`
+    /// and `.partial` neighbours, must not exist. A database whose id keys
+    /// are already big-endian is left alone, and the stats say so.
+    pub fn upgradeIdKeysTo(
+        self: *Self,
+        dest_path: []const u8,
+        diagnostic: ?*id_key_upgrade.Diagnostic,
+    ) id_key_upgrade.UpgradeError!id_key_upgrade.UpgradeStats {
+        return id_key_upgrade.upgrade(self, dest_path, diagnostic);
+    }
+
+    /// Flush all durable state and remove contiguous freelist pages from EOF.
+    ///
+    /// Compaction is an exclusive maintenance operation. It never relocates a
+    /// live page, so stable IDs and persisted page references remain unchanged.
     pub fn compact(self: *Self) DatabaseError!CompactStats {
         if (self.read_only) return DatabaseError.ReadOnly;
         if (self.txn_overlays.count() != 0) return DatabaseError.TransactionConflict;
 
+        try self.reclaimUnreachableFts();
         try self.persistHnswIndex();
         self.saveTreeRoots() catch return DatabaseError.IoError;
         try self.checkpointWal(.truncate);
@@ -1617,6 +2506,36 @@ pub const Database = struct {
     /// Close the database and release all resources.
     /// For guaranteed durability, call sync() first and handle errors.
     pub fn close(self: *Self) void {
+        _ = self.closeImpl(false);
+    }
+
+    /// Close the database but keep its file open and exclusively locked, and
+    /// return that file. Everything else `close` does happens as usual: the
+    /// log is checkpointed, every page is flushed, the stores go away. The
+    /// caller owns the file and must `unlock` and `close` it.
+    ///
+    /// Until it does, no other handle can open the database, so the file can
+    /// be replaced (`id_key_upgrade.replaceWithUpgraded`) with no moment in
+    /// which another process could open and write to it.
+    ///
+    /// Refused, with the database left open, for a read-only, in-memory,
+    /// failed or unlocked handle, or one on a VFS other than the operating
+    /// system's (whose files could not outlive it).
+    pub fn closeKeepingLock(self: *Self) DatabaseError!vfs_mod.File {
+        if (self.read_only) return DatabaseError.ReadOnly;
+        if (self.failed) return DatabaseError.IoError;
+        if (self.vfs != .posix or isMemoryPath(self.path) or self.owns_backing_file) return DatabaseError.IoError;
+        if (!self.page_manager.holdsLock()) return DatabaseError.IoError;
+        return self.closeImpl(true).?;
+    }
+
+    fn closeImpl(self: *Self, keep_lock: bool) ?vfs_mod.File {
+        // Leave a file that opens without replaying anything. The C API has
+        // always done this in lattice_close; the Zig API and the CLI left
+        // the whole log for the next open to replay.
+        self.checkpointLeftoverLog();
+        self.applyChangefeedRetentionWithoutLog() catch {};
+
         // Reverse initialization order
 
         // 11. Query cache
@@ -1635,6 +2554,7 @@ pub const Database = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.txn_overlays.deinit();
+        self.changefeed_scratch.deinit(self.allocator);
 
         // 9. Transaction manager
         if (self.txn_manager) |*tm| {
@@ -1643,11 +2563,12 @@ pub const Database = struct {
 
         // 8c. HNSW index
         if (self.hnsw_index) |*hnsw| {
-            if (!self.read_only) {
+            if (!self.read_only and !self.failed) {
                 self.persistHnswIndex() catch {};
             }
             hnsw.deinit();
         }
+        if (self.vector_storage) |*vs| vs.deinit();
 
         // 8. FTS index (no explicit deinit needed - components don't own resources)
 
@@ -1655,7 +2576,7 @@ pub const Database = struct {
         // 6. Symbol table (no explicit deinit needed)
 
         // 5. B+Trees - save root pages before closing (best effort)
-        if (!self.read_only) {
+        if (!self.read_only and !self.failed) {
             self.saveTreeRoots() catch {};
         }
 
@@ -1664,11 +2585,32 @@ pub const Database = struct {
             wal.deinit();
         }
 
-        // 3. Buffer pool
+        // 3. Buffer pool. Its last flush carries the roots saved above. A
+        //    failed handle writes nothing: what it holds is half a
+        //    transaction that the log will redo in full.
+        if (self.failed) self.buffer_pool.abandonDirty();
+        const final_flush_ok = if (self.buffer_pool.flushAll()) |_| true else |_| false;
+        if (!final_flush_ok) self.buffer_pool.abandonDirty();
         self.buffer_pool.deinit();
 
-        // 2. Page manager
-        self.page_manager.deinit();
+        // 3b. Journal. An empty one is removed, so a cleanly closed database
+        //     is its file and nothing else. One that still holds a flush is
+        //     the record of a failure just now, and the next open needs it.
+        if (self.journal) |*journal| {
+            const empty = (journal.file.size() catch 1) == 0;
+            journal.deinit();
+            if (empty) {
+                if (std.fmt.allocPrint(self.allocator, "{s}-journal", .{self.path})) |journal_path| {
+                    defer self.allocator.free(journal_path);
+                    self.vfs.vfs().delete(journal_path) catch {};
+                } else |_| {}
+            }
+        }
+
+        // 2. Page manager. A PosixVfs file is its own allocation and stays
+        //    valid after the backend below goes.
+        var kept: ?vfs_mod.File = null;
+        if (keep_lock) kept = self.page_manager.deinitKeepingFile() else self.page_manager.deinit();
 
         // 1. Storage backend. A memory backend holds every byte of the database,
         //    so this is where an in-memory database actually goes away.
@@ -1691,6 +2633,7 @@ pub const Database = struct {
 
         // Free self
         self.allocator.destroy(self);
+        return kept;
     }
 
     // ========================================================================
@@ -1700,6 +2643,7 @@ pub const Database = struct {
     /// Begin a new transaction
     /// Returns a Transaction handle that must be passed to mutating operations
     pub fn beginTransaction(self: *Self, mode: TxnMode) DatabaseError!Transaction {
+        if (self.failed) return DatabaseError.IoError;
         if (self.txn_manager) |*tm| {
             if (mode == .read_write and self.active_writer_txn_id != null) {
                 return DatabaseError.TransactionConflict;
@@ -1723,36 +2667,76 @@ pub const Database = struct {
         return DatabaseError.TransactionsNotEnabled;
     }
 
-    /// Commit a transaction, making all changes durable
+    /// Commit a transaction, making all changes durable.
+    ///
+    /// The order is: write the transaction's records, write and sync its
+    /// commit record, then apply the changes to the trees. The sync is the
+    /// commit point. Applying first, as this used to, meant a failure
+    /// partway through left half a transaction visible in this process and
+    /// in the next checkpoint while the log said it had never committed.
+    ///
+    /// Past the commit point there is no way back: the transaction is
+    /// durable and recovery will redo it. If applying it here fails, or the
+    /// sync itself fails and the outcome is unknown, the handle marks itself
+    /// failed and returns an error. The caller reopens, and recovery
+    /// produces the state the log describes.
     pub fn commitTransaction(self: *Self, txn: *Transaction) DatabaseError!void {
         if (self.txn_manager) |*tm| {
+            if (self.failed) return DatabaseError.IoError;
+
             var should_broadcast_streams = false;
+            var has_changes = false;
             if (self.txn_overlays.getPtr(txn.id)) |overlay| {
                 if (overlay.hasChanges()) {
+                    has_changes = true;
+                    try self.readStoredStatesForCommit(overlay);
                     try self.captureTxnSnapshotsForCommit(txn.id, overlay);
                     try self.stageGraphChangefeed(overlay);
                     try self.assignStreamSequences(overlay);
+                    // 0.16.0 opens a file holding compact changefeed events
+                    // and misreads its changefeed (see FileHeader.ReaderReason),
+                    // so the file refuses it before the first event is logged
+                    // or written. A no-op once raised.
+                    if (overlay.changefeed.count() > 0) {
+                        self.page_manager.raiseMinReaderVersionNow(page_mod.FileHeader.ReaderReason.changefeed_events) catch
+                            return DatabaseError.IoError;
+                    }
                     should_broadcast_streams = overlay.stream_appends.items.len > 0 or
+                        overlay.changefeed.count() > 0 or
                         overlay.stream_offsets.items.len > 0 or
                         overlay.stream_trims.items.len > 0;
-                    try self.logTxnOverlayForCommit(txn, overlay);
-                    try self.applyTxnOverlay(txn.id, overlay);
+                    if (self.wal != null) try self.logTxnOverlayForCommit(txn, overlay);
                 }
             }
+
             tm.commit(txn) catch |err| {
-                return switch (err) {
-                    TxnError.NotActive => DatabaseError.TransactionNotActive,
-                    TxnError.NotFound => DatabaseError.NotFound,
-                    else => DatabaseError.IoError,
-                };
+                switch (err) {
+                    TxnError.NotActive => return DatabaseError.TransactionNotActive,
+                    TxnError.NotFound => return DatabaseError.NotFound,
+                    else => {
+                        // The commit record may or may not have reached the
+                        // disk. Nothing more may be appended after it.
+                        if (has_changes) self.failed = true;
+                        return DatabaseError.IoError;
+                    },
+                }
             };
-            if (self.txn_overlays.fetchRemove(txn.id)) |entry| {
-                var overlay = entry.value;
-                overlay.deinit(self.allocator);
+
+            if (has_changes) {
+                const overlay = self.txn_overlays.getPtr(txn.id).?;
+                const applied = if (self.fail_next_apply_for_testing) blk: {
+                    self.fail_next_apply_for_testing = false;
+                    break :blk DatabaseError.IoError;
+                } else self.applyTxnOverlay(txn.id, overlay);
+                applied catch {
+                    self.failed = true;
+                    self.releaseTxnState(txn.id);
+                    return DatabaseError.IoError;
+                };
             }
-            if (self.active_writer_txn_id == txn.id) {
-                self.active_writer_txn_id = null;
-            }
+
+            self.releaseTxnState(txn.id);
+            self.relieveBufferPressure();
             if (should_broadcast_streams) {
                 self.stream_mutex.lock();
                 self.stream_epoch +%= 1;
@@ -1763,6 +2747,17 @@ pub const Database = struct {
             return;
         }
         return DatabaseError.TransactionsNotEnabled;
+    }
+
+    /// Drop a finished transaction's overlay and its claim on the writer slot.
+    fn releaseTxnState(self: *Self, txn_id: u64) void {
+        if (self.txn_overlays.fetchRemove(txn_id)) |entry| {
+            var overlay = entry.value;
+            overlay.deinit(self.allocator);
+        }
+        if (self.active_writer_txn_id == txn_id) {
+            self.active_writer_txn_id = null;
+        }
     }
 
     /// Abort a transaction, rolling back all changes
@@ -1788,23 +2783,63 @@ pub const Database = struct {
                 }
             }
 
-            tm.abort(txn) catch |err| {
+            // On a failed handle the log must stay as it is: an abort
+            // record written after a commit record whose sync failed would
+            // decide an outcome nobody knows.
+            const ended = if (self.failed) tm.discard(txn) else tm.abort(txn);
+            ended catch |err| {
                 return switch (err) {
                     TxnError.NotActive => DatabaseError.TransactionNotActive,
                     TxnError.NotFound => DatabaseError.NotFound,
                     else => DatabaseError.IoError,
                 };
             };
-            if (self.txn_overlays.fetchRemove(txn.id)) |entry| {
-                var overlay = entry.value;
-                overlay.deinit(self.allocator);
-            }
-            if (self.active_writer_txn_id == txn.id) {
-                self.active_writer_txn_id = null;
-            }
+            self.releaseTxnState(txn.id);
             return;
         }
         return DatabaseError.TransactionsNotEnabled;
+    }
+
+    /// Read what the store holds for every node and edge the transaction
+    /// changes, once, into `stored_nodes` and `stored_edges`. Everything
+    /// the commit does with a record compares it with this: the readers'
+    /// snapshots, the changefeed, the log and the apply. The store cannot
+    /// change between here and the apply, since only the one writer
+    /// changes it, and applying one record does not change another's.
+    ///
+    /// The ids are sorted here and kept on the overlay, and the records read
+    /// in that order; the changefeed and the apply walk the same ids. A
+    /// commit that fails before its commit point leaves the transaction
+    /// open to further changes, so each attempt sorts and reads afresh.
+    fn readStoredStatesForCommit(self: *Self, overlay: *TxnOverlay) DatabaseError!void {
+        overlay.clearStored(self.allocator);
+        overlay.clearSortedIds(self.allocator);
+
+        const node_ids = sortedIdsAlloc(NodeId, self.allocator, &overlay.node_states) catch
+            return DatabaseError.OutOfMemory;
+        overlay.sorted_node_ids = node_ids;
+        const edge_ids = sortedIdsAlloc(EdgeId, self.allocator, &overlay.edge_states) catch
+            return DatabaseError.OutOfMemory;
+        overlay.sorted_edge_ids = edge_ids;
+
+        for (node_ids) |node_id| try self.keepStoredNodeState(overlay, node_id);
+        for (edge_ids) |edge_id| try self.keepStoredEdgeState(overlay, edge_id);
+    }
+
+    fn keepStoredNodeState(self: *Self, overlay: *TxnOverlay, node_id: NodeId) DatabaseError!void {
+        var state = (try self.readBaseNodeState(node_id)) orelse return;
+        overlay.stored_nodes.put(self.allocator, node_id, state) catch {
+            state.deinit(self.allocator);
+            return DatabaseError.OutOfMemory;
+        };
+    }
+
+    fn keepStoredEdgeState(self: *Self, overlay: *TxnOverlay, edge_id: EdgeId) DatabaseError!void {
+        var state = (try self.readBaseEdgeState(edge_id)) orelse return;
+        overlay.stored_edges.put(self.allocator, edge_id, state) catch {
+            state.deinit(self.allocator);
+            return DatabaseError.OutOfMemory;
+        };
     }
 
     fn captureTxnSnapshotsForCommit(
@@ -1822,7 +2857,8 @@ pub const Database = struct {
                 const node_id = node_entry.key_ptr.*;
                 if (reader_overlay.node_states.contains(node_id)) continue;
 
-                if (try self.readBaseNodeState(node_id)) |state| {
+                if (overlay.stored_nodes.get(node_id)) |stored| {
+                    const state = stored.clone(self.allocator) catch return DatabaseError.OutOfMemory;
                     try self.storeNodeOverlayState(reader_overlay, node_id, state);
                 } else {
                     try self.storeNodeOverlayState(reader_overlay, node_id, .{
@@ -1838,7 +2874,8 @@ pub const Database = struct {
                 const edge_id = edge_entry.key_ptr.*;
                 if (reader_overlay.edge_states.contains(edge_id)) continue;
 
-                if (try self.readBaseEdgeState(edge_id)) |state| {
+                if (overlay.stored_edges.get(edge_id)) |stored| {
+                    const state = stored.clone(self.allocator) catch return DatabaseError.OutOfMemory;
                     try self.storeEdgeOverlayState(reader_overlay, edge_id, state);
                 } else {
                     try self.storeEdgeOverlayState(reader_overlay, edge_id, .{
@@ -1858,7 +2895,6 @@ pub const Database = struct {
                 const state = try self.readBaseVectorState(node_id);
                 try self.storeVectorOverlayState(reader_overlay, node_id, state);
             }
-
         }
     }
 
@@ -1869,23 +2905,61 @@ pub const Database = struct {
     ) DatabaseError!void {
         var node_iter = overlay.node_states.iterator();
         while (node_iter.next()) |entry| {
-            try self.logCommittedNodeState(txn, entry.key_ptr.*, entry.value_ptr.*);
+            const node_id = entry.key_ptr.*;
+            try self.logCommittedNodeState(txn, node_id, entry.value_ptr.*, overlay.stored_nodes.get(node_id));
         }
 
         var edge_iter = overlay.edge_states.iterator();
         while (edge_iter.next()) |entry| {
-            try self.logCommittedEdgeState(txn, entry.key_ptr.*, entry.value_ptr.*);
+            const edge_id = entry.key_ptr.*;
+            try self.logCommittedEdgeState(txn, edge_id, entry.value_ptr.*, overlay.stored_edges.get(edge_id));
+        }
+
+        var vector_iter = overlay.vector_states.iterator();
+        while (vector_iter.next()) |entry| {
+            const vector: ?[]const f32 = switch (entry.value_ptr.*) {
+                // Nothing to take back out. Logging a removal anyway put a
+                // vector record into the log of databases that have never
+                // held a vector, and recovery refuses those without a
+                // vector index to apply them to.
+                .absent => if (self.baseHasVector(entry.key_ptr.*)) null else continue,
+                .value => |value| value,
+            };
+            const payload = wal_payload.serializeVectorMutationAlloc(
+                self.allocator,
+                entry.key_ptr.*,
+                vector,
+            ) catch return DatabaseError.OutOfMemory;
+            defer self.allocator.free(payload);
+            const tm = &(self.txn_manager orelse return DatabaseError.TransactionsNotEnabled);
+            _ = tm.logOperation(txn, .update, payload) catch |err| return mapTxnError(err);
         }
 
         for (overlay.stream_appends.items) |append| {
             try self.logWalStreamAppend(txn, append);
         }
+        try self.logChangefeed(txn, &overlay.changefeed);
         for (overlay.stream_offsets.items) |offset| {
             try self.logWalStreamOffset(txn, offset);
         }
         for (overlay.stream_trims.items) |trim_op| {
-            try self.logWalStreamTrim(txn, trim_op);
+            try self.logWalStreamTrim(txn, try self.boundChangefeedTrim(overlay, trim_op));
         }
+    }
+
+    /// A trim of the changefeed, as it goes into the log: through the last
+    /// event there is once this transaction's own are counted, however far
+    /// past it the caller asked. `trimBelow` stops there when the trim is
+    /// applied; logging the same sequence makes replay raise the floor to
+    /// the same place, whatever later events the file holds by then.
+    fn boundChangefeedTrim(self: *Self, overlay: *const TxnOverlay, trim_op: TxnStreamTrim) DatabaseError!TxnStreamTrim {
+        if (!std.mem.eql(u8, trim_op.stream, stream_store_mod.changes_stream)) return trim_op;
+        const trees = self.streamTrees() orelse return trim_op;
+        var last = changefeed_mod.lastSequence(trees) catch |err| return mapChangefeedError(err);
+        if (overlay.changefeed.count() > 0) {
+            last = @max(last, overlay.changefeed.first_sequence + overlay.changefeed.count() - 1);
+        }
+        return .{ .stream = trim_op.stream, .through_sequence = @min(trim_op.through_sequence, last) };
     }
 
     fn logCommittedNodeState(
@@ -1893,13 +2967,8 @@ pub const Database = struct {
         txn: *Transaction,
         node_id: NodeId,
         state: TxnNodeState,
+        current: ?TxnNodeState,
     ) DatabaseError!void {
-        const current = try self.readBaseNodeState(node_id);
-        defer if (current) |existing| {
-            var owned_existing = existing;
-            owned_existing.deinit(self.allocator);
-        };
-
         if (!state.exists) {
             if (current) |existing| {
                 try self.logWalNodeDelete(txn, node_id, existing);
@@ -1951,13 +3020,8 @@ pub const Database = struct {
         txn: *Transaction,
         edge_id: EdgeId,
         state: TxnEdgeState,
+        current: ?TxnEdgeState,
     ) DatabaseError!void {
-        const current = try self.readBaseEdgeState(edge_id);
-        defer if (current) |existing| {
-            var owned_existing = existing;
-            owned_existing.deinit(self.allocator);
-        };
-
         if (!state.exists) {
             if (current) |existing| {
                 try self.logWalEdgeSnapshot(txn, edge_id, existing, .delete);
@@ -2282,14 +3346,40 @@ pub const Database = struct {
         overlay: *TxnOverlay,
     ) DatabaseError!void {
         _ = writer_txn_id;
-        var node_iter = overlay.node_states.iterator();
-        while (node_iter.next()) |entry| {
-            try self.applyNodeState(entry.key_ptr.*, entry.value_ptr.*);
+        // In id order where the ids can be sorted, so that the label index
+        // and, in a format-5 file, the node tree and the edge id index
+        // receive a transaction's keys in key order and fill their pages
+        // densely, instead of in hash-map order, which splits them down the
+        // middle. (A file created before format 5 has little-endian id keys,
+        // where id order is not key order; its label index still benefits.)
+        // Order does not change the outcome: each state is applied on its own.
+        // Reading the stored states has sorted them already.
+        if (overlay.sortedNodeIds()) |ids| {
+            for (ids) |node_id| try self.applyNodeState(node_id, overlay.node_states.get(node_id).?, overlay.stored_nodes.get(node_id));
+        } else if (sortedKeysAlloc(NodeId, self.allocator, &overlay.node_states)) |ids| {
+            defer self.allocator.free(ids);
+            for (ids) |node_id| try self.applyNodeState(node_id, overlay.node_states.get(node_id).?, overlay.stored_nodes.get(node_id));
+        } else {
+            var node_iter = overlay.node_states.iterator();
+            while (node_iter.next()) |entry| {
+                try self.applyNodeState(entry.key_ptr.*, entry.value_ptr.*, overlay.stored_nodes.get(entry.key_ptr.*));
+            }
         }
 
-        var edge_iter = overlay.edge_states.iterator();
-        while (edge_iter.next()) |entry| {
-            try self.applyEdgeState(entry.key_ptr.*, entry.value_ptr.*);
+        // The traversal keys of the edges a large transaction creates go in
+        // first, in key order; the loop below then writes those edges'
+        // records and applies every other edge as it always has.
+        const keys_first = try self.applyNewEdgeKeysSorted(overlay);
+        if (overlay.sortedEdgeIds()) |ids| {
+            for (ids) |edge_id| try self.applyEdgeState(edge_id, overlay.edge_states.get(edge_id).?, overlay.stored_edges.get(edge_id), keys_first);
+        } else if (sortedKeysAlloc(EdgeId, self.allocator, &overlay.edge_states)) |ids| {
+            defer self.allocator.free(ids);
+            for (ids) |edge_id| try self.applyEdgeState(edge_id, overlay.edge_states.get(edge_id).?, overlay.stored_edges.get(edge_id), keys_first);
+        } else {
+            var edge_iter = overlay.edge_states.iterator();
+            while (edge_iter.next()) |entry| {
+                try self.applyEdgeState(entry.key_ptr.*, entry.value_ptr.*, overlay.stored_edges.get(entry.key_ptr.*), keys_first);
+            }
         }
         if (overlay.edge_states.count() > 0) {
             self.edge_store.syncNextEdgeId() catch return DatabaseError.IoError;
@@ -2308,10 +3398,13 @@ pub const Database = struct {
         }
 
         if (overlay.stream_appends.items.len > 0 or
+            overlay.changefeed.count() > 0 or
             overlay.stream_offsets.items.len > 0 or
             overlay.stream_trims.items.len > 0)
         {
             const trees = try self.streamTreesForWrite();
+            changefeed_mod.applyBatch(trees, &overlay.changefeed) catch |err| return mapChangefeedError(err);
+            self.changefeed_appended_since_trim +|= overlay.changefeed.count();
             for (overlay.stream_appends.items) |append| {
                 const sequence = append.sequence orelse return DatabaseError.IoError;
                 stream_store_mod.appendWithSequence(
@@ -2333,6 +3426,15 @@ pub const Database = struct {
                 ) catch |err| return self.mapStreamError(err);
             }
             for (overlay.stream_trims.items) |trim_op| {
+                if (std.mem.eql(u8, trim_op.stream, stream_store_mod.changes_stream)) {
+                    _ = changefeed_mod.trimBelow(
+                        trees,
+                        self.allocator,
+                        trim_op.through_sequence +| 1,
+                        std.math.maxInt(u64),
+                    ) catch |err| return mapChangefeedError(err);
+                    continue;
+                }
                 stream_store_mod.trim(
                     trees,
                     self.allocator,
@@ -2341,6 +3443,20 @@ pub const Database = struct {
                 ) catch |err| return self.mapStreamError(err);
             }
         }
+    }
+
+    /// Flush early while a committed transaction is being applied, when the
+    /// log allows it.
+    ///
+    /// With a log, pages holding part of a transaction may reach the file:
+    /// its commit record is already durable, and recovery redoes the rest.
+    /// Without one, the file must only ever get whole transactions, since
+    /// nothing could finish a half-applied one after a crash. So the pages
+    /// stay in memory, and the buffer pool grows past its size if it must,
+    /// until the transaction is applied; the flush that the end of the
+    /// commit offers then writes it whole.
+    fn relieveApplyPressure(self: *Self) void {
+        if (self.wal != null) self.relieveBufferPressure();
     }
 
     fn replaceNodePropertyIndex(
@@ -2352,8 +3468,7 @@ pub const Database = struct {
         new_properties: []const node_mod.Property,
     ) DatabaseError!void {
         if (self.property_index) |*index| {
-            index.removeNode(node_id, old_labels, old_properties) catch |err| return mapPropertyIndexError(err);
-            index.indexNode(node_id, new_labels, new_properties) catch |err| return mapPropertyIndexError(err);
+            index.replaceNode(node_id, old_labels, old_properties, new_labels, new_properties) catch |err| return mapPropertyIndexError(err);
         }
         try self.ftsReplaceNode(node_id, old_labels, old_properties, new_labels, new_properties);
     }
@@ -2367,18 +3482,15 @@ pub const Database = struct {
         new_properties: []const node_mod.Property,
     ) DatabaseError!void {
         if (self.property_index) |*index| {
-            index.removeEdge(edge_id, old_type, old_properties) catch |err| return mapPropertyIndexError(err);
-            index.indexEdge(edge_id, new_type, new_properties) catch |err| return mapPropertyIndexError(err);
+            index.replaceEdge(edge_id, old_type, old_properties, new_type, new_properties) catch |err| return mapPropertyIndexError(err);
         }
         try self.ftsReplaceEdge(edge_id, old_type, old_properties, new_type, new_properties, true, true);
     }
 
-    fn applyNodeState(self: *Self, node_id: NodeId, state: TxnNodeState) DatabaseError!void {
-        const current = try self.readBaseNodeState(node_id);
-        defer if (current) |existing| {
-            var owned_existing = existing;
-            owned_existing.deinit(self.allocator);
-        };
+    /// Apply one node's committed state; `current` is what the store held
+    /// before, as `readStoredStatesForCommit` read it.
+    fn applyNodeState(self: *Self, node_id: NodeId, state: TxnNodeState, current: ?TxnNodeState) DatabaseError!void {
+        self.relieveApplyPressure();
 
         if (!state.exists) {
             if (current) |existing| {
@@ -2413,8 +3525,7 @@ pub const Database = struct {
                 }
             }
             if (self.property_index) |*index| {
-                index.removeNode(node_id, existing.labels, existing.properties) catch |err| return mapPropertyIndexError(err);
-                index.indexNode(node_id, state.labels, state.properties) catch |err| return mapPropertyIndexError(err);
+                index.replaceNode(node_id, existing.labels, existing.properties, state.labels, state.properties) catch |err| return mapPropertyIndexError(err);
             }
             try self.ftsReplaceNode(node_id, existing.labels, existing.properties, state.labels, state.properties);
             return;
@@ -2432,12 +3543,84 @@ pub const Database = struct {
         try self.ftsReplaceNode(node_id, &.{}, &.{}, state.labels, state.properties);
     }
 
-    fn applyEdgeState(self: *Self, edge_id: EdgeId, state: TxnEdgeState) DatabaseError!void {
-        const current = try self.readBaseEdgeState(edge_id);
-        defer if (current) |existing| {
-            var owned_existing = existing;
-            owned_existing.deinit(self.allocator);
-        };
+    /// How many edges a transaction must create before their traversal keys
+    /// are inserted in key order ahead of everything else (see
+    /// `applyNewEdgeKeysSorted`). Below it the sort buys nothing: so few keys
+    /// land on different pages whatever order they arrive in.
+    pub const sorted_edge_apply_min: usize = 64;
+
+    /// Insert the traversal keys of every edge the transaction creates, in
+    /// key order, when there are enough of them. Returns whether it did;
+    /// `applyEdgeState` must then write only the record of a new edge.
+    ///
+    /// An edge has two traversal keys, one filed under its source and one
+    /// under its target, and they land wherever those nodes are in the tree.
+    /// Applied edge by edge, a transaction's keys reach the tree in an order
+    /// unrelated to where they go, and once the tree is larger than the
+    /// buffer pool nearly every key dirties a page of its own: the pool
+    /// fills with pages changed once, flushes them, and reads them back for
+    /// the next key bound there. In key order, all the keys a page will get
+    /// from this transaction arrive together, so each page is changed and
+    /// written once, however often the pool is flushed along the way.
+    ///
+    /// Between this and the records, the tree holds traversal keys of edges
+    /// that have no record. That state can reach the file, through a flush
+    /// here or a crash, and recovery completes it: the transaction's commit
+    /// record is durable before any of this runs, and replaying an edge puts
+    /// in whichever of its entries are missing (`EdgeStore.ensureWithId`).
+    /// Nothing in this process reads the tree until the commit returns.
+    fn applyNewEdgeKeysSorted(self: *Self, overlay: *TxnOverlay) DatabaseError!bool {
+        var created: usize = 0;
+        var count_iter = overlay.edge_states.iterator();
+        while (count_iter.next()) |entry| {
+            if (entry.value_ptr.exists and !overlay.stored_edges.contains(entry.key_ptr.*)) created += 1;
+        }
+        if (created < sorted_edge_apply_min) return false;
+
+        const Key = [edge_mod.EdgeKey.SIZE]u8;
+        // Without the memory for the keys, the edges are applied one by one.
+        const keys = self.allocator.alloc(Key, created * 2) catch return false;
+        defer self.allocator.free(keys);
+
+        var filled: usize = 0;
+        var iter = overlay.edge_states.iterator();
+        while (iter.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!state.exists or overlay.stored_edges.contains(entry.key_ptr.*)) continue;
+            const pair = EdgeStore.traversalKeys(entry.key_ptr.*, state.source, state.target, state.edge_type);
+            keys[filled] = pair[0];
+            keys[filled + 1] = pair[1];
+            filled += 2;
+        }
+        std.debug.assert(filled == keys.len);
+
+        std.mem.sortUnstable(Key, keys, {}, struct {
+            fn lessThan(_: void, a: Key, b: Key) bool {
+                return std.mem.order(u8, &a, &b) == .lt;
+            }
+        }.lessThan);
+
+        for (keys, 0..) |*key, done| {
+            if (self.fail_apply_after_edge_keys_for_testing) |limit| {
+                if (done == limit) {
+                    self.fail_apply_after_edge_keys_for_testing = null;
+                    // What a full buffer pool does at this point on its own:
+                    // write the keys inserted so far to the file.
+                    if (self.wal != null) self.flushForBufferPressure();
+                    return DatabaseError.IoError;
+                }
+            }
+            self.relieveApplyPressure();
+            self.edge_store.insertTraversalKey(key) catch |err| return mapEdgeStoreError(err);
+        }
+        return true;
+    }
+
+    /// Apply one edge of a committed transaction. `keys_first` says the
+    /// traversal keys of the edges this transaction creates are in the tree
+    /// already (`applyNewEdgeKeysSorted`).
+    fn applyEdgeState(self: *Self, edge_id: EdgeId, state: TxnEdgeState, current: ?TxnEdgeState, keys_first: bool) DatabaseError!void {
+        self.relieveApplyPressure();
 
         if (!state.exists) {
             if (current != null) {
@@ -2445,6 +3628,7 @@ pub const Database = struct {
                     edge_mod.EdgeError.NotFound => {},
                     else => return DatabaseError.IoError,
                 };
+                self.forgetCachedAdjacency(current.?.source);
                 if (self.property_index) |*index| {
                     const existing = current.?;
                     index.removeEdge(edge_id, existing.edge_type, existing.properties) catch |err| return mapPropertyIndexError(err);
@@ -2459,21 +3643,41 @@ pub const Database = struct {
             return DatabaseError.ValueTooLarge;
         }
 
-        if (current != null) {
-            self.edge_store.deleteById(edge_id) catch |err| switch (err) {
-                edge_mod.EdgeError.NotFound => {},
-                else => return DatabaseError.IoError,
+        // An edge that keeps its endpoints and type changed only properties,
+        // and those live in its record alone: rewrite that, not the
+        // traversal keys.
+        const same_edge = if (current) |existing|
+            existing.source == state.source and existing.target == state.target and existing.edge_type == state.edge_type
+        else
+            false;
+        if (same_edge) {
+            self.edge_store.replaceProperties(edge_id, state.source, state.target, state.edge_type, state.properties) catch |err| {
+                return mapEdgeStoreError(err);
             };
-        }
-
-        self.edge_store.createWithId(edge_id, state.source, state.target, state.edge_type, state.properties) catch |err| {
-            return mapEdgeStoreError(err);
-        };
-        if (self.property_index) |*index| {
+        } else {
             if (current) |existing| {
-                index.removeEdge(edge_id, existing.edge_type, existing.properties) catch |err| return mapPropertyIndexError(err);
+                self.edge_store.deleteById(edge_id) catch |err| switch (err) {
+                    edge_mod.EdgeError.NotFound => {},
+                    else => return DatabaseError.IoError,
+                };
+                self.forgetCachedAdjacency(existing.source);
             }
-            index.indexEdge(edge_id, state.edge_type, state.properties) catch |err| return mapPropertyIndexError(err);
+
+            if (keys_first and current == null) {
+                self.edge_store.createRecordWithId(edge_id, state.source, state.target, state.edge_type, state.properties) catch |err| {
+                    return mapEdgeStoreError(err);
+                };
+            } else {
+                self.edge_store.createWithId(edge_id, state.source, state.target, state.edge_type, state.properties) catch |err| {
+                    return mapEdgeStoreError(err);
+                };
+            }
+            self.forgetCachedAdjacency(state.source);
+        }
+        if (self.property_index) |*index| {
+            const old_type: ?symbols_mod.SymbolId = if (current) |existing| existing.edge_type else null;
+            const old_properties: []const node_mod.Property = if (current) |existing| existing.properties else &.{};
+            index.replaceEdge(edge_id, old_type, old_properties, state.edge_type, state.properties) catch |err| return mapPropertyIndexError(err);
         }
         if (current) |existing| {
             try self.ftsReplaceEdge(edge_id, existing.edge_type, existing.properties, state.edge_type, state.properties, true, true);
@@ -2482,8 +3686,18 @@ pub const Database = struct {
         }
     }
 
+    /// The adjacency cache holds committed edges, so it changes when a
+    /// commit applies an edge, not when a transaction stages one.
+    fn forgetCachedAdjacency(self: *Self, source: NodeId) void {
+        if (self.adjacency_cache) |*cache| cache.invalidate(source);
+    }
+
     /// Execute a single undo operation
     fn executeUndo(self: *Self, entry: UndoEntry) !void {
+        // An undo entry does not always say which node an edge left from.
+        if (entry.entity_type == .edge) {
+            if (self.adjacency_cache) |*cache| cache.clear();
+        }
         switch (entry.entity_type) {
             .node => switch (entry.op_type) {
                 // Undo of insert is delete
@@ -2629,15 +3843,25 @@ pub const Database = struct {
                         self.allocator.free(properties);
                     };
 
-                    // Replace edge state with the previous snapshot.
-                    self.edge_store.deleteById(entry.entity_id) catch {};
-                    self.edge_store.createWithId(
+                    // Put back the previous properties. An update never
+                    // changes an edge's endpoints or type, so only its
+                    // record needs writing.
+                    self.edge_store.replaceProperties(
                         payload.edge_id,
                         payload.source,
                         payload.target,
                         payload.type_id,
                         properties,
-                    ) catch {};
+                    ) catch |err| switch (err) {
+                        edge_mod.EdgeError.NotFound => self.edge_store.createWithId(
+                            payload.edge_id,
+                            payload.source,
+                            payload.target,
+                            payload.type_id,
+                            properties,
+                        ) catch {},
+                        else => {},
+                    };
                 },
             },
             .property => switch (entry.op_type) {
@@ -3034,6 +4258,13 @@ pub const Database = struct {
     }
 
     fn saveTreeRoots(self: *Self) DatabaseError!void {
+        var header = self.headerWithCurrentRoots();
+        self.page_manager.updateHeader(&header) catch {
+            return DatabaseError.IoError;
+        };
+    }
+
+    fn headerWithCurrentRoots(self: *Self) page_mod.FileHeader {
         var header = self.page_manager.getHeader().*;
 
         header.setTreeRoot(.node, self.node_tree.getRootPage());
@@ -3077,9 +4308,13 @@ pub const Database = struct {
             header.vector_segment_page = vs.first_page;
         }
 
-        self.page_manager.updateHeader(&header) catch {
-            return DatabaseError.IoError;
-        };
+        // The node id counter travels with the pages it describes: every
+        // flush writes this header together with the node tree.
+        if (header.hasExtension()) {
+            header.next_node_id = self.node_store.next_id;
+        }
+
+        return header;
     }
 
     fn propertyIndexDefinition(
@@ -3117,6 +4352,8 @@ pub const Database = struct {
                     defer state.deinit(self.allocator);
                     if (findPropertyById(state.properties, definition.property_id)) |property| {
                         index.add(definition, node_id, property.value) catch |err| return mapPropertyIndexError(err);
+                    } else if (definition.encoding == .ordered_dense) {
+                        index.add(definition, node_id, .{ .null_val = {} }) catch |err| return mapPropertyIndexError(err);
                     }
                 }
             },
@@ -3160,16 +4397,136 @@ pub const Database = struct {
         try self.ensurePropertyIndexTreesForWrite();
         self.initializePropertyIndex();
 
-        const definition = try self.propertyIndexDefinition(kind, scope, property, true);
+        var definition = try self.propertyIndexDefinition(kind, scope, property, true);
+        // A label's index holds every node with the label, so that it can
+        // be read in ORDER BY's order with the nulls; a relationship type's
+        // only the edges with the property.
+        definition.encoding = PropertyIndexEncoding.current(kind);
         var index = &(self.property_index orelse return DatabaseError.IoError);
         if (index.hasDefinition(definition) catch |err| return mapPropertyIndexError(err)) {
             return DatabaseError.AlreadyExists;
         }
+        try self.closePropertyIndexesToOlderReaders();
         index.clearEntries(definition) catch |err| return mapPropertyIndexError(err);
         try self.populatePropertyIndexDefinition(definition);
         index.createDefinition(definition) catch |err| return mapPropertyIndexError(err);
-        try self.saveTreeRoots();
+        // A declaration runs outside any transaction, so the log never sees
+        // it. Until the pages and header reach the file, a crash would lose
+        // a declaration this call said it made.
+        try self.sync();
+        self.page_manager.sync() catch return DatabaseError.IoError;
         if (self.query_cache) |cache| cache.bumpSchemaVersion();
+    }
+
+    /// 0.16.0 would take ordered keys for digests and find nothing under
+    /// them, and leave them stale as it wrote. The file says so before it
+    /// holds any, so that release refuses to open it.
+    fn closePropertyIndexesToOlderReaders(self: *Self) DatabaseError!void {
+        const header = self.page_manager.getHeader();
+        const reason = page_mod.FileHeader.ReaderReason.ordered_property_index;
+        if (!header.requiresReaderFor(reason)) {
+            var raised = header.*;
+            raised.raiseMinReader(reason);
+            self.page_manager.updateHeader(&raised) catch return DatabaseError.IoError;
+            try self.sync();
+            self.page_manager.sync() catch return DatabaseError.IoError;
+        }
+    }
+
+    /// A declared property index as `propertyIndexes` lists it.
+    pub const PropertyIndexInfo = struct {
+        kind: PropertyIndexEntityKind,
+        /// The label or relationship type.
+        scope: []u8,
+        property: []u8,
+        encoding: PropertyIndexEncoding,
+    };
+
+    /// Every declared property index, nodes first, with the encoding its
+    /// entries are in. Free with `freePropertyIndexes`.
+    pub fn propertyIndexes(self: *Self, allocator: Allocator) DatabaseError![]PropertyIndexInfo {
+        var out: std.ArrayList(PropertyIndexInfo) = .empty;
+        errdefer {
+            for (out.items) |info| {
+                allocator.free(info.scope);
+                allocator.free(info.property);
+            }
+            out.deinit(allocator);
+        }
+        var index = if (self.property_index) |*property_index| property_index else return out.toOwnedSlice(allocator) catch DatabaseError.OutOfMemory;
+        inline for (.{ PropertyIndexEntityKind.node, PropertyIndexEntityKind.edge }) |kind| {
+            var iter: PropertyIndex.DefinitionIterator = undefined;
+            index.iterateDefinitions(kind, &iter) catch |err| return mapPropertyIndexError(err);
+            defer iter.deinit();
+            while (iter.next() catch |err| return mapPropertyIndexError(err)) |definition| {
+                const scope = try self.symbolNameCopy(allocator, definition.scope_id);
+                errdefer allocator.free(scope);
+                const property = try self.symbolNameCopy(allocator, definition.property_id);
+                errdefer allocator.free(property);
+                out.append(allocator, .{ .kind = kind, .scope = scope, .property = property, .encoding = definition.encoding }) catch
+                    return DatabaseError.OutOfMemory;
+            }
+        }
+        return out.toOwnedSlice(allocator) catch DatabaseError.OutOfMemory;
+    }
+
+    pub fn freePropertyIndexes(allocator: Allocator, infos: []PropertyIndexInfo) void {
+        for (infos) |info| {
+            allocator.free(info.scope);
+            allocator.free(info.property);
+        }
+        allocator.free(infos);
+    }
+
+    fn symbolNameCopy(self: *Self, allocator: Allocator, id: symbols_mod.SymbolId) DatabaseError![]u8 {
+        const name = self.symbol_table.resolve(id) catch return DatabaseError.IoError;
+        defer self.symbol_table.freeString(name);
+        return allocator.dupe(u8, name) catch DatabaseError.OutOfMemory;
+    }
+
+    /// Rebuild every declared property index whose encoding is not the one
+    /// this release creates, in place, and return how many there were.
+    ///
+    /// An index 0.16.0 created keys a digest and answers equality only; a
+    /// label's index without entries for the nodes lacking the property
+    /// cannot be read in ORDER BY's order. Rebuilt, each answers ranges,
+    /// prefixes and sorting as one created now does. Like creating an index
+    /// it raises the minimum reader version, so 0.16.0 no longer opens the
+    /// file, and it needs the database to itself. An index stays usable at
+    /// every point: a crash before its new encoding is recorded leaves the
+    /// old one, whose entries recovery rebuilds.
+    pub fn upgradePropertyIndexes(self: *Self) DatabaseError!usize {
+        if (self.read_only) return DatabaseError.ReadOnly;
+        if (self.active_writer_txn_id != null) return DatabaseError.TransactionConflict;
+        var index = if (self.property_index) |*property_index| property_index else return 0;
+
+        // Collected first: rewriting the catalog while walking it would
+        // move the walk.
+        var stale: std.ArrayList(PropertyIndexDefinition) = .empty;
+        defer stale.deinit(self.allocator);
+        inline for (.{ PropertyIndexEntityKind.node, PropertyIndexEntityKind.edge }) |kind| {
+            var iter: PropertyIndex.DefinitionIterator = undefined;
+            index.iterateDefinitions(kind, &iter) catch |err| return mapPropertyIndexError(err);
+            defer iter.deinit();
+            while (iter.next() catch |err| return mapPropertyIndexError(err)) |definition| {
+                if (definition.encoding == PropertyIndexEncoding.current(kind)) continue;
+                stale.append(self.allocator, definition) catch return DatabaseError.OutOfMemory;
+            }
+        }
+        if (stale.items.len == 0) return 0;
+
+        try self.closePropertyIndexesToOlderReaders();
+        for (stale.items) |old| {
+            var definition = old;
+            definition.encoding = PropertyIndexEncoding.current(definition.kind);
+            index.clearEntries(definition) catch |err| return mapPropertyIndexError(err);
+            try self.populatePropertyIndexDefinition(definition);
+            index.setEncoding(definition) catch |err| return mapPropertyIndexError(err);
+        }
+        try self.sync();
+        self.page_manager.sync() catch return DatabaseError.IoError;
+        if (self.query_cache) |cache| cache.bumpSchemaVersion();
+        return stale.items.len;
     }
 
     fn dropPropertyIndex(
@@ -3184,6 +4541,10 @@ pub const Database = struct {
         const definition = try self.propertyIndexDefinition(kind, scope, property, false);
         var index = &(self.property_index orelse return DatabaseError.MissingIndex);
         index.dropDefinition(definition) catch |err| return mapPropertyIndexError(err);
+        // Durable for the same reason as a declaration: a drop the file never
+        // saw would bring the index back after a crash.
+        try self.sync();
+        self.page_manager.sync() catch return DatabaseError.IoError;
         if (self.query_cache) |cache| cache.bumpSchemaVersion();
     }
 
@@ -3198,6 +4559,28 @@ pub const Database = struct {
         };
         var index = &(self.property_index orelse return false);
         return index.hasDefinition(definition) catch |err| return mapPropertyIndexError(err);
+    }
+
+    /// The declared index on a label's property as the catalog holds it, with
+    /// its encoding, or null when there is none.
+    pub fn nodePropertyIndex(self: *Self, label: []const u8, property: []const u8) DatabaseError!?PropertyIndexDefinition {
+        const definition = self.propertyIndexDefinition(.node, label, property, false) catch |err| switch (err) {
+            DatabaseError.MissingIndex => return null,
+            else => return err,
+        };
+        var index = &(self.property_index orelse return null);
+        return index.resolve(definition) catch |err| return mapPropertyIndexError(err);
+    }
+
+    /// The declared index on a relationship type's property as the catalog
+    /// holds it, with its encoding, or null when there is none.
+    pub fn edgePropertyIndex(self: *Self, edge_type: []const u8, property: []const u8) DatabaseError!?PropertyIndexDefinition {
+        const definition = self.propertyIndexDefinition(.edge, edge_type, property, false) catch |err| switch (err) {
+            DatabaseError.MissingIndex => return null,
+            else => return err,
+        };
+        var index = &(self.property_index orelse return null);
+        return index.resolve(definition) catch |err| return mapPropertyIndexError(err);
     }
 
     pub fn dropNodePropertyIndex(self: *Self, label: []const u8, property: []const u8) DatabaseError!void {
@@ -3246,10 +4629,7 @@ pub const Database = struct {
     ///
     /// Built per call rather than kept, because it holds nothing worth keeping:
     /// the trees belong to the database and the scope is four bytes derived from
-    /// the definition. The one piece of state it does carry, the dictionary's next
-    /// token id, restarts at its first value — which is already what happens on
-    /// every reopen, and is harmless because that id is a label written into the
-    /// posting page header and never used to find anything.
+    /// the definition, and everything it reads, counts included, is in the trees.
     fn ftsIndexFor(self: *Self, definition: FtsDefinition) FtsIndex {
         return FtsIndex.initScoped(
             self.allocator,
@@ -3258,6 +4638,7 @@ pub const Database = struct {
             &self.fts_lengths_tree,
             if (self.fts_reverse_tree) |*t| t else null,
             self.config.fts_config,
+            self.id_key_order,
             fts_catalog_mod.scopePrefix(definition),
         );
     }
@@ -3334,10 +4715,41 @@ pub const Database = struct {
         if (catalog.has(definition) catch |err| return mapFtsCatalogError(err)) {
             return DatabaseError.AlreadyExists;
         }
-        try self.populateFtsDefinition(definition);
-        catalog.create(definition) catch |err| return mapFtsCatalogError(err);
-        self.fts_declared = true;
-        try self.saveTreeRoots();
+        // Labels and relationship types share one symbol table, and an index's
+        // storage is keyed by symbol and property alone, so `(:Review).text` and
+        // `[:Review].text` would write the same keys: each would return the
+        // other's ids and overwrite the other's document lengths. Telling them
+        // apart needs a different key layout, which databases already written
+        // cannot have, so the second of the pair is refused instead.
+        var other_kind = definition;
+        other_kind.kind = if (kind == .node) .edge else .node;
+        if (catalog.has(other_kind) catch |err| return mapFtsCatalogError(err)) {
+            return DatabaseError.AlreadyExists;
+        }
+        // Indexing appends, so whatever an earlier attempt that failed part way
+        // left under this scope would be indexed a second time. Start from an
+        // empty scope, as `createPropertyIndex` does, and leave one behind if
+        // this attempt fails before the declaration is recorded.
+        try self.clearFtsDefinition(definition);
+        {
+            errdefer self.clearFtsDefinition(definition) catch {};
+            try self.populateFtsDefinition(definition);
+            catalog.create(definition) catch |err| return mapFtsCatalogError(err);
+        }
+        {
+            // A declaration the file did not get is taken back, so the error
+            // means the index does not exist and asking again builds it,
+            // rather than answering AlreadyExists for an index that a reopen
+            // would not have.
+            errdefer {
+                catalog.drop(definition) catch {};
+                self.clearFtsDefinition(definition) catch {};
+                self.fts_declared = self.ftsDeclarationsExist();
+            }
+            self.fts_declared = true;
+            try self.sync();
+            self.page_manager.sync() catch return DatabaseError.IoError;
+        }
         if (self.query_cache) |cache| cache.bumpSchemaVersion();
     }
 
@@ -3355,7 +4767,10 @@ pub const Database = struct {
         catalog.drop(definition) catch |err| return mapFtsCatalogError(err);
         try self.clearFtsDefinition(definition);
         self.fts_declared = self.ftsDeclarationsExist();
-        try self.saveTreeRoots();
+        // Durable as the declaration is: a drop the file never saw would
+        // bring back a declaration whose terms are already partly gone.
+        try self.sync();
+        self.page_manager.sync() catch return DatabaseError.IoError;
         if (self.query_cache) |cache| cache.bumpSchemaVersion();
     }
 
@@ -3367,6 +4782,41 @@ pub const Database = struct {
     fn clearFtsDefinition(self: *Self, definition: FtsDefinition) DatabaseError!void {
         var index = self.ftsIndexFor(definition);
         index.clearScope() catch |err| return mapFtsError(err);
+    }
+
+    /// Remove the full-text entries no declared index can reach: those of the
+    /// single index releases before 0.15.0 kept, and any a drop cut short left
+    /// (see `fts/legacy.zig` for how each is told apart). Their posting pages
+    /// go to the freelist. `compact` does this rather than opening, because
+    /// the old index may be the only place some text was searchable, and only
+    /// the user knows they have moved on from it.
+    fn reclaimUnreachableFts(self: *Self) DatabaseError!void {
+        if (self.fts_index == null) return;
+        var prefixes: std.ArrayListUnmanaged([fts_catalog_mod.SCOPE_PREFIX_SIZE]u8) = .empty;
+        defer prefixes.deinit(self.allocator);
+        if (self.ftsCatalog()) |catalog_value| {
+            var catalog = catalog_value;
+            inline for (.{ FtsEntityKind.node, FtsEntityKind.edge }) |kind| {
+                var iter: FtsCatalog.DefinitionIterator = undefined;
+                catalog.iterate(kind, &iter) catch |err| return mapFtsCatalogError(err);
+                defer iter.deinit();
+                while (iter.next() catch |err| return mapFtsCatalogError(err)) |definition| {
+                    prefixes.append(self.allocator, fts_catalog_mod.scopePrefix(definition)) catch return DatabaseError.OutOfMemory;
+                }
+            }
+        }
+        const stats = fts_legacy.reclaimUnreachable(
+            self.allocator,
+            &self.buffer_pool,
+            &self.fts_dict_tree,
+            &self.fts_lengths_tree,
+            if (self.fts_reverse_tree) |*t| t else null,
+            prefixes.items,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => DatabaseError.OutOfMemory,
+            error.StorageError => DatabaseError.IoError,
+        };
+        if (stats.terms + stats.length_keys + stats.reverse_keys != 0) try self.sync();
     }
 
     /// Rebuild every declared index from the entities as they now stand.
@@ -3439,10 +4889,9 @@ pub const Database = struct {
     /// the state before its own writes, which is the one place a reader is
     /// entitled to see them.
     ///
-    /// The pending text is scored by term presence rather than BM25, matching what
-    /// the unscoped search already does for uncommitted documents. Those scores
-    /// are not comparable with the index's, so this is about which rows come back
-    /// rather than exactly how they rank among themselves.
+    /// The pending text is scored with the same BM25 and the index's corpus
+    /// statistics, so it ranks among committed documents as it will once
+    /// committed, give or take what its own commit changes in the statistics.
     pub fn ftsSearchIndexInTxn(
         self: *Self,
         txn: ?*Transaction,
@@ -3468,11 +4917,9 @@ pub const Database = struct {
     /// arguments that were supposed to control that sitting unused. Both forms go
     /// through the same fuzzy matcher now.
     ///
-    /// Uncommitted text is matched by term presence rather than edit distance, so
-    /// a typo will not find a document this transaction has only just written.
-    /// That is worth saying out loud rather than hiding: fuzzy matching against
-    /// pending text needs the tokenizer to run over it, which is what committing
-    /// does.
+    /// Uncommitted text is matched with the same edit distances, so a typo finds
+    /// a document this transaction has only just written as it would a
+    /// committed one.
     pub fn ftsSearchIndexFuzzy(
         self: *Self,
         txn: ?*Transaction,
@@ -3495,19 +4942,31 @@ pub const Database = struct {
             .max_distance = max_distance,
             .min_term_length = min_term_length,
         };
-        const base = index.searchFuzzy(query_text, config, limit) catch |err| return mapFtsError(err);
-
         const overlay = blk: {
-            if (definition.kind != .node) break :blk null;
             const t = txn orelse break :blk null;
             const found = self.getTxnOverlay(t) orelse break :blk null;
-            if (found.node_states.count() == 0) break :blk null;
+            const pending = switch (definition.kind) {
+                .node => found.node_states.count(),
+                .edge => found.edge_states.count(),
+            };
+            if (pending == 0) break :blk null;
             break :blk found;
         };
-        const pending = overlay orelse return base;
+        const pending = overlay orelse {
+            return index.searchFuzzy(query_text, config, limit) catch |err| return mapFtsError(err);
+        };
+
+        // Each pending entity can knock at most one indexed result out, so asking
+        // for that many more keeps the merge from coming up short. Saturating, as
+        // in `ftsSearchDefinitionInTxn`.
+        const extra: u32 = @intCast(switch (definition.kind) {
+            .node => pending.node_states.count(),
+            .edge => pending.edge_states.count(),
+        });
+        const base = index.searchFuzzy(query_text, config, limit +| extra) catch |err| return mapFtsError(err);
         defer self.freeFtsSearchResults(base);
 
-        return self.mergePendingFts(definition, pending, base, query_text, limit);
+        return self.mergePendingFts(definition, pending, base, query_text, config, limit);
     }
 
     /// Roughly how many entities a query would match in one declared index.
@@ -3573,7 +5032,7 @@ pub const Database = struct {
         const base_results = index.search(query_text, limit +| extra) catch |err| return mapFtsError(err);
         defer self.freeFtsSearchResults(base_results);
 
-        return self.mergePendingFts(definition, pending, base_results, query_text, limit);
+        return self.mergePendingFts(definition, pending, base_results, query_text, null, limit);
     }
 
     /// Reconcile indexed results with what an open transaction has pending.
@@ -3588,6 +5047,7 @@ pub const Database = struct {
         pending: *TxnOverlay,
         base: []const FtsSearchResult,
         query_text: []const u8,
+        fuzzy: ?fuzzy_mod.FuzzyConfig,
         limit: u32,
     ) DatabaseError![]FtsSearchResult {
         var merged: std.ArrayListUnmanaged(FtsSearchResult) = .empty;
@@ -3596,9 +5056,14 @@ pub const Database = struct {
         var seen: std.AutoHashMapUnmanaged(NodeId, void) = .{};
         defer seen.deinit(self.allocator);
 
+        // The query is analysed once for every pending document.
+        var index = self.ftsIndexFor(definition);
+        var matcher = index.queryMatcher(query_text, fuzzy) catch |err| return mapFtsError(err);
+        defer matcher.deinit();
+
         for (base) |result| {
             try seen.put(self.allocator, result.doc_id, {});
-            if (try self.pendingFtsFor(definition, pending, result.doc_id, query_text)) |staged| {
+            if (try self.pendingFtsFor(definition, pending, result.doc_id, &matcher)) |staged| {
                 if (staged.score) |score| {
                     merged.append(self.allocator, .{ .doc_id = result.doc_id, .score = score }) catch {
                         return DatabaseError.OutOfMemory;
@@ -3614,7 +5079,7 @@ pub const Database = struct {
                 var overlay_iter = pending.node_states.iterator();
                 while (overlay_iter.next()) |entry| {
                     if (seen.contains(entry.key_ptr.*)) continue;
-                    if (try self.pendingNodeFtsScore(definition, entry.value_ptr.*, query_text)) |score| {
+                    if (try self.pendingNodeFtsScore(definition, entry.value_ptr.*, &matcher)) |score| {
                         merged.append(self.allocator, .{ .doc_id = entry.key_ptr.*, .score = score }) catch {
                             return DatabaseError.OutOfMemory;
                         };
@@ -3625,7 +5090,7 @@ pub const Database = struct {
                 var overlay_iter = pending.edge_states.iterator();
                 while (overlay_iter.next()) |entry| {
                     if (seen.contains(entry.key_ptr.*)) continue;
-                    if (try self.pendingEdgeFtsScore(definition, entry.value_ptr.*, query_text)) |score| {
+                    if (try self.pendingEdgeFtsScore(definition, entry.value_ptr.*, &matcher)) |score| {
                         merged.append(self.allocator, .{ .doc_id = entry.key_ptr.*, .score = score }) catch {
                             return DatabaseError.OutOfMemory;
                         };
@@ -3650,16 +5115,16 @@ pub const Database = struct {
         definition: FtsDefinition,
         pending: *TxnOverlay,
         doc_id: NodeId,
-        query_text: []const u8,
+        matcher: *FtsIndex.QueryMatcher,
     ) DatabaseError!?struct { score: ?f32 } {
         switch (definition.kind) {
             .node => {
                 const state = pending.node_states.get(doc_id) orelse return null;
-                return .{ .score = try self.pendingNodeFtsScore(definition, state, query_text) };
+                return .{ .score = try self.pendingNodeFtsScore(definition, state, matcher) };
             },
             .edge => {
                 const state = pending.edge_states.get(doc_id) orelse return null;
-                return .{ .score = try self.pendingEdgeFtsScore(definition, state, query_text) };
+                return .{ .score = try self.pendingEdgeFtsScore(definition, state, matcher) };
             },
         }
     }
@@ -3670,13 +5135,13 @@ pub const Database = struct {
         self: *Self,
         definition: FtsDefinition,
         state: TxnEdgeState,
-        query_text: []const u8,
+        matcher: *FtsIndex.QueryMatcher,
     ) DatabaseError!?f32 {
+        _ = self;
         if (!state.exists) return null;
         if (state.edge_type != definition.scope_id) return null;
         const text = ftsTextOf(definition, state.properties) orelse return null;
-        const score = try self.overlayFtsScore(query_text, text);
-        return if (score > 0) score else null;
+        return overlayFtsScore(matcher, text);
     }
 
     /// What an uncommitted node state would score for a declared index, or null
@@ -3685,13 +5150,13 @@ pub const Database = struct {
         self: *Self,
         definition: FtsDefinition,
         state: TxnNodeState,
-        query_text: []const u8,
+        matcher: *FtsIndex.QueryMatcher,
     ) DatabaseError!?f32 {
+        _ = self;
         if (!state.exists) return null;
         if (!containsSymbolId(state.labels, definition.scope_id)) return null;
         const text = ftsTextOf(definition, state.properties) orelse return null;
-        const score = try self.overlayFtsScore(query_text, text);
-        return if (score > 0) score else null;
+        return overlayFtsScore(matcher, text);
     }
 
     /// Whether one node matches a query through the index declared for a property.
@@ -3712,7 +5177,11 @@ pub const Database = struct {
         query_text: []const u8,
         limit: u32,
     ) DatabaseError!?bool {
-        const property_id = self.symbol_table.lookup(property) catch return null;
+        const property_id = self.symbol_table.lookup(property) catch |err| return switch (err) {
+            symbols_mod.SymbolError.NotFound => null,
+            symbols_mod.SymbolError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
 
         var node = (try self.getNodeInTxn(txn, node_id)) orelse return null;
         defer node.deinit(self.allocator);
@@ -3731,7 +5200,11 @@ pub const Database = struct {
         query_text: []const u8,
         limit: u32,
     ) DatabaseError!?bool {
-        const property_id = self.symbol_table.lookup(property) catch return null;
+        const property_id = self.symbol_table.lookup(property) catch |err| return switch (err) {
+            symbols_mod.SymbolError.NotFound => null,
+            symbols_mod.SymbolError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
 
         var edge = (try self.getEdgeInTxn(txn, edge_id)) orelse return null;
         defer edge.deinit(self.allocator);
@@ -3800,6 +5273,11 @@ pub const Database = struct {
         return null;
     }
 
+    /// Declare a full-text index on a node property.
+    ///
+    /// `AlreadyExists` if this index exists, or if an edge index is declared on
+    /// a relationship type with the same name and the same property: the two
+    /// would share storage.
     pub fn createNodeFtsIndex(self: *Self, label: []const u8, property: []const u8) DatabaseError!void {
         try self.createFtsIndex(.node, label, property);
     }
@@ -3812,6 +5290,11 @@ pub const Database = struct {
         return self.hasFtsIndex(.node, label, property);
     }
 
+    /// Declare a full-text index on a relationship property.
+    ///
+    /// `AlreadyExists` if this index exists, or if a node index is declared on
+    /// a label with the same name and the same property: the two would share
+    /// storage.
     pub fn createEdgeFtsIndex(self: *Self, edge_type: []const u8, property: []const u8) DatabaseError!void {
         try self.createFtsIndex(.edge, edge_type, property);
     }
@@ -3956,11 +5439,11 @@ pub const Database = struct {
         }
         if (txn) |active_txn| {
             if (self.getTxnOverlay(active_txn)) |overlay| {
-                var iter = overlay.node_states.iterator();
-                while (iter.next()) |entry| {
-                    if (seen.contains(entry.key_ptr.*) or !nodeStateMatchesPropertyIndex(entry.value_ptr.*, definition, value)) continue;
-                    try seen.put(self.allocator, entry.key_ptr.*, {});
-                    ids.append(self.allocator, entry.key_ptr.*) catch return DatabaseError.OutOfMemory;
+                for (try self.overlayNodeCandidates(overlay, definition, value)) |node_id| {
+                    const state = overlay.node_states.getPtr(node_id) orelse continue;
+                    if (seen.contains(node_id) or !nodeStateMatchesPropertyIndex(state.*, definition, value)) continue;
+                    try seen.put(self.allocator, node_id, {});
+                    ids.append(self.allocator, node_id) catch return DatabaseError.OutOfMemory;
                 }
             }
         }
@@ -3997,11 +5480,11 @@ pub const Database = struct {
         }
         if (txn) |active_txn| {
             if (self.getTxnOverlay(active_txn)) |overlay| {
-                var iter = overlay.edge_states.iterator();
-                while (iter.next()) |entry| {
-                    if (seen.contains(entry.key_ptr.*) or !edgeStateMatchesPropertyIndex(entry.value_ptr.*, definition, value)) continue;
-                    try seen.put(self.allocator, entry.key_ptr.*, {});
-                    ids.append(self.allocator, entry.key_ptr.*) catch return DatabaseError.OutOfMemory;
+                for (try self.overlayEdgeCandidates(overlay, definition, value)) |edge_id| {
+                    const state = overlay.edge_states.getPtr(edge_id) orelse continue;
+                    if (seen.contains(edge_id) or !edgeStateMatchesPropertyIndex(state.*, definition, value)) continue;
+                    try seen.put(self.allocator, edge_id, {});
+                    ids.append(self.allocator, edge_id) catch return DatabaseError.OutOfMemory;
                 }
             }
         }
@@ -4177,10 +5660,19 @@ pub const Database = struct {
         };
     }
 
+    /// Refuse a vector this database cannot store or search with:
+    /// `MissingIndex` when it was created without a vector index (it used to
+    /// be `IoError`, which read like a disk fault), `InvalidArgument` for the
+    /// wrong dimensions or a NaN or infinite component.
     fn validateVectorValue(self: *Self, vector: []const f32) DatabaseError!void {
+        const vs = self.vector_storage orelse return DatabaseError.MissingIndex;
         if (!types.isValidVectorDimensions(vector.len)) return DatabaseError.InvalidArgument;
-        const vs = self.vector_storage orelse return DatabaseError.IoError;
         if (vector.len != vs.dimensions) return DatabaseError.InvalidArgument;
+        // A NaN or infinite component makes every distance to it NaN or
+        // infinite, which breaks the ordering the index search relies on.
+        for (vector) |component| {
+            if (!std.math.isFinite(component)) return DatabaseError.InvalidArgument;
+        }
     }
 
     fn stageStreamAppend(
@@ -4198,7 +5690,7 @@ pub const Database = struct {
         }
         stream_store_mod.validateKind(kind) catch |err| return self.mapStreamError(err);
 
-        const sequence = try self.nextStreamSequence(overlay.stream_appends.items, stream);
+        const sequence = try self.nextStreamSequence(overlay, stream);
         const stream_copy = self.allocator.dupe(u8, stream) catch return DatabaseError.OutOfMemory;
         errdefer self.allocator.free(stream_copy);
         const kind_copy = self.allocator.dupe(u8, kind) catch return DatabaseError.OutOfMemory;
@@ -4209,42 +5701,64 @@ pub const Database = struct {
             owned.deinit(self.allocator);
         }
 
-        overlay.stream_appends.append(self.allocator, .{
+        // Reserve both slots first so the append and its sequence are
+        // recorded together or not at all.
+        overlay.stream_appends.ensureUnusedCapacity(self.allocator, 1) catch return DatabaseError.OutOfMemory;
+        overlay.stream_last_sequences.ensureUnusedCapacity(self.allocator, 1) catch return DatabaseError.OutOfMemory;
+        overlay.stream_appends.appendAssumeCapacity(.{
             .stream = stream_copy,
             .kind = kind_copy,
             .payload = payload_copy,
             .sequence = sequence,
-        }) catch return DatabaseError.OutOfMemory;
+        });
+        noteStreamSequence(overlay, stream_copy, sequence);
         overlay.markDirty();
         return sequence;
     }
 
-    fn nextStreamSequence(self: *Self, prior_appends: []const TxnStreamAppend, stream: []const u8) DatabaseError!u64 {
-        const trees = try self.streamTreesForWrite();
-
-        var last = stream_store_mod.getLastSequence(
-            trees,
-            self.allocator,
-            stream,
-        ) catch |err| return self.mapStreamError(err);
-
-        for (prior_appends) |previous| {
-            if (previous.sequence) |seq| {
-                if (std.mem.eql(u8, previous.stream, stream) and seq > last) {
-                    last = seq;
-                }
-            }
-        }
+    /// The sequence the next append to `stream` in this transaction gets.
+    ///
+    /// Only one write transaction runs at a time and only its commit moves a
+    /// stream's committed last sequence, so the committed value read for the
+    /// first append to a stream stays current for the rest of the
+    /// transaction; later appends continue from the overlay's own record.
+    fn nextStreamSequence(self: *Self, overlay: *const TxnOverlay, stream: []const u8) DatabaseError!u64 {
+        const last = overlay.stream_last_sequences.get(stream) orelse blk: {
+            const trees = try self.streamTreesForWrite();
+            break :blk stream_store_mod.getLastSequence(
+                trees,
+                self.allocator,
+                stream,
+            ) catch |err| return self.mapStreamError(err);
+        };
 
         if (last == std.math.maxInt(u64)) return DatabaseError.ValueTooLarge;
         return last + 1;
     }
 
+    /// Record `sequence` as staged for `owned_stream`, whose bytes must live
+    /// as long as the overlay. The caller reserves capacity first.
+    fn noteStreamSequence(overlay: *TxnOverlay, owned_stream: []const u8, sequence: u64) void {
+        const entry = overlay.stream_last_sequences.getOrPutAssumeCapacity(owned_stream);
+        if (!entry.found_existing or sequence > entry.value_ptr.*) {
+            entry.value_ptr.* = sequence;
+        }
+    }
+
     fn assignStreamSequences(self: *Self, overlay: *TxnOverlay) DatabaseError!void {
-        for (overlay.stream_appends.items, 0..) |*append, i| {
+        if (overlay.changefeed.count() > 0) {
+            const trees = try self.streamTreesForWrite();
+            const last = changefeed_mod.lastSequence(trees) catch |err| return mapChangefeedError(err);
+            if (last > std.math.maxInt(u64) - overlay.changefeed.count()) return DatabaseError.ValueTooLarge;
+            overlay.changefeed.first_sequence = last + 1;
+        }
+        for (overlay.stream_appends.items) |*append| {
             if (append.sequence != null) continue;
 
-            append.sequence = try self.nextStreamSequence(overlay.stream_appends.items[0..i], append.stream);
+            const sequence = try self.nextStreamSequence(overlay, append.stream);
+            overlay.stream_last_sequences.ensureUnusedCapacity(self.allocator, 1) catch return DatabaseError.OutOfMemory;
+            append.sequence = sequence;
+            noteStreamSequence(overlay, append.stream, sequence);
         }
     }
 
@@ -4363,6 +5877,9 @@ pub const Database = struct {
         after_sequence: u64,
         limit: usize,
     ) DatabaseError!StreamBatch {
+        if (std.mem.eql(u8, stream, stream_store_mod.changes_stream)) {
+            return self.readChangesOnce(after_sequence, limit);
+        }
         return stream_store_mod.read(
             self.streamTrees(),
             self.allocator,
@@ -4414,6 +5931,190 @@ pub const Database = struct {
 
     pub fn readChanges(self: *Self, after_sequence: u64, limit: usize, timeout_ms: u64) DatabaseError!StreamBatch {
         return self.readStream(stream_store_mod.changes_stream, after_sequence, limit, timeout_ms);
+    }
+
+    // -----------------------------------------------------------------------
+    // The changefeed: reading, retention, status
+    // -----------------------------------------------------------------------
+
+    fn mapChangefeedError(err: changefeed_mod.Error) DatabaseError {
+        return switch (err) {
+            changefeed_mod.Error.OutOfMemory => DatabaseError.OutOfMemory,
+            changefeed_mod.Error.ValueTooLarge => DatabaseError.ValueTooLarge,
+            changefeed_mod.Error.InvalidRecord => DatabaseError.InvalidDatabase,
+            changefeed_mod.Error.IoError => DatabaseError.IoError,
+        };
+    }
+
+    fn resolveSymbolForChangefeed(context: *anyopaque, id: u16) changefeed_mod.Error![]const u8 {
+        const self: *Self = @ptrCast(@alignCast(context));
+        return self.symbol_table.resolve(id) catch |err| switch (err) {
+            error.OutOfMemory => changefeed_mod.Error.OutOfMemory,
+            else => changefeed_mod.Error.InvalidRecord,
+        };
+    }
+
+    fn freeSymbolForChangefeed(context: *anyopaque, name: []const u8) void {
+        const self: *Self = @ptrCast(@alignCast(context));
+        self.allocator.free(name);
+    }
+
+    fn changefeedResolver(self: *Self) changefeed_mod.Resolver {
+        return .{
+            .context = self,
+            .resolve = resolveSymbolForChangefeed,
+            .free = freeSymbolForChangefeed,
+        };
+    }
+
+    fn readChangesOnce(self: *Self, after_sequence: u64, limit: usize) DatabaseError!StreamBatch {
+        if (self.changefeed_retention == .off) return DatabaseError.ChangefeedOff;
+        const trees = self.streamTrees() orelse return .{
+            .allocator = self.allocator,
+            .records = self.allocator.alloc(stream_store_mod.Record, 0) catch return DatabaseError.OutOfMemory,
+        };
+        const from = changefeed_mod.readStart(trees, after_sequence) catch |err| return switch (err) {
+            error.Trimmed => DatabaseError.ChangesTrimmed,
+            else => |e| mapChangefeedError(e),
+        };
+        if (from == std.math.maxInt(u64) and after_sequence == std.math.maxInt(u64)) {
+            return .{
+                .allocator = self.allocator,
+                .records = self.allocator.alloc(stream_store_mod.Record, 0) catch return DatabaseError.OutOfMemory,
+            };
+        }
+        return changefeed_mod.read(trees, self.allocator, from, limit, self.changefeedResolver()) catch |err| mapChangefeedError(err);
+    }
+
+    /// Log a transaction's changefeed events, a frame's worth per record.
+    /// Each record carries the names of the symbols its events use, because
+    /// the symbol table is not logged: after a crash, replay interns the
+    /// names again and may give them other ids.
+    fn logChangefeed(self: *Self, txn: *Transaction, batch: *const changefeed_mod.Batch) DatabaseError!void {
+        const count = batch.count();
+        if (count == 0) return;
+        const tm = &(self.txn_manager orelse return DatabaseError.TransactionsNotEnabled);
+        var from: usize = 0;
+        while (from < count) {
+            var to = from + 1;
+            var bytes: usize = batch.event(from).len;
+            while (to < count) : (to += 1) {
+                const next = batch.event(to).len;
+                if (bytes + next > changefeed_mod.LOG_CHUNK_BYTES) break;
+                bytes += next;
+            }
+            const payload = changefeed_mod.encodeLogRecord(self.allocator, batch, from, to, self.changefeedResolver()) catch |err| return mapChangefeedError(err);
+            defer self.allocator.free(payload);
+            _ = tm.logOperation(txn, .insert, payload) catch |err| return mapTxnError(err);
+            from = to;
+        }
+    }
+
+    /// Events a checkpoint's retention pass may drop beyond those committed
+    /// since the last pass, so a backlog (a stricter policy, a feed turned
+    /// off) is worked off over several checkpoints instead of stalling one.
+    const changefeed_trim_slack: u64 = 4096;
+
+    /// Drop the events the retention policy no longer keeps, at most
+    /// `max_events` of them. The deletes are not logged: the floor, written
+    /// first and flushed with them, keeps replay from bringing them back.
+    fn applyChangefeedRetention(self: *Self, max_events: u64) DatabaseError!changefeed_mod.TrimResult {
+        if (self.read_only or self.failed) return .{};
+        const trees = self.streamTrees() orelse return .{};
+        const target = changefeed_mod.retentionTarget(
+            trees,
+            self.allocator,
+            self.changefeed_retention,
+            @intCast(@max(0, @import("compat").milliTimestamp())),
+            max_events,
+        ) catch |err| return mapChangefeedError(err);
+        const result = changefeed_mod.trimBelow(trees, self.allocator, target, max_events) catch |err| return mapChangefeedError(err);
+        if (result.done) self.changefeed_appended_since_trim = 0;
+        return result;
+    }
+
+    /// Without a log there are no checkpoints, and retention acts at the
+    /// flushes instead, which is where a checkpoint would have written the
+    /// same pages: `sync`, close, and the flush after a commit once the
+    /// cache is half dirty. The events dropped go to the file in the same
+    /// flush as the floor, so a crash keeps both or neither.
+    fn applyChangefeedRetentionWithoutLog(self: *Self) DatabaseError!void {
+        if (self.wal != null) return;
+        if (self.changefeed_retention == .keep_all) return;
+        // A writer between its statements: its staged events are not in
+        // the trees yet, and trimming may wait for its commit.
+        if (self.active_writer_txn_id != null) return;
+        _ = try self.applyChangefeedRetention(changefeed_trim_slack + self.changefeed_appended_since_trim);
+    }
+
+    /// Apply the retention policy in full now, rather than a bounded part
+    /// of it at each checkpoint, and make the result durable. Returns the
+    /// number of events dropped. Fails with `TransactionConflict` while a
+    /// write transaction is open.
+    pub fn trimChangefeed(self: *Self) DatabaseError!u64 {
+        if (self.read_only) return DatabaseError.ReadOnly;
+        if (self.failed) return DatabaseError.IoError;
+        if (self.active_writer_txn_id != null) return DatabaseError.TransactionConflict;
+        const result = try self.applyChangefeedRetention(std.math.maxInt(u64));
+        if (result.removed > 0) try self.sync();
+        return result.removed;
+    }
+
+    pub const ChangefeedStatus = struct {
+        retention: changefeed_mod.Retention,
+        /// The oldest event held, or null when none is.
+        oldest_sequence: ?u64,
+        /// The last sequence handed out, 0 if none ever was.
+        last_sequence: u64,
+    };
+
+    pub fn changefeedStatus(self: *Self) DatabaseError!ChangefeedStatus {
+        const trees = self.streamTrees() orelse return .{
+            .retention = self.changefeed_retention,
+            .oldest_sequence = null,
+            .last_sequence = 0,
+        };
+        return .{
+            .retention = self.changefeed_retention,
+            .oldest_sequence = changefeed_mod.oldestSequence(trees, self.allocator) catch |err| return mapChangefeedError(err),
+            .last_sequence = changefeed_mod.lastSequence(trees) catch |err| return mapChangefeedError(err),
+        };
+    }
+
+    /// How many events the changefeed holds and the bytes their keys and
+    /// values take. Walks every event.
+    pub fn changefeedSize(self: *Self) DatabaseError!changefeed_mod.Size {
+        const trees = self.streamTrees() orelse return .{};
+        return changefeed_mod.size(trees, self.allocator) catch |err| mapChangefeedError(err);
+    }
+
+    /// Settle the retention policy at open: an explicit one replaces the
+    /// file's, the environment supplies one for a new file, and otherwise
+    /// the file's stands. A change is synced to the file at once, so it
+    /// cannot be half there after a crash.
+    fn openChangefeedRetention(self: *Self, options: OpenOptions, is_new: bool) DatabaseError!void {
+        const stored: ?changefeed_mod.Retention = if (self.streamTrees()) |trees|
+            changefeed_mod.storedRetention(trees) catch |err| return mapChangefeedError(err)
+        else
+            null;
+        const current = stored orelse changefeed_mod.Retention.keep_all;
+        self.changefeed_retention = current;
+        if (options.read_only) return;
+
+        var wanted = options.config.changefeed_retention;
+        if (wanted == null and is_new) {
+            if (std.c.getenv("LATTICE_CHANGEFEED_RETENTION")) |value| {
+                wanted = changefeed_mod.Retention.parse(std.mem.span(value));
+            }
+        }
+        const new = wanted orelse return;
+        if (new.eql(current) and (stored != null or new == .keep_all)) return;
+
+        const trees = try self.streamTreesForWrite();
+        changefeed_mod.storeRetention(trees, current, new) catch |err| return mapChangefeedError(err);
+        self.changefeed_retention = new;
+        try self.sync();
+        self.page_manager.sync() catch return DatabaseError.IoError;
     }
 
     fn propertyValueEqual(a: PropertyValue, b: PropertyValue) bool {
@@ -4495,295 +6196,256 @@ pub const Database = struct {
         return streamAppendPayloadFits(kind, .{ .map_val = entries });
     }
 
-    fn stageChangePayload(
-        self: *Self,
-        overlay: *TxnOverlay,
-        kind: []const u8,
-        entries: []const PropertyValue.MapEntry,
-    ) DatabaseError!void {
-        const payload = PropertyValue{ .map_val = entries };
-        _ = try self.stageStreamAppend(
-            overlay,
-            stream_store_mod.changes_stream,
-            kind,
-            payload,
-            false,
-        );
-    }
-
-    fn stagePropertyChangePayload(
-        self: *Self,
-        overlay: *TxnOverlay,
+    /// The old and new values a property event records: the values
+    /// themselves, or in place of one too large for the record a short
+    /// summary map (`__lattice_value_omitted`, `type`, `encoded_bytes`),
+    /// chosen exactly as the changefeed has always chosen it, by the size of
+    /// the record 0.16.0 wrote. `entries` and the summary arrays hold what
+    /// the returned values point into.
+    fn fitPropertyChangePayload(
         kind: []const u8,
         entries: *[6]PropertyValue.MapEntry,
+        old_summary_entries: *[3]PropertyValue.MapEntry,
+        new_summary_entries: *[3]PropertyValue.MapEntry,
         old_value: ?PropertyValue,
         new_value: ?PropertyValue,
     ) DatabaseError!void {
         entries[4].value = old_value orelse .{ .null_val = {} };
         entries[5].value = new_value orelse .{ .null_val = {} };
-        if (changePayloadFits(kind, entries[0..])) {
-            try self.stageChangePayload(overlay, kind, entries[0..]);
-            return;
-        }
+        if (changePayloadFits(kind, entries[0..])) return;
 
-        var old_summary_entries: [3]PropertyValue.MapEntry = undefined;
         if (old_value) |value| {
-            entries[4].value = summarizedChangefeedValue(value, &old_summary_entries);
-            if (changePayloadFits(kind, entries[0..])) {
-                try self.stageChangePayload(overlay, kind, entries[0..]);
-                return;
-            }
+            entries[4].value = summarizedChangefeedValue(value, old_summary_entries);
+            if (changePayloadFits(kind, entries[0..])) return;
         }
-
-        var new_summary_entries: [3]PropertyValue.MapEntry = undefined;
         if (new_value) |value| {
-            entries[5].value = summarizedChangefeedValue(value, &new_summary_entries);
-            if (changePayloadFits(kind, entries[0..])) {
-                try self.stageChangePayload(overlay, kind, entries[0..]);
-                return;
-            }
+            entries[5].value = summarizedChangefeedValue(value, new_summary_entries);
+            if (changePayloadFits(kind, entries[0..])) return;
         }
-
         return DatabaseError.ValueTooLarge;
     }
 
-    fn stageNodeChange(
+    /// Values this small leave the record far below every size limit, so
+    /// they are recorded as they are without working out the record's size.
+    const changefeed_inline_value_limit: usize = 1 << 20;
+
+    fn stageChangefeedEvent(
         self: *Self,
         overlay: *TxnOverlay,
-        kind: []const u8,
-        op: []const u8,
-        node_id: NodeId,
+        event: changefeed_mod.Event,
+        commit_ms: u64,
     ) DatabaseError!void {
-        var entries = [_]PropertyValue.MapEntry{
-            .{ .key = "entity", .value = .{ .string_val = "node" } },
-            .{ .key = "op", .value = .{ .string_val = op } },
-            .{ .key = "node_id", .value = idValue(node_id) },
-        };
-        try self.stageChangePayload(overlay, kind, &entries);
+        overlay.changefeed.append(self.allocator, event, commit_ms) catch |err| return mapChangefeedError(err);
     }
 
-    fn stageNodeLabelChange(
+    fn stageChangefeedProperty(
         self: *Self,
         overlay: *TxnOverlay,
-        kind: []const u8,
-        op: []const u8,
-        node_id: NodeId,
-        label_id: symbols_mod.SymbolId,
-    ) DatabaseError!void {
-        const label = self.symbol_table.resolve(label_id) catch return DatabaseError.IoError;
-        defer self.allocator.free(label);
-        var entries = [_]PropertyValue.MapEntry{
-            .{ .key = "entity", .value = .{ .string_val = "node" } },
-            .{ .key = "op", .value = .{ .string_val = op } },
-            .{ .key = "node_id", .value = idValue(node_id) },
-            .{ .key = "label", .value = .{ .string_val = label } },
-        };
-        try self.stageChangePayload(overlay, kind, &entries);
-    }
-
-    fn stageNodePropertyChange(
-        self: *Self,
-        overlay: *TxnOverlay,
-        kind: []const u8,
-        op: []const u8,
-        node_id: NodeId,
+        op: changefeed_mod.Op,
+        id: u64,
         key_id: symbols_mod.SymbolId,
         old_value: ?PropertyValue,
         new_value: ?PropertyValue,
+        commit_ms: u64,
     ) DatabaseError!void {
-        const key = self.symbol_table.resolve(key_id) catch return DatabaseError.IoError;
-        defer self.allocator.free(key);
-        var entries = [_]PropertyValue.MapEntry{
-            .{ .key = "entity", .value = .{ .string_val = "node" } },
-            .{ .key = "op", .value = .{ .string_val = op } },
-            .{ .key = "node_id", .value = idValue(node_id) },
-            .{ .key = "key", .value = .{ .string_val = key } },
-            .{ .key = "old_value", .value = .{ .null_val = {} } },
-            .{ .key = "new_value", .value = .{ .null_val = {} } },
-        };
-        try self.stagePropertyChangePayload(overlay, kind, &entries, old_value, new_value);
-    }
+        const null_value = PropertyValue{ .null_val = {} };
+        var old_recorded = old_value orelse null_value;
+        var new_recorded = new_value orelse null_value;
+        const old_size = wal_payload.propertyValueSize(old_recorded);
+        const new_size = wal_payload.propertyValueSize(new_recorded);
 
-    fn stageEdgeChange(
-        self: *Self,
-        overlay: *TxnOverlay,
-        kind: []const u8,
-        op: []const u8,
-        edge_id: EdgeId,
-        state: TxnEdgeState,
-    ) DatabaseError!void {
-        const type_name = self.symbol_table.resolve(state.edge_type) catch return DatabaseError.IoError;
-        defer self.allocator.free(type_name);
-        var entries = [_]PropertyValue.MapEntry{
-            .{ .key = "entity", .value = .{ .string_val = "edge" } },
-            .{ .key = "op", .value = .{ .string_val = op } },
-            .{ .key = "edge_id", .value = idValue(edge_id) },
-            .{ .key = "source_id", .value = idValue(state.source) },
-            .{ .key = "target_id", .value = idValue(state.target) },
-            .{ .key = "type", .value = .{ .string_val = type_name } },
-        };
-        try self.stageChangePayload(overlay, kind, &entries);
-    }
-
-    fn stageEdgePropertyChange(
-        self: *Self,
-        overlay: *TxnOverlay,
-        kind: []const u8,
-        op: []const u8,
-        edge_id: EdgeId,
-        key_id: symbols_mod.SymbolId,
-        old_value: ?PropertyValue,
-        new_value: ?PropertyValue,
-    ) DatabaseError!void {
-        const key = self.symbol_table.resolve(key_id) catch return DatabaseError.IoError;
-        defer self.allocator.free(key);
-        var entries = [_]PropertyValue.MapEntry{
-            .{ .key = "entity", .value = .{ .string_val = "edge" } },
-            .{ .key = "op", .value = .{ .string_val = op } },
-            .{ .key = "edge_id", .value = idValue(edge_id) },
-            .{ .key = "key", .value = .{ .string_val = key } },
-            .{ .key = "old_value", .value = .{ .null_val = {} } },
-            .{ .key = "new_value", .value = .{ .null_val = {} } },
-        };
-        try self.stagePropertyChangePayload(overlay, kind, &entries, old_value, new_value);
-    }
-
-    fn stageGraphChangefeed(self: *Self, overlay: *TxnOverlay) DatabaseError!void {
-        var node_iter = overlay.node_states.iterator();
-        while (node_iter.next()) |entry| {
-            const node_id = entry.key_ptr.*;
-            const state = entry.value_ptr.*;
-            const current = try self.readBaseNodeState(node_id);
-            defer if (current) |existing| {
-                var owned_existing = existing;
-                owned_existing.deinit(self.allocator);
+        var entries: [6]PropertyValue.MapEntry = undefined;
+        var old_summary: [3]PropertyValue.MapEntry = undefined;
+        var new_summary: [3]PropertyValue.MapEntry = undefined;
+        var key_name: ?[]const u8 = null;
+        defer if (key_name) |name| self.allocator.free(name);
+        if (old_size > changefeed_inline_value_limit or new_size > changefeed_inline_value_limit) {
+            key_name = self.symbol_table.resolve(key_id) catch return DatabaseError.IoError;
+            const entity: []const u8 = if (op.isEdge()) "edge" else "node";
+            entries = .{
+                .{ .key = "entity", .value = .{ .string_val = entity } },
+                .{ .key = "op", .value = .{ .string_val = if (op == .node_property_set or op == .edge_property_set) "property_set" else "property_remove" } },
+                .{ .key = if (op.isEdge()) "edge_id" else "node_id", .value = idValue(id) },
+                .{ .key = "key", .value = .{ .string_val = key_name.? } },
+                .{ .key = "old_value", .value = null_value },
+                .{ .key = "new_value", .value = null_value },
             };
-
-            if (!state.exists) {
-                if (current != null) {
-                    try self.stageNodeChange(overlay, "node.delete", "delete", node_id);
-                }
-                continue;
-            }
-
-            if (current) |existing| {
-                for (existing.labels) |label_id| {
-                    if (!containsSymbolId(state.labels, label_id)) {
-                        try self.stageNodeLabelChange(overlay, "node.label_remove", "label_remove", node_id, label_id);
-                    }
-                }
-                for (state.labels) |label_id| {
-                    if (!containsSymbolId(existing.labels, label_id)) {
-                        try self.stageNodeLabelChange(overlay, "node.label_add", "label_add", node_id, label_id);
-                    }
-                }
-
-                for (existing.properties) |prop| {
-                    if (findPropertyById(state.properties, prop.key_id) == null) {
-                        try self.stageNodePropertyChange(
-                            overlay,
-                            "node.property_remove",
-                            "property_remove",
-                            node_id,
-                            prop.key_id,
-                            prop.value,
-                            null,
-                        );
-                    }
-                }
-                for (state.properties) |prop| {
-                    const old_prop = findPropertyById(existing.properties, prop.key_id);
-                    if (old_prop) |old| {
-                        if (propertyValueEqual(old.value, prop.value)) continue;
-                    }
-                    try self.stageNodePropertyChange(
-                        overlay,
-                        "node.property_set",
-                        "property_set",
-                        node_id,
-                        prop.key_id,
-                        if (old_prop) |old| old.value else null,
-                        prop.value,
-                    );
-                }
-            } else {
-                try self.stageNodeChange(overlay, "node.insert", "insert", node_id);
-                for (state.labels) |label_id| {
-                    try self.stageNodeLabelChange(overlay, "node.label_add", "label_add", node_id, label_id);
-                }
-                for (state.properties) |prop| {
-                    try self.stageNodePropertyChange(
-                        overlay,
-                        "node.property_set",
-                        "property_set",
-                        node_id,
-                        prop.key_id,
-                        null,
-                        prop.value,
-                    );
-                }
-            }
+            try fitPropertyChangePayload(op.kind(), &entries, &old_summary, &new_summary, old_value, new_value);
+            old_recorded = entries[4].value;
+            new_recorded = entries[5].value;
         }
 
-        var edge_iter = overlay.edge_states.iterator();
-        while (edge_iter.next()) |entry| {
-            const edge_id = entry.key_ptr.*;
-            const state = entry.value_ptr.*;
-            const current = try self.readBaseEdgeState(edge_id);
-            defer if (current) |existing| {
-                var owned_existing = existing;
-                owned_existing.deinit(self.allocator);
-            };
+        const old_len = wal_payload.propertyValueSize(old_recorded);
+        const new_len = wal_payload.propertyValueSize(new_recorded);
+        const scratch = &self.changefeed_scratch;
+        scratch.resize(self.allocator, old_len + new_len) catch return DatabaseError.OutOfMemory;
+        _ = wal_payload.serializePropertyValueToBuf(scratch.items[0..old_len], old_recorded) catch return DatabaseError.IoError;
+        _ = wal_payload.serializePropertyValueToBuf(scratch.items[old_len..], new_recorded) catch return DatabaseError.IoError;
+        try self.stageChangefeedEvent(overlay, .{
+            .op = op,
+            .id = id,
+            .symbol = .{ .id = key_id },
+            .old_value = scratch.items[0..old_len],
+            .new_value = scratch.items[old_len..],
+        }, commit_ms);
+    }
 
-            if (!state.exists) {
-                if (current) |existing| {
-                    try self.stageEdgeChange(overlay, "edge.delete", "delete", edge_id, existing);
+    /// Stage the changefeed events for what this transaction changes, by
+    /// comparing each node and edge it touched with its committed state.
+    /// Events are encoded as they are found (see `stream/changefeed.zig`);
+    /// symbols go in by id, and the log carries their names.
+    ///
+    /// The events are the transaction's net effect, in an order a consumer
+    /// applying them in sequence can replay: first the edges it deletes,
+    /// then the nodes that exist after it, then the edges that exist after
+    /// it, then the nodes it deletes, each group in ascending id order. So an edge is created after both its nodes and
+    /// deleted before either, a change to an entity comes after its
+    /// creation, and a node's deletion is the last event that names it. A
+    /// property set several times is one event, from its value before the
+    /// transaction to its value after.
+    ///
+    /// A commit that fails before its commit point leaves the transaction
+    /// open, and the caller may change it further and commit again, so
+    /// everything is staged afresh each time: the events, the sorted ids and
+    /// the stored states from an earlier attempt describe a transaction that
+    /// no longer exists (the ids and states are redone by
+    /// `readStoredStatesForCommit`, which runs first).
+    fn stageGraphChangefeed(self: *Self, overlay: *TxnOverlay) DatabaseError!void {
+        overlay.changefeed.deinit(self.allocator);
+        if (self.changefeed_retention == .off) return;
+        if (overlay.node_states.count() == 0 and overlay.edge_states.count() == 0) return;
+        const commit_ms: u64 = @intCast(@max(0, @import("compat").milliTimestamp()));
+
+        // Sorted when the stored states were read, on this attempt.
+        const node_ids = overlay.sortedNodeIds() orelse return DatabaseError.IoError;
+        const edge_ids = overlay.sortedEdgeIds() orelse return DatabaseError.IoError;
+
+        for (edge_ids) |id| {
+            const state = overlay.edge_states.get(id).?;
+            if (!state.exists) try self.stageEdgeChangefeed(overlay, id, state, commit_ms);
+        }
+        for (node_ids) |id| {
+            const state = overlay.node_states.get(id).?;
+            if (state.exists) try self.stageNodeChangefeed(overlay, id, state, commit_ms);
+        }
+        for (edge_ids) |id| {
+            const state = overlay.edge_states.get(id).?;
+            if (state.exists) try self.stageEdgeChangefeed(overlay, id, state, commit_ms);
+        }
+        for (node_ids) |id| {
+            const state = overlay.node_states.get(id).?;
+            if (!state.exists) try self.stageNodeChangefeed(overlay, id, state, commit_ms);
+        }
+        if (self.fail_after_changefeed_staging_for_testing) {
+            self.fail_after_changefeed_staging_for_testing = false;
+            return DatabaseError.IoError;
+        }
+    }
+
+    /// The events for one node: the difference between its committed state
+    /// and `state`.
+    fn stageNodeChangefeed(self: *Self, overlay: *TxnOverlay, node_id: NodeId, state: TxnNodeState, commit_ms: u64) DatabaseError!void {
+        const current = overlay.stored_nodes.get(node_id);
+
+        if (!state.exists) {
+            if (current != null) {
+                try self.stageChangefeedEvent(overlay, .{ .op = .node_delete, .id = node_id }, commit_ms);
+            }
+            return;
+        }
+
+        if (current) |existing| {
+            for (existing.labels) |label_id| {
+                if (!containsSymbolId(state.labels, label_id)) {
+                    try self.stageChangefeedEvent(overlay, .{ .op = .node_label_remove, .id = node_id, .symbol = .{ .id = label_id } }, commit_ms);
                 }
-                continue;
+            }
+            for (state.labels) |label_id| {
+                if (!containsSymbolId(existing.labels, label_id)) {
+                    try self.stageChangefeedEvent(overlay, .{ .op = .node_label_add, .id = node_id, .symbol = .{ .id = label_id } }, commit_ms);
+                }
             }
 
+            for (existing.properties) |prop| {
+                if (findPropertyById(state.properties, prop.key_id) == null) {
+                    try self.stageChangefeedProperty(overlay, .node_property_remove, node_id, prop.key_id, prop.value, null, commit_ms);
+                }
+            }
+            for (state.properties) |prop| {
+                const old_prop = findPropertyById(existing.properties, prop.key_id);
+                if (old_prop) |old| {
+                    if (propertyValueEqual(old.value, prop.value)) continue;
+                }
+                try self.stageChangefeedProperty(
+                    overlay,
+                    .node_property_set,
+                    node_id,
+                    prop.key_id,
+                    if (old_prop) |old| old.value else null,
+                    prop.value,
+                    commit_ms,
+                );
+            }
+        } else {
+            try self.stageChangefeedEvent(overlay, .{ .op = .node_insert, .id = node_id }, commit_ms);
+            for (state.labels) |label_id| {
+                try self.stageChangefeedEvent(overlay, .{ .op = .node_label_add, .id = node_id, .symbol = .{ .id = label_id } }, commit_ms);
+            }
+            for (state.properties) |prop| {
+                try self.stageChangefeedProperty(overlay, .node_property_set, node_id, prop.key_id, null, prop.value, commit_ms);
+            }
+        }
+    }
+
+    /// The events for one edge: the difference between its committed state
+    /// and `state`.
+    fn stageEdgeChangefeed(self: *Self, overlay: *TxnOverlay, edge_id: EdgeId, state: TxnEdgeState, commit_ms: u64) DatabaseError!void {
+        const current = overlay.stored_edges.get(edge_id);
+
+        if (!state.exists) {
             if (current) |existing| {
-                for (existing.properties) |prop| {
-                    if (findPropertyById(state.properties, prop.key_id) == null) {
-                        try self.stageEdgePropertyChange(
-                            overlay,
-                            "edge.property_remove",
-                            "property_remove",
-                            edge_id,
-                            prop.key_id,
-                            prop.value,
-                            null,
-                        );
-                    }
+                try self.stageChangefeedEvent(overlay, .{
+                    .op = .edge_delete,
+                    .id = edge_id,
+                    .source = existing.source,
+                    .target = existing.target,
+                    .symbol = .{ .id = existing.edge_type },
+                }, commit_ms);
+            }
+            return;
+        }
+
+        if (current) |existing| {
+            for (existing.properties) |prop| {
+                if (findPropertyById(state.properties, prop.key_id) == null) {
+                    try self.stageChangefeedProperty(overlay, .edge_property_remove, edge_id, prop.key_id, prop.value, null, commit_ms);
                 }
-                for (state.properties) |prop| {
-                    const old_prop = findPropertyById(existing.properties, prop.key_id);
-                    if (old_prop) |old| {
-                        if (propertyValueEqual(old.value, prop.value)) continue;
-                    }
-                    try self.stageEdgePropertyChange(
-                        overlay,
-                        "edge.property_set",
-                        "property_set",
-                        edge_id,
-                        prop.key_id,
-                        if (old_prop) |old| old.value else null,
-                        prop.value,
-                    );
+            }
+            for (state.properties) |prop| {
+                const old_prop = findPropertyById(existing.properties, prop.key_id);
+                if (old_prop) |old| {
+                    if (propertyValueEqual(old.value, prop.value)) continue;
                 }
-            } else {
-                try self.stageEdgeChange(overlay, "edge.insert", "insert", edge_id, state);
-                for (state.properties) |prop| {
-                    try self.stageEdgePropertyChange(
-                        overlay,
-                        "edge.property_set",
-                        "property_set",
-                        edge_id,
-                        prop.key_id,
-                        null,
-                        prop.value,
-                    );
-                }
+                try self.stageChangefeedProperty(
+                    overlay,
+                    .edge_property_set,
+                    edge_id,
+                    prop.key_id,
+                    if (old_prop) |old| old.value else null,
+                    prop.value,
+                    commit_ms,
+                );
+            }
+        } else {
+            try self.stageChangefeedEvent(overlay, .{
+                .op = .edge_insert,
+                .id = edge_id,
+                .source = state.source,
+                .target = state.target,
+                .symbol = .{ .id = state.edge_type },
+            }, commit_ms);
+            for (state.properties) |prop| {
+                try self.stageChangefeedProperty(overlay, .edge_property_set, edge_id, prop.key_id, null, prop.value, commit_ms);
             }
         }
     }
@@ -4793,18 +6455,19 @@ pub const Database = struct {
     }
 
     fn readBaseNodeState(self: *Self, node_id: NodeId) DatabaseError!?TxnNodeState {
-        var node = self.node_store.get(node_id) catch |err| {
+        const node = self.node_store.get(node_id) catch |err| {
             return switch (err) {
                 node_mod.NodeError.NotFound => null,
+                node_mod.NodeError.OutOfMemory => DatabaseError.OutOfMemory,
                 else => DatabaseError.IoError,
             };
         };
-        defer node.deinit(self.allocator);
-
+        // The decoded node is already a private copy in this allocator; the
+        // state takes it over rather than copying it a second time.
         return .{
             .exists = true,
-            .labels = cloneSymbolIds(self.allocator, node.labels) catch return DatabaseError.OutOfMemory,
-            .properties = cloneProperties(self.allocator, node.properties) catch return DatabaseError.OutOfMemory,
+            .labels = node.labels,
+            .properties = node.properties,
         };
     }
 
@@ -4834,30 +6497,82 @@ pub const Database = struct {
         if (overlay.node_states.getPtr(node_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = state;
-            return;
+        } else {
+            overlay.node_states.put(self.allocator, node_id, state) catch {
+                var owned_state = state;
+                owned_state.deinit(self.allocator);
+                return DatabaseError.OutOfMemory;
+            };
         }
-        overlay.node_states.put(self.allocator, node_id, state) catch {
-            var owned_state = state;
-            owned_state.deinit(self.allocator);
-            return DatabaseError.OutOfMemory;
-        };
+        try noteOverlayNode(overlay, self.allocator, node_id, state);
+    }
+
+    /// Note a staged node under its values for the declarations that index
+    /// lookups in this transaction have asked about. None until the first.
+    fn noteOverlayNode(overlay: *TxnOverlay, allocator: Allocator, node_id: NodeId, state: TxnNodeState) DatabaseError!void {
+        if (!state.exists) return;
+        for (overlay.node_lookup.covered.items) |definition| {
+            if (!containsSymbolId(state.labels, definition.scope_id)) continue;
+            const property = findPropertyById(state.properties, definition.property_id) orelse continue;
+            overlay.node_lookup.note(allocator, definition, node_id, property.value) catch return DatabaseError.OutOfMemory;
+        }
+    }
+
+    fn noteOverlayEdge(overlay: *TxnOverlay, allocator: Allocator, edge_id: EdgeId, state: TxnEdgeState) DatabaseError!void {
+        if (!state.exists) return;
+        for (overlay.edge_lookup.covered.items) |definition| {
+            if (state.edge_type != definition.scope_id) continue;
+            const property = findPropertyById(state.properties, definition.property_id) orelse continue;
+            overlay.edge_lookup.note(allocator, definition, edge_id, property.value) catch return DatabaseError.OutOfMemory;
+        }
+    }
+
+    /// The staged nodes that may hold `value` under `definition`, to be
+    /// checked against their staged state. The first call for a declaration
+    /// notes every node staged so far.
+    fn overlayNodeCandidates(self: *Self, overlay: *TxnOverlay, definition: PropertyIndexDefinition, value: PropertyValue) DatabaseError![]const u64 {
+        if (!overlay.node_lookup.covers(definition)) {
+            overlay.node_lookup.cover(self.allocator, definition) catch return DatabaseError.OutOfMemory;
+            var iter = overlay.node_states.iterator();
+            while (iter.next()) |entry| {
+                const state = entry.value_ptr;
+                if (!state.exists or !containsSymbolId(state.labels, definition.scope_id)) continue;
+                const property = findPropertyById(state.properties, definition.property_id) orelse continue;
+                overlay.node_lookup.note(self.allocator, definition, entry.key_ptr.*, property.value) catch return DatabaseError.OutOfMemory;
+            }
+        }
+        return overlay.node_lookup.candidates(definition, value);
+    }
+
+    fn overlayEdgeCandidates(self: *Self, overlay: *TxnOverlay, definition: PropertyIndexDefinition, value: PropertyValue) DatabaseError![]const u64 {
+        if (!overlay.edge_lookup.covers(definition)) {
+            overlay.edge_lookup.cover(self.allocator, definition) catch return DatabaseError.OutOfMemory;
+            var iter = overlay.edge_states.iterator();
+            while (iter.next()) |entry| {
+                const state = entry.value_ptr;
+                if (!state.exists or state.edge_type != definition.scope_id) continue;
+                const property = findPropertyById(state.properties, definition.property_id) orelse continue;
+                overlay.edge_lookup.note(self.allocator, definition, entry.key_ptr.*, property.value) catch return DatabaseError.OutOfMemory;
+            }
+        }
+        return overlay.edge_lookup.candidates(definition, value);
     }
 
     fn readBaseEdgeState(self: *Self, edge_id: EdgeId) DatabaseError!?TxnEdgeState {
-        var edge = self.edge_store.getById(edge_id) catch |err| {
+        const edge = self.edge_store.getById(edge_id) catch |err| {
             return switch (err) {
                 edge_mod.EdgeError.NotFound => null,
+                edge_mod.EdgeError.OutOfMemory => DatabaseError.OutOfMemory,
                 else => DatabaseError.IoError,
             };
         };
-        defer edge.deinit(self.allocator);
-
+        // Taken over, as in readBaseNodeState.
         return .{
             .exists = true,
             .source = edge.source,
             .target = edge.target,
             .edge_type = edge.edge_type,
-            .properties = cloneProperties(self.allocator, edge.properties) catch return DatabaseError.OutOfMemory,
+            .properties = edge.properties,
         };
     }
 
@@ -4885,20 +6600,60 @@ pub const Database = struct {
         }
 
         if (overlay.edge_states.getPtr(edge_id)) |existing| {
+            if (state.exists and !existing.exists) {
+                indexOverlayEdge(self.allocator, overlay, edge_id, state) catch {
+                    var owned_state = state;
+                    owned_state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+            }
             existing.deinit(self.allocator);
             existing.* = state;
-            return;
+        } else {
+            if (state.exists) {
+                indexOverlayEdge(self.allocator, overlay, edge_id, state) catch {
+                    var owned_state = state;
+                    owned_state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+            }
+            overlay.edge_states.put(self.allocator, edge_id, state) catch {
+                var owned_state = state;
+                owned_state.deinit(self.allocator);
+                return DatabaseError.OutOfMemory;
+            };
         }
-        overlay.edge_states.put(self.allocator, edge_id, state) catch {
-            var owned_state = state;
-            owned_state.deinit(self.allocator);
-            return DatabaseError.OutOfMemory;
-        };
+        try noteOverlayEdge(overlay, self.allocator, edge_id, state);
+    }
+
+    /// File a pending edge under its endpoints in `edges_by_node`. A
+    /// self-loop is filed once. An entry with no state behind it, left by a
+    /// failed put, is harmless: readers look the state up and skip it.
+    fn indexOverlayEdge(
+        allocator: Allocator,
+        overlay: *TxnOverlay,
+        edge_id: EdgeId,
+        state: TxnEdgeState,
+    ) Allocator.Error!void {
+        const source = try overlay.edges_by_node.getOrPut(allocator, state.source);
+        if (!source.found_existing) source.value_ptr.* = .empty;
+        try source.value_ptr.append(allocator, edge_id);
+        if (state.target == state.source) return;
+        const target = try overlay.edges_by_node.getOrPut(allocator, state.target);
+        if (!target.found_existing) target.value_ptr.* = .empty;
+        try target.value_ptr.append(allocator, edge_id);
+    }
+
+    /// Whether the committed state holds a vector for this node.
+    fn baseHasVector(self: *Self, node_id: NodeId) bool {
+        var hnsw = self.hnsw_index orelse return false;
+        return hnsw.getNode(node_id) != null;
     }
 
     fn readBaseVectorState(self: *Self, node_id: NodeId) DatabaseError!TxnVectorState {
         var hnsw = self.hnsw_index orelse return .{ .absent = {} };
-        var vector_storage = self.vector_storage orelse return .{ .absent = {} };
+        // By pointer: borrowing can fill the storage's scratch buffers.
+        const vector_storage = if (self.vector_storage) |*vs| vs else return .{ .absent = {} };
         if (hnsw.getNode(node_id)) |entry| {
             const borrowed = vector_storage.borrowByLocation(entry.vector_loc) catch return DatabaseError.IoError;
             defer borrowed.release();
@@ -4936,12 +6691,18 @@ pub const Database = struct {
         };
     }
 
+    /// Ids of every node `txn` sees, ascending.
+    ///
+    /// In a file created before format 5 the node tree's keys are
+    /// little-endian, so its own order is not id order (256 before 2), and
+    /// the overlay's ids come after the tree's in any file; the ids are
+    /// sorted so that `MATCH (n)` comes back in the order a label scan does.
     fn collectVisibleNodeIds(self: *Self, txn: ?*Transaction) DatabaseError![]NodeId {
         var ids: std.ArrayListUnmanaged(NodeId) = .empty;
         errdefer ids.deinit(self.allocator);
 
-        var seen: std.AutoHashMapUnmanaged(NodeId, void) = .{};
-        defer seen.deinit(self.allocator);
+        const overlay: ?*TxnOverlay = if (txn) |t| self.getTxnOverlay(t) else null;
+        const has_node_states = if (overlay) |o| o.node_states.count() > 0 else false;
 
         var iter = self.node_tree.range(null, null) catch return DatabaseError.IoError;
         defer iter.deinit();
@@ -4950,35 +6711,24 @@ pub const Database = struct {
             const entry = iter.next() catch return DatabaseError.IoError;
             if (entry) |e| {
                 if (e.key.len < 8) continue;
-                const node_id = std.mem.readInt(u64, e.key[0..8], .little);
-                var include = true;
-                if (txn) |t| {
-                    if (self.getTxnOverlay(t)) |overlay| {
-                        if (overlay.node_states.get(node_id)) |state| {
-                            include = state.exists;
-                        }
-                    }
-                }
-                try seen.put(self.allocator, node_id, {});
-                if (include) {
-                    try ids.append(self.allocator, node_id);
-                }
+                const node_id = self.id_key_order.decode(e.key[0..8]);
+                // The overlay decides every node it holds; it is walked below.
+                if (has_node_states and overlay.?.node_states.contains(node_id)) continue;
+                try ids.append(self.allocator, node_id);
             } else {
                 break;
             }
         }
 
-        if (txn) |t| {
-            if (self.getTxnOverlay(t)) |overlay| {
-                var overlay_iter = overlay.node_states.iterator();
-                while (overlay_iter.next()) |entry| {
-                    if (seen.contains(entry.key_ptr.*)) continue;
-                    if (!entry.value_ptr.exists) continue;
-                    try ids.append(self.allocator, entry.key_ptr.*);
-                }
+        if (has_node_states) {
+            var overlay_iter = overlay.?.node_states.iterator();
+            while (overlay_iter.next()) |entry| {
+                if (!entry.value_ptr.exists) continue;
+                try ids.append(self.allocator, entry.key_ptr.*);
             }
         }
 
+        std.mem.sort(NodeId, ids.items, {}, std.sort.asc(NodeId));
         return ids.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
     }
 
@@ -4986,23 +6736,152 @@ pub const Database = struct {
         return self.collectVisibleNodeIds(txn);
     }
 
+    /// Ids of the nodes that carry `label_id` as `txn` sees them, ascending.
+    ///
+    /// Committed members come from the label index, which the commit path
+    /// keeps in step with the node store. The transaction's overlay then
+    /// decides every node it holds a state for: that covers the writer's own
+    /// creates, deletes and label changes, and the pre-images a reader's
+    /// overlay receives when a writer commits under it. A node in the
+    /// overlay counts only if its overlay state exists and has the label;
+    /// any other node counts if the index lists it.
     pub fn getNodesByLabelIdInTxn(self: *Self, txn: ?*Transaction, label_id: symbols_mod.SymbolId) DatabaseError![]NodeId {
-        const visible_ids = try self.collectVisibleNodeIds(txn);
-        defer self.allocator.free(visible_ids);
+        const committed = self.label_index.getNodesByLabel(label_id) catch |err| return switch (err) {
+            label_index_mod.LabelIndexError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+
+        const t = txn orelse return committed;
+        const overlay = self.getTxnOverlay(t) orelse return committed;
+        if (overlay.node_states.count() == 0) return committed;
+        defer self.allocator.free(committed);
 
         var matches: std.ArrayListUnmanaged(NodeId) = .empty;
         errdefer matches.deinit(self.allocator);
+        matches.ensureTotalCapacity(self.allocator, committed.len) catch return DatabaseError.OutOfMemory;
 
-        for (visible_ids) |node_id| {
-            var state = (try self.readVisibleNodeState(txn, node_id)) orelse continue;
-            defer state.deinit(self.allocator);
-            if (!state.exists) continue;
-            if (containsSymbolId(state.labels, label_id)) {
-                matches.append(self.allocator, node_id) catch return DatabaseError.OutOfMemory;
+        for (committed) |node_id| {
+            if (overlay.node_states.getPtr(node_id)) |state| {
+                if (!state.exists or !containsSymbolId(state.labels, label_id)) continue;
             }
+            matches.appendAssumeCapacity(node_id);
         }
 
+        // Nodes the index does not list but the overlay gives the label to:
+        // created or relabelled in this transaction, or deleted by a writer
+        // that committed after this reader's snapshot.
+        var added = false;
+        var overlay_iter = overlay.node_states.iterator();
+        while (overlay_iter.next()) |entry| {
+            const state = entry.value_ptr;
+            if (!state.exists or !containsSymbolId(state.labels, label_id)) continue;
+            if (std.sort.binarySearch(NodeId, committed, entry.key_ptr.*, orderNodeId) != null) continue;
+            matches.append(self.allocator, entry.key_ptr.*) catch return DatabaseError.OutOfMemory;
+            added = true;
+        }
+        if (added) std.mem.sort(NodeId, matches.items, {}, std.sort.asc(NodeId));
+
         return matches.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+    }
+
+    /// The nodes `txn`'s overlay holds with `label_id`, ascending; empty
+    /// without an overlay. Owned by `self.allocator`.
+    ///
+    /// With `overlayNodeHasLabel` and the label index's `readNodesByLabel`
+    /// this gives what getNodesByLabelIdInTxn does, a piece at a time.
+    pub fn overlayNodesWithLabel(self: *Self, txn: ?*Transaction, label_id: symbols_mod.SymbolId) DatabaseError![]NodeId {
+        var matches: std.ArrayListUnmanaged(NodeId) = .empty;
+        errdefer matches.deinit(self.allocator);
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                var iter = overlay.node_states.iterator();
+                while (iter.next()) |entry| {
+                    const state = entry.value_ptr;
+                    if (!state.exists or !containsSymbolId(state.labels, label_id)) continue;
+                    matches.append(self.allocator, entry.key_ptr.*) catch return DatabaseError.OutOfMemory;
+                }
+            }
+        }
+        std.mem.sort(NodeId, matches.items, {}, std.sort.asc(NodeId));
+        return matches.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+    }
+
+    /// Whether `txn`'s overlay gives a node `label_id`, or null when the
+    /// overlay does not hold the node and the committed state decides.
+    pub fn overlayNodeHasLabel(self: *Self, txn: ?*Transaction, node_id: NodeId, label_id: symbols_mod.SymbolId) ?bool {
+        const t = txn orelse return null;
+        const overlay = self.getTxnOverlay(t) orelse return null;
+        const state = overlay.node_states.getPtr(node_id) orelse return null;
+        return state.exists and containsSymbolId(state.labels, label_id);
+    }
+
+    /// Whether the transaction's overlay holds this edge, which then
+    /// decides whether and how it exists.
+    pub fn overlayHoldsEdge(self: *Self, txn: ?*Transaction, edge_id: EdgeId) bool {
+        const t = txn orelse return false;
+        const overlay = self.getTxnOverlay(t) orelse return false;
+        return overlay.edge_states.contains(edge_id);
+    }
+
+    /// An edge's endpoints and type as `txn` sees it, without its
+    /// properties; null when the edge does not exist.
+    pub fn getEdgeRefInTxn(self: *Self, txn: ?*Transaction, edge_id: EdgeId) DatabaseError!?EdgeRef {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.edge_states.getPtr(edge_id)) |state| {
+                    return if (state.exists) edgeStateToRef(edge_id, state.*) else null;
+                }
+            }
+        }
+        return self.edge_store.getRefById(edge_id) catch |err| switch (err) {
+            edge_mod.EdgeError.NotFound => null,
+            edge_mod.EdgeError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
+    /// Whether a node exists as `txn` sees it, without decoding it.
+    pub fn nodeVisibleInTxn(self: *Self, txn: ?*Transaction, node_id: NodeId) DatabaseError!bool {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.node_states.getPtr(node_id)) |state| return state.exists;
+            }
+        }
+        return self.nodeExists(node_id);
+    }
+
+    /// Whether the transaction's overlay holds any edge.
+    pub fn overlayHasEdges(self: *Self, txn: ?*Transaction) bool {
+        const t = txn orelse return false;
+        const overlay = self.getTxnOverlay(t) orelse return false;
+        return overlay.edge_states.count() > 0;
+    }
+
+    /// The edges the overlay holds that exist and have one of `types`, in id
+    /// order. The slice belongs to `self.allocator`.
+    pub fn overlayEdgesOfTypes(self: *Self, txn: ?*Transaction, edge_types: []const symbols_mod.SymbolId) DatabaseError![]EdgeRef {
+        var refs: std.ArrayListUnmanaged(EdgeRef) = .empty;
+        errdefer refs.deinit(self.allocator);
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                var iter = overlay.edge_states.iterator();
+                while (iter.next()) |entry| {
+                    const state = entry.value_ptr.*;
+                    if (!state.exists or !containsSymbolId(edge_types, state.edge_type)) continue;
+                    refs.append(self.allocator, edgeStateToRef(entry.key_ptr.*, state)) catch return DatabaseError.OutOfMemory;
+                }
+            }
+        }
+        std.mem.sort(EdgeRef, refs.items, {}, struct {
+            fn lessThan(_: void, a: EdgeRef, b: EdgeRef) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+        return refs.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+    }
+
+    fn orderNodeId(target: NodeId, item: NodeId) std.math.Order {
+        return std.math.order(target, item);
     }
 
     fn edgeStateToRef(edge_id: EdgeId, state: TxnEdgeState) EdgeRef {
@@ -5080,6 +6959,15 @@ pub const Database = struct {
         var refs: std.ArrayListUnmanaged(EdgeRef) = .empty;
         errdefer refs.deinit(self.allocator);
 
+        // Without staged edges, the committed ones are the answer: no
+        // overlay lookup per edge, and no set of the ids seen.
+        const overlay: ?*TxnOverlay = if (txn) |t| self.getTxnOverlay(t) else null;
+        const staged = if (overlay) |o| o.edge_states.count() > 0 else false;
+        // Only this node's pending edges, not the transaction's.
+        const pending: []const EdgeId = if (!staged) &.{} else if (overlay.?.edges_by_node.get(node_id)) |list| list.items else &.{};
+
+        // The committed edges seen, so that a pending edge already given is
+        // not given again; needed only when this node has pending ones.
         var seen: std.AutoHashMapUnmanaged(EdgeId, void) = .{};
         defer seen.deinit(self.allocator);
 
@@ -5098,17 +6986,15 @@ pub const Database = struct {
         defer base_iter.deinit();
 
         while (base_iter.next() catch return DatabaseError.IoError) |base_ref| {
-            try seen.put(self.allocator, base_ref.id, {});
+            if (pending.len > 0) try seen.put(self.allocator, base_ref.id, {});
 
-            if (txn) |t| {
-                if (self.getTxnOverlay(t)) |overlay| {
-                    if (overlay.edge_states.get(base_ref.id)) |state| {
-                        if (edgeStateMatches(state, node_id, direction, edge_type)) {
-                            refs.append(self.allocator, edgeStateToRef(base_ref.id, state)) catch return DatabaseError.OutOfMemory;
-                            if (edgeLimitReached(refs.items.len, limit)) break;
-                        }
-                        continue;
+            if (staged) {
+                if (overlay.?.edge_states.get(base_ref.id)) |state| {
+                    if (edgeStateMatches(state, node_id, direction, edge_type)) {
+                        refs.append(self.allocator, edgeStateToRef(base_ref.id, state)) catch return DatabaseError.OutOfMemory;
+                        if (edgeLimitReached(refs.items.len, limit)) break;
                     }
+                    continue;
                 }
             }
 
@@ -5117,16 +7003,13 @@ pub const Database = struct {
         }
 
         if (!edgeLimitReached(refs.items.len, limit)) {
-            if (txn) |t| {
-                if (self.getTxnOverlay(t)) |overlay| {
-                    var overlay_iter = overlay.edge_states.iterator();
-                    while (overlay_iter.next()) |entry| {
-                        if (seen.contains(entry.key_ptr.*)) continue;
-                        if (!edgeStateMatches(entry.value_ptr.*, node_id, direction, edge_type)) continue;
-                        refs.append(self.allocator, edgeStateToRef(entry.key_ptr.*, entry.value_ptr.*)) catch return DatabaseError.OutOfMemory;
-                        if (edgeLimitReached(refs.items.len, limit)) break;
-                    }
-                }
+            for (pending) |edge_id| {
+                // Also skips an edge filed twice by a retried write.
+                if ((try seen.getOrPut(self.allocator, edge_id)).found_existing) continue;
+                const state = overlay.?.edge_states.get(edge_id) orelse continue;
+                if (!edgeStateMatches(state, node_id, direction, edge_type)) continue;
+                refs.append(self.allocator, edgeStateToRef(edge_id, state)) catch return DatabaseError.OutOfMemory;
+                if (edgeLimitReached(refs.items.len, limit)) break;
             }
         }
 
@@ -5142,6 +7025,10 @@ pub const Database = struct {
         var refs: std.ArrayListUnmanaged(EdgeRef) = .empty;
         errdefer refs.deinit(self.allocator);
 
+        // The committed edges seen, to tell the staged edges that are new
+        // from those that change a committed one; only with staged edges.
+        const overlay: ?*TxnOverlay = if (txn) |t| self.getTxnOverlay(t) else null;
+        const staged = if (overlay) |o| o.edge_states.count() > 0 else false;
         var seen: std.AutoHashMapUnmanaged(EdgeId, void) = .{};
         defer seen.deinit(self.allocator);
 
@@ -5149,17 +7036,14 @@ pub const Database = struct {
         defer base_iter.deinit();
 
         while (base_iter.next() catch return DatabaseError.IoError) |base_ref| {
-            try seen.put(self.allocator, base_ref.id, {});
-
-            if (txn) |t| {
-                if (self.getTxnOverlay(t)) |overlay| {
-                    if (overlay.edge_states.get(base_ref.id)) |state| {
-                        if (edgeStateMatchesType(state, edge_type)) {
-                            refs.append(self.allocator, edgeStateToRef(base_ref.id, state)) catch return DatabaseError.OutOfMemory;
-                            if (edgeLimitReached(refs.items.len, limit)) break;
-                        }
-                        continue;
+            if (staged) {
+                try seen.put(self.allocator, base_ref.id, {});
+                if (overlay.?.edge_states.get(base_ref.id)) |state| {
+                    if (edgeStateMatchesType(state, edge_type)) {
+                        refs.append(self.allocator, edgeStateToRef(base_ref.id, state)) catch return DatabaseError.OutOfMemory;
+                        if (edgeLimitReached(refs.items.len, limit)) break;
                     }
+                    continue;
                 }
             }
 
@@ -5170,17 +7054,13 @@ pub const Database = struct {
             if (edgeLimitReached(refs.items.len, limit)) break;
         }
 
-        if (!edgeLimitReached(refs.items.len, limit)) {
-            if (txn) |t| {
-                if (self.getTxnOverlay(t)) |overlay| {
-                    var overlay_iter = overlay.edge_states.iterator();
-                    while (overlay_iter.next()) |entry| {
-                        if (seen.contains(entry.key_ptr.*)) continue;
-                        if (!edgeStateMatchesType(entry.value_ptr.*, edge_type)) continue;
-                        refs.append(self.allocator, edgeStateToRef(entry.key_ptr.*, entry.value_ptr.*)) catch return DatabaseError.OutOfMemory;
-                        if (edgeLimitReached(refs.items.len, limit)) break;
-                    }
-                }
+        if (staged and !edgeLimitReached(refs.items.len, limit)) {
+            var overlay_iter = overlay.?.edge_states.iterator();
+            while (overlay_iter.next()) |entry| {
+                if (seen.contains(entry.key_ptr.*)) continue;
+                if (!edgeStateMatchesType(entry.value_ptr.*, edge_type)) continue;
+                refs.append(self.allocator, edgeStateToRef(entry.key_ptr.*, entry.value_ptr.*)) catch return DatabaseError.OutOfMemory;
+                if (edgeLimitReached(refs.items.len, limit)) break;
             }
         }
 
@@ -5210,8 +7090,22 @@ pub const Database = struct {
     /// Create a new node with the given labels
     /// Returns the new node's ID
     /// If txn is null, the operation is auto-committed
+    ///
+    /// The id belongs to the node once the transaction's commit has returned.
+    /// Ids are never handed out twice within a process, and an id that a
+    /// committed node had is never handed out again, crash or not. After a
+    /// crash the counter resumes past the highest id any committed
+    /// transaction created and past the counter of the last flush, so the
+    /// only ids that can come back are ones that transactions which did not
+    /// commit received after both: ids that were never in the database, the
+    /// log, or any result another transaction could read. A program that
+    /// copies an id out of the database before its commit returns must treat
+    /// it as unassigned if the commit fails or the process dies first, as it
+    /// would for a rollback; if the process died during the commit call, read
+    /// the node back to learn whether the commit happened.
     pub fn createNode(self: *Self, txn: ?*Transaction, labels: []const []const u8) !NodeId {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         // Validate transaction if provided
         if (txn) |t| {
@@ -5239,7 +7133,6 @@ pub const Database = struct {
                 });
                 overlay.markDirty();
 
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return node_id;
             }
         }
@@ -5291,9 +7184,6 @@ pub const Database = struct {
             }
         }
 
-        // Invalidate query cache (labels changed)
-        if (self.query_cache) |cache| cache.bumpSchemaVersion();
-
         return node_id;
     }
 
@@ -5320,15 +7210,88 @@ pub const Database = struct {
         return null;
     }
 
-    /// Delete a node
+    /// Whether `txn` sees any relationship of `node_id`, in either direction.
+    ///
+    /// One probe of the edge tree answers for the committed edges, since
+    /// every edge is filed under both of its endpoints; only when the
+    /// transaction has changed edges is more needed. The first committed edge
+    /// the transaction has not deleted ends the search, so a node with many
+    /// edges costs no more than one with a single edge. What the transaction
+    /// created is then found among the node's own pending edges
+    /// (`edges_by_node`), not by walking every edge the transaction changed.
+    pub fn nodeHasRelationshipsInTxn(self: *Self, txn: ?*Transaction, node_id: NodeId) DatabaseError!bool {
+        const overlay: ?*TxnOverlay = if (txn) |t| self.getTxnOverlay(t) else null;
+        const changed_edges: ?*const std.AutoHashMapUnmanaged(EdgeId, TxnEdgeState) = if (overlay) |o|
+            (if (o.edge_states.count() > 0) &o.edge_states else null)
+        else
+            null;
+
+        var iter = self.edge_store.getAllRefs(node_id) catch |err| return mapEdgeReadError(err);
+        defer iter.deinit();
+        while (iter.next() catch |err| return mapEdgeReadError(err)) |edge_ref| {
+            const states = changed_edges orelse return true;
+            const state = states.getPtr(edge_ref.id) orelse return true;
+            if (state.exists) return true;
+        }
+
+        const states = changed_edges orelse return false;
+        const pending = overlay.?.edges_by_node.get(node_id) orelse return false;
+        for (pending.items) |edge_id| {
+            const state = states.getPtr(edge_id) orelse continue;
+            if (state.exists) return true;
+        }
+        return false;
+    }
+
+    fn mapEdgeReadError(err: anyerror) DatabaseError {
+        return switch (err) {
+            error.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
+    /// Delete a node and every relationship it has, as Cypher's DETACH DELETE
+    /// does. In a transaction it is all or nothing with the rest of it.
+    pub fn detachDeleteNode(self: *Self, txn: ?*Transaction, node_id: NodeId) !void {
+        if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn) |t| {
+            if (!t.isActive()) return DatabaseError.TransactionNotActive;
+            if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
+        }
+        // Deleted by id, so parallel edges of one type between the same two
+        // nodes each go once.
+        inline for (.{ edge_mod.Direction.outgoing, edge_mod.Direction.incoming }) |direction| {
+            const refs = try self.collectVisibleEdgeRefs(txn, node_id, direction, null, 0);
+            defer self.allocator.free(refs);
+            for (refs) |edge_ref| {
+                self.deleteEdgeById(txn, edge_ref.id) catch |err| switch (err) {
+                    // A self-loop is listed both ways; the first pass took it.
+                    error.NotFound => {},
+                    else => return err,
+                };
+            }
+        }
+        try self.deleteNode(txn, node_id);
+    }
+
+    /// Delete a node.
+    ///
+    /// Refuses with `NodeHasRelationships` while the node has relationships
+    /// that `txn` can see, as Cypher's DELETE does: removing the node alone
+    /// would leave edges that point at nothing. `detachDeleteNode` removes
+    /// them with it. Deleting a node that does not exist does nothing.
     /// If txn is null, the operation is auto-committed
     pub fn deleteNode(self: *Self, txn: ?*Transaction, node_id: NodeId) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         // Validate transaction if provided
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
+        }
+        if (try self.nodeHasRelationshipsInTxn(txn, node_id)) return DatabaseError.NodeHasRelationships;
+        if (txn) |t| {
             if (self.getTxnOverlay(t)) |overlay| {
                 const existing = try self.readVisibleNodeState(txn, node_id);
                 if (existing) |state| {
@@ -5344,10 +7307,11 @@ pub const Database = struct {
                     .labels = self.allocator.alloc(symbols_mod.SymbolId, 0) catch return DatabaseError.OutOfMemory,
                     .properties = self.allocator.alloc(node_mod.Property, 0) catch return DatabaseError.OutOfMemory,
                 });
-                try self.storeVectorOverlayState(overlay, node_id, .{ .absent = {} });
+                if (self.hnsw_index != null) {
+                    try self.storeVectorOverlayState(overlay, node_id, .{ .absent = {} });
+                }
                 overlay.markDirty();
 
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return;
             }
         }
@@ -5419,9 +7383,18 @@ pub const Database = struct {
         if (self.hnsw_index) |*hnsw| {
             hnsw.remove(node_id) catch |err| return mapHnswError(err);
         }
+    }
 
-        // Invalidate query cache (labels changed)
-        if (self.query_cache) |cache| cache.bumpSchemaVersion();
+    /// Whether `txn` sees `node_id`, checked as cheaply as possible: the
+    /// transaction's own state for the node if it has one, else a probe for
+    /// the key in the node tree, without reading the record.
+    fn nodeVisibleForEdge(self: *Self, txn: ?*Transaction, node_id: NodeId) DatabaseError!bool {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.node_states.getPtr(node_id)) |state| return state.exists;
+            }
+        }
+        return self.nodeExists(node_id);
     }
 
     /// Check if a node exists
@@ -5447,6 +7420,10 @@ pub const Database = struct {
 
     /// Set a property on a node
     /// If txn is null, the operation is auto-committed
+    ///
+    /// A null value removes the property, as Cypher's `SET n.x = null` does,
+    /// and does nothing when the node has no such property: no write path
+    /// stores a null. Up to 0.18.0 this stored the null as a property.
     pub fn setNodeProperty(
         self: *Self,
         txn: ?*Transaction,
@@ -5454,7 +7431,9 @@ pub const Database = struct {
         key: []const u8,
         value: PropertyValue,
     ) !void {
+        if (value == .null_val) return self.removeNodeProperty(txn, node_id, key);
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         // Validate transaction if provided
         if (txn) |t| {
@@ -5462,47 +7441,21 @@ pub const Database = struct {
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
             if (self.getTxnOverlay(t)) |overlay| {
                 var state = (try self.readVisibleNodeState(txn, node_id)) orelse return DatabaseError.NotFound;
-                defer state.deinit(self.allocator);
-                if (!state.exists) return DatabaseError.NotFound;
-
-                const key_id = self.symbol_table.intern(key) catch return DatabaseError.IoError;
-
-                var new_props: std.ArrayListUnmanaged(node_mod.Property) = .empty;
-                errdefer {
-                    for (new_props.items) |*prop| {
-                        var val = prop.value;
-                        val.deinit(self.allocator);
-                    }
-                    new_props.deinit(self.allocator);
+                if (!state.exists) {
+                    state.deinit(self.allocator);
+                    return DatabaseError.NotFound;
                 }
-
-                var found = false;
-                for (state.properties) |prop| {
-                    if (prop.key_id == key_id) {
-                        new_props.append(self.allocator, .{
-                            .key_id = key_id,
-                            .value = value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                        found = true;
-                    } else {
-                        new_props.append(self.allocator, .{
-                            .key_id = prop.key_id,
-                            .value = prop.value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                    }
-                }
-                if (!found) {
-                    new_props.append(self.allocator, .{
-                        .key_id = key_id,
-                        .value = value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                    }) catch return DatabaseError.OutOfMemory;
-                }
-
-                try self.storeNodeOverlayState(overlay, node_id, .{
-                    .exists = true,
-                    .labels = cloneSymbolIds(self.allocator, state.labels) catch return DatabaseError.OutOfMemory,
-                    .properties = new_props.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory,
-                });
+                const key_id = self.symbol_table.intern(key) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.IoError;
+                };
+                // The state is this call's own copy: change the one property
+                // in it rather than copying every other one again.
+                _ = editProperties(self.allocator, &state.properties, key_id, value) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+                try self.storeNodeOverlayState(overlay, node_id, state);
                 overlay.markDirty();
                 return;
             }
@@ -5624,40 +7577,26 @@ pub const Database = struct {
         key: []const u8,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
             if (self.getTxnOverlay(t)) |overlay| {
                 var state = (try self.readVisibleNodeState(txn, node_id)) orelse return DatabaseError.NotFound;
-                defer state.deinit(self.allocator);
-                if (!state.exists) return DatabaseError.NotFound;
-
-                const key_id = self.symbol_table.intern(key) catch return DatabaseError.IoError;
-
-                var new_props: std.ArrayListUnmanaged(node_mod.Property) = .empty;
-                errdefer {
-                    for (new_props.items) |*prop| {
-                        var val = prop.value;
-                        val.deinit(self.allocator);
-                    }
-                    new_props.deinit(self.allocator);
+                if (!state.exists) {
+                    state.deinit(self.allocator);
+                    return DatabaseError.NotFound;
                 }
-
-                for (state.properties) |prop| {
-                    if (prop.key_id != key_id) {
-                        new_props.append(self.allocator, .{
-                            .key_id = prop.key_id,
-                            .value = prop.value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                    }
-                }
-
-                try self.storeNodeOverlayState(overlay, node_id, .{
-                    .exists = true,
-                    .labels = cloneSymbolIds(self.allocator, state.labels) catch return DatabaseError.OutOfMemory,
-                    .properties = new_props.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory,
-                });
+                const key_id = self.symbol_table.intern(key) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.IoError;
+                };
+                _ = editProperties(self.allocator, &state.properties, key_id, null) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+                try self.storeNodeOverlayState(overlay, node_id, state);
                 overlay.markDirty();
                 return;
             }
@@ -5754,6 +7693,7 @@ pub const Database = struct {
         label: []const u8,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
@@ -5782,7 +7722,6 @@ pub const Database = struct {
                 });
                 overlay.markDirty();
 
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return;
             }
         }
@@ -5872,6 +7811,7 @@ pub const Database = struct {
         label: []const u8,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
@@ -5906,12 +7846,8 @@ pub const Database = struct {
                     .labels = owned_labels,
                     .properties = owned_properties,
                 });
-                if (owned_labels.len == 0) {
-                    try self.storeVectorOverlayState(overlay, node_id, .{ .absent = {} });
-                }
                 overlay.markDirty();
 
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return;
             }
         }
@@ -5962,12 +7898,6 @@ pub const Database = struct {
             existing_node.properties,
         );
 
-        if (new_labels.items.len == 0) {
-            if (self.hnsw_index) |*hnsw| {
-                hnsw.remove(node_id) catch |err| return mapHnswError(err);
-            }
-        }
-
         // Log undo entry for transaction rollback
         if (txn) |t| {
             if (self.txn_manager) |*tm| {
@@ -6005,6 +7935,7 @@ pub const Database = struct {
         node_id: NodeId,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
@@ -6104,6 +8035,66 @@ pub const Database = struct {
         return null;
     }
 
+    /// One property of a node as `txn` sees it, decoded into `allocator`;
+    /// null when the node does not exist or lacks the property.
+    ///
+    /// For the query engine's per-row reads: it takes a resolved key id and
+    /// decodes only the one value, where getNodePropertyInTxn copies the
+    /// whole node and looks the key up again. `cache`, when given, keeps the
+    /// last committed record read (see NodeStore.getPropertyCached); pass
+    /// one only while nothing writes to the store.
+    pub fn getNodePropertyByKeyInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        node_id: NodeId,
+        key_id: symbols_mod.SymbolId,
+        allocator: Allocator,
+        cache: ?*node_mod.RecordCache,
+    ) DatabaseError!?PropertyValue {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.node_states.getPtr(node_id)) |state| {
+                    if (!state.exists) return null;
+                    for (state.properties) |prop| {
+                        if (prop.key_id == key_id) return prop.value.clone(allocator) catch return DatabaseError.OutOfMemory;
+                    }
+                    return null;
+                }
+            }
+        }
+        const found = if (cache) |c|
+            self.node_store.getPropertyCached(c, node_id, key_id, allocator)
+        else
+            self.node_store.getProperty(node_id, key_id, allocator);
+        return found catch |err| switch (err) {
+            node_mod.NodeError.NotFound => null,
+            node_mod.NodeError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
+    /// Whether a node has a label as `txn` sees it, answered from the label
+    /// index rather than by reading the node. False for a node that does
+    /// not exist.
+    pub fn nodeHasLabelInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        node_id: NodeId,
+        label_id: symbols_mod.SymbolId,
+    ) DatabaseError!bool {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.node_states.getPtr(node_id)) |state| {
+                    return state.exists and containsSymbolId(state.labels, label_id);
+                }
+            }
+        }
+        return self.label_index.contains(label_id, node_id) catch |err| switch (err) {
+            label_index_mod.LabelIndexError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
     // ========================================================================
     // Vector Operations
     // ========================================================================
@@ -6117,8 +8108,7 @@ pub const Database = struct {
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
 
-        // Check if vector storage is enabled
-        _ = self.vector_storage orelse return DatabaseError.IoError;
+        // A database created without a vector index has nowhere to put it.
         try self.validateVectorValue(vector);
 
         // Verify node exists
@@ -6154,6 +8144,48 @@ pub const Database = struct {
         try self.setNodeVector(node_id, vector);
     }
 
+    /// Remove a node's vector. The node keeps its labels and properties; it
+    /// no longer reads back a vector and no vector search returns it.
+    /// Removing a vector the node does not have, or on a database without a
+    /// vector index, does nothing. `NotFound` if the node does not exist.
+    pub fn removeNodeVector(self: *Self, node_id: NodeId) DatabaseError!void {
+        if (self.read_only) return DatabaseError.PermissionDenied;
+        if (!(try self.nodeExists(node_id))) return DatabaseError.NotFound;
+        if (self.hnsw_index) |*hnsw| {
+            hnsw.remove(node_id) catch |err| return mapHnswError(err);
+        }
+    }
+
+    /// `removeNodeVector` in `txn`: the removal is visible to the
+    /// transaction's own reads and searches at once, and to everyone else
+    /// when it commits. It is logged and replayed as the removal that deleting
+    /// a node logs.
+    pub fn removeNodeVectorInTxn(self: *Self, txn: ?*Transaction, node_id: NodeId) DatabaseError!void {
+        if (txn) |t| {
+            if (!t.isActive()) return DatabaseError.TransactionNotActive;
+            if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (!(try self.nodeExistsInTxn(txn, node_id))) return DatabaseError.NotFound;
+                // Nothing staged and nothing committed: nothing to remove.
+                if (self.hnsw_index == null) return;
+                if (!overlay.vector_states.contains(node_id) and !self.baseHasVector(node_id)) return;
+                try self.storeVectorOverlayState(overlay, node_id, .{ .absent = {} });
+                overlay.markDirty();
+                return;
+            }
+        }
+        try self.removeNodeVector(node_id);
+    }
+
+    /// The vector visible to `txn` for a node, or null if it has none.
+    ///
+    /// Under the cosine metric, the default, the index stores each vector
+    /// scaled to unit length and the file keeps no other copy, so a committed
+    /// vector reads back normalised: storing (3, 4) reads back as (0.6, 0.8).
+    /// The direction, and so every cosine distance, is unchanged. Under the
+    /// euclidean and inner-product metrics vectors are stored as given. A
+    /// vector written earlier in the same transaction and not yet committed
+    /// reads back as written.
     pub fn getNodeVectorInTxn(self: *Self, txn: ?*Transaction, node_id: NodeId) DatabaseError!?[]f32 {
         var state = try self.readVisibleVectorState(txn, node_id);
         return switch (state) {
@@ -6165,12 +8197,64 @@ pub const Database = struct {
         };
     }
 
+    /// Whether the vector `txn` sees for a node is `vector`. A vector written
+    /// in `txn` compares as written; a committed one as the index stores it,
+    /// so under the cosine metric `vector` is first scaled to unit length, as
+    /// storing it would.
+    pub fn nodeVectorEqualsInTxn(self: *Self, txn: ?*Transaction, node_id: NodeId, vector: []const f32) bool {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.vector_states.get(node_id)) |state| return switch (state) {
+                    .absent => false,
+                    .value => |pending| std.mem.eql(f32, pending, vector),
+                };
+            }
+        }
+        const hnsw = if (self.hnsw_index) |*h| h else return false;
+        return hnsw.holdsVector(node_id, vector);
+    }
+
+    /// Score a transaction's pending vector exactly as the committed index
+    /// would score it once stored, so pending and committed results rank on
+    /// one scale.
     fn vectorDistanceForSearch(self: *Self, query_vector: []const f32, candidate: []const f32) f32 {
         if (self.hnsw_index) |*hnsw| {
-            const distance_fn = hnsw_mod.getDistanceFn(hnsw.config.metric);
-            return distance_fn(query_vector, candidate);
+            return hnsw.distanceForSearch(query_vector, candidate);
         }
         return vector_distance.euclideanDistance(query_vector, candidate);
+    }
+
+    /// The distance between two vectors under this database's vector metric,
+    /// as a vector search would report it: what Cypher's `<=>` returns.
+    /// Cosine when the database has no vector index.
+    pub fn vectorDistance(self: *Self, a: []const f32, b: []const f32) f32 {
+        std.debug.assert(a.len == b.len);
+        const metric: VectorMetric = if (self.hnsw_index) |*hnsw| switch (hnsw.config.metric) {
+            .euclidean => .euclidean,
+            .inner_product => .dot_product,
+            .cosine => .cosine,
+        } else .cosine;
+        return switch (metric) {
+            .euclidean => vector_distance.euclideanDistance(a, b),
+            .dot_product => vector_distance.innerProductDistance(a, b),
+            else => vector_distance.cosineDistance(a, b),
+        };
+    }
+
+    /// The vector index's configuration, or null when the database has none.
+    pub fn vectorConfig(self: *const Self) ?VectorConfig {
+        const hnsw = if (self.hnsw_index) |*h| h else return null;
+        return .{
+            .dimensions = hnsw.config.dimensions,
+            .metric = switch (hnsw.config.metric) {
+                .euclidean => .euclidean,
+                .inner_product => .dot_product,
+                .cosine => .cosine,
+            },
+            .m = hnsw.config.m,
+            .m_max0 = hnsw.config.m_max0,
+            .ef_construction = hnsw.config.ef_construction,
+        };
     }
 
     pub fn vectorSearchInTxn(
@@ -6180,71 +8264,220 @@ pub const Database = struct {
         k: u32,
         ef_search: ?u16,
     ) DatabaseError![]VectorSearchResult {
+        return self.vectorSearchWhereInTxn(txn, query_vector, k, ef_search, null);
+    }
+
+    /// The k nearest nodes `filter` allows (every node, when null), as `txn`
+    /// sees them: its pending vectors in place of the committed ones, and
+    /// without the nodes it deleted.
+    pub fn vectorSearchWhereInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        query_vector: []const f32,
+        k: u32,
+        ef_search: ?u16,
+        filter: ?VectorFilter,
+    ) DatabaseError![]VectorSearchResult {
         try self.validateVectorValue(query_vector);
 
-        if (txn) |t| {
-            if (self.getTxnOverlay(t)) |overlay| {
-                if (overlay.vector_states.count() == 0) {
-                    return self.vectorSearch(query_vector, k, ef_search);
-                }
-
-                const extra: u32 = @intCast(overlay.vector_states.count());
-                const base_results = try self.vectorSearch(query_vector, k + extra, ef_search);
-                defer self.freeVectorSearchResults(base_results);
-
-                var merged: std.ArrayListUnmanaged(VectorSearchResult) = .empty;
-                errdefer merged.deinit(self.allocator);
-
-                var seen: std.AutoHashMapUnmanaged(NodeId, void) = .{};
-                defer seen.deinit(self.allocator);
-
-                for (base_results) |result| {
-                    try seen.put(self.allocator, result.node_id, {});
-                    if (!(try self.nodeExistsInTxn(txn, result.node_id))) continue;
-                    if (overlay.vector_states.get(result.node_id)) |state| {
-                        switch (state) {
-                            .absent => continue,
-                            .value => |vector| {
-                                merged.append(self.allocator, .{
-                                    .node_id = result.node_id,
-                                    .distance = self.vectorDistanceForSearch(query_vector, vector),
-                                }) catch return DatabaseError.OutOfMemory;
-                            },
-                        }
-                        continue;
-                    }
-                    merged.append(self.allocator, result) catch return DatabaseError.OutOfMemory;
-                }
-
-                var overlay_iter = overlay.vector_states.iterator();
-                while (overlay_iter.next()) |entry| {
-                    if (seen.contains(entry.key_ptr.*)) continue;
-                    if (!(try self.nodeExistsInTxn(txn, entry.key_ptr.*))) continue;
-                    switch (entry.value_ptr.*) {
-                        .absent => {},
-                        .value => |vector| {
-                            merged.append(self.allocator, .{
-                                .node_id = entry.key_ptr.*,
-                                .distance = self.vectorDistanceForSearch(query_vector, vector),
-                            }) catch return DatabaseError.OutOfMemory;
-                        },
-                    }
-                }
-
-                std.mem.sort(VectorSearchResult, merged.items, {}, struct {
-                    fn lessThan(_: void, lhs: VectorSearchResult, rhs: VectorSearchResult) bool {
-                        return lhs.distance < rhs.distance;
-                    }
-                }.lessThan);
-
-                if (merged.items.len > k) {
-                    merged.items.len = k;
-                }
-                return merged.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
-            }
+        const overlay = (if (txn) |t| self.getTxnOverlay(t) else null) orelse
+            return self.vectorSearchWhere(query_vector, k, ef_search, filter);
+        if (overlay.vector_states.count() == 0) {
+            return self.vectorSearchWhere(query_vector, k, ef_search, filter);
         }
 
-        return self.vectorSearch(query_vector, k, ef_search);
+        const extra: u32 = @intCast(overlay.vector_states.count());
+        const base_results = try self.vectorSearchWhere(query_vector, k +| extra, ef_search, filter);
+        defer self.freeVectorSearchResults(base_results);
+
+        var merged: std.ArrayListUnmanaged(VectorSearchResult) = .empty;
+        errdefer merged.deinit(self.allocator);
+
+        var seen: std.AutoHashMapUnmanaged(NodeId, void) = .{};
+        defer seen.deinit(self.allocator);
+
+        for (base_results) |result| {
+            try seen.put(self.allocator, result.node_id, {});
+            // The committed node exists (the search checked); only what
+            // the transaction did to it can hide it.
+            if (overlay.node_states.getPtr(result.node_id)) |state| {
+                if (!state.exists) continue;
+            }
+            if (overlay.vector_states.get(result.node_id)) |state| {
+                switch (state) {
+                    .absent => continue,
+                    .value => |vector| {
+                        merged.append(self.allocator, .{
+                            .node_id = result.node_id,
+                            .distance = self.vectorDistanceForSearch(query_vector, vector),
+                        }) catch return DatabaseError.OutOfMemory;
+                    },
+                }
+                continue;
+            }
+            merged.append(self.allocator, result) catch return DatabaseError.OutOfMemory;
+        }
+
+        var overlay_iter = overlay.vector_states.iterator();
+        while (overlay_iter.next()) |entry| {
+            const node_id = entry.key_ptr.*;
+            if (seen.contains(node_id)) continue;
+            if (filter) |f| {
+                if (!f.allows(node_id)) continue;
+            }
+            const vector = switch (entry.value_ptr.*) {
+                .absent => continue,
+                .value => |vector| vector,
+            };
+            if (!(try self.nodeVisibleInOverlay(overlay, node_id))) continue;
+            merged.append(self.allocator, .{
+                .node_id = node_id,
+                .distance = self.vectorDistanceForSearch(query_vector, vector),
+            }) catch return DatabaseError.OutOfMemory;
+        }
+
+        sortVectorResults(merged.items);
+        if (merged.items.len > k) {
+            merged.items.len = k;
+        }
+        return merged.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+    }
+
+    /// Whether a node exists for a transaction: as it left the node, or as
+    /// committed when it did not touch it.
+    fn nodeVisibleInOverlay(self: *Self, overlay: *TxnOverlay, node_id: NodeId) DatabaseError!bool {
+        if (overlay.node_states.getPtr(node_id)) |state| return state.exists;
+        return self.nodeExists(node_id);
+    }
+
+    fn sortVectorResults(results: []VectorSearchResult) void {
+        std.mem.sort(VectorSearchResult, results, {}, struct {
+            fn lessThan(_: void, lhs: VectorSearchResult, rhs: VectorSearchResult) bool {
+                return lhs.distance < rhs.distance;
+            }
+        }.lessThan);
+    }
+
+    /// The k nearest of the nodes `ids` names (each once), as `txn` sees
+    /// them. `member`, when given, tells whether a node is one of `ids`
+    /// without the search building a set of them.
+    ///
+    /// A small set is measured node by node, which is exact; a larger one is
+    /// searched through the graph with a filter (`vectorSearchWhereInTxn`),
+    /// which costs less once the set is large enough that the beam finds its
+    /// members quickly. `exactScanPays` is where one starts to cost less
+    /// than the other.
+    pub fn vectorSearchAmongInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        query_vector: []const f32,
+        k: u32,
+        ef_search: ?u16,
+        ids: []const NodeId,
+        member: ?VectorFilter,
+    ) DatabaseError![]VectorSearchResult {
+        try self.validateVectorValue(query_vector);
+        const hnsw = &(self.hnsw_index orelse return DatabaseError.MissingIndex);
+
+        if (!exactScanPays(ids.len, hnsw.vector_count, ef_search orelse hnsw.config.ef_search, hnsw.config.m_max0)) {
+            if (member) |m| return self.vectorSearchWhereInTxn(txn, query_vector, k, ef_search, m);
+            var set: std.AutoHashMapUnmanaged(NodeId, void) = .{};
+            defer set.deinit(self.allocator);
+            set.ensureTotalCapacity(self.allocator, @intCast(ids.len)) catch return DatabaseError.OutOfMemory;
+            for (ids) |id| set.putAssumeCapacity(id, {});
+            return self.vectorSearchWhereInTxn(txn, query_vector, k, ef_search, .{
+                .context = &set,
+                .allowsFn = struct {
+                    fn allows(context: *const anyopaque, node_id: NodeId) bool {
+                        const s: *const std.AutoHashMapUnmanaged(NodeId, void) = @ptrCast(@alignCast(context));
+                        return s.contains(node_id);
+                    }
+                }.allows,
+            });
+        }
+
+        const overlay = if (txn) |t| self.getTxnOverlay(t) else null;
+        var merged: std.ArrayListUnmanaged(VectorSearchResult) = .empty;
+        errdefer merged.deinit(self.allocator);
+        var committed: std.ArrayListUnmanaged(NodeId) = .empty;
+        defer committed.deinit(self.allocator);
+        committed.ensureTotalCapacity(self.allocator, ids.len) catch return DatabaseError.OutOfMemory;
+
+        for (ids) |id| {
+            if (overlay) |o| {
+                if (o.node_states.getPtr(id)) |state| {
+                    if (!state.exists) continue;
+                }
+                if (o.vector_states.get(id)) |state| {
+                    switch (state) {
+                        .absent => {},
+                        .value => |vector| {
+                            if (try self.nodeVisibleInOverlay(o, id)) {
+                                merged.append(self.allocator, .{
+                                    .node_id = id,
+                                    .distance = self.vectorDistanceForSearch(query_vector, vector),
+                                }) catch return DatabaseError.OutOfMemory;
+                            }
+                        },
+                    }
+                    continue;
+                }
+            }
+            committed.appendAssumeCapacity(id);
+        }
+
+        // The committed vectors, measured; a node the index still holds but
+        // the store does not is skipped, as `vectorSearch` skips it.
+        var want: u32 = k;
+        while (true) {
+            const raw = hnsw.searchExact(query_vector, want, committed.items) catch |err| return mapVectorSearchError(err);
+            defer hnsw.freeResults(raw);
+            const before = merged.items.len;
+            var kept: u32 = 0;
+            for (raw) |result| {
+                if (kept >= k) break;
+                if (!(try self.nodeExists(result.node_id))) continue;
+                merged.append(self.allocator, result) catch return DatabaseError.OutOfMemory;
+                kept += 1;
+            }
+            if (kept >= k or raw.len < want or want >= committed.items.len) break;
+            merged.items.len = before;
+            want = @intCast(@min(@as(u64, want) * 2, committed.items.len));
+        }
+
+        sortVectorResults(merged.items);
+        if (merged.items.len > k) merged.items.len = k;
+        return merged.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+    }
+
+    /// Whether measuring each of `count` nodes costs less than a filtered
+    /// walk of a graph of `total` vectors that allows them.
+    ///
+    /// The walk visits roughly `ef * m_max0` nodes per beam's worth of
+    /// members, and finds a member among every `total / count` it visits,
+    /// so it measures about `ef * m_max0 * total / count` vectors against
+    /// the scan's `count`. They cross where `count^2 = ef * m_max0 * total`;
+    /// the constant is from measuring both at 10k and 100k vectors of 128
+    /// dimensions (notes, item 9).
+    pub fn exactScanPays(count: usize, total: u64, ef: u16, m_max0: u16) bool {
+        const c: u128 = count;
+        return c * c <= @as(u128, EXACT_SCAN_FACTOR) * ef * m_max0 * total;
+    }
+
+    /// The most nodes `exactScanPays` measures one by one.
+    pub fn exactScanCount(total: u64, ef: u16, m_max0: u16) usize {
+        const bound: u128 = @as(u128, EXACT_SCAN_FACTOR) * ef * m_max0 * total;
+        return @intCast(std.math.sqrt(bound));
+    }
+
+    const EXACT_SCAN_FACTOR: u32 = 1;
+
+    fn mapVectorSearchError(err: HnswError) DatabaseError {
+        return switch (err) {
+            HnswError.DimensionMismatch => DatabaseError.InvalidArgument,
+            HnswError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
     }
 
     /// Search for similar vectors using HNSW index.
@@ -6255,11 +8488,27 @@ pub const Database = struct {
         k: u32,
         ef_search: ?u16,
     ) DatabaseError![]VectorSearchResult {
-        try self.validateVectorValue(query_vector);
-        const hnsw = &(self.hnsw_index orelse return DatabaseError.IoError);
+        return self.vectorSearchWhere(query_vector, k, ef_search, null);
+    }
 
-        const search_limit: u32 = @intCast(@min(hnsw.vector_count, @as(u64, std.math.maxInt(u32))));
-        const raw_results = hnsw.search(query_vector, search_limit, ef_search) catch |err| {
+    /// The k nearest committed nodes that `filter` allows (every node, when
+    /// null), through the graph.
+    pub fn vectorSearchWhere(
+        self: *Self,
+        query_vector: []const f32,
+        k: u32,
+        ef_search: ?u16,
+        filter: ?VectorFilter,
+    ) DatabaseError![]VectorSearchResult {
+        try self.validateVectorValue(query_vector);
+        const hnsw = &(self.hnsw_index orelse return DatabaseError.MissingIndex);
+
+        // The index widens its beam to the number of results asked for, so
+        // asking for every vector would make each query exhaustive. A full beam
+        // still leaves slack for skipping nodes that no longer exist.
+        const beam: u64 = @max(k, ef_search orelse hnsw.config.ef_search);
+        const search_limit: u32 = @intCast(@min(hnsw.vector_count, beam));
+        const raw_results = hnsw.searchFiltered(query_vector, search_limit, ef_search, filter) catch |err| {
             return switch (err) {
                 HnswError.EmptyIndex => self.allocator.alloc(VectorSearchResult, 0) catch return DatabaseError.OutOfMemory,
                 HnswError.NotFound => self.allocator.alloc(VectorSearchResult, 0) catch return DatabaseError.OutOfMemory,
@@ -6295,23 +8544,11 @@ pub const Database = struct {
     // the rest of the index catalog. There is no unscoped search: a query names
     // the label and property whose index answers it.
 
-    fn overlayFtsScore(self: *Self, query_text: []const u8, text: []const u8) DatabaseError!f32 {
-        const lower_query = self.allocator.dupe(u8, query_text) catch return DatabaseError.OutOfMemory;
-        defer self.allocator.free(lower_query);
-        for (lower_query) |*ch| ch.* = std.ascii.toLower(ch.*);
-
-        const lower_text = self.allocator.dupe(u8, text) catch return DatabaseError.OutOfMemory;
-        defer self.allocator.free(lower_text);
-        for (lower_text) |*ch| ch.* = std.ascii.toLower(ch.*);
-
-        var score: f32 = 0;
-        var iter = std.mem.tokenizeAny(u8, lower_query, " \t\r\n");
-        while (iter.next()) |token| {
-            if (token.len == 0) continue;
-            if (std.mem.indexOf(u8, lower_text, token) == null) return 0;
-            score += 1;
-        }
-        return score;
+    /// Score uncommitted text as the index would score it, or null when it
+    /// does not match. Matching substrings instead let "cat" find
+    /// "concatenate", and kept stop words and punctuation that indexing drops.
+    fn overlayFtsScore(matcher: *FtsIndex.QueryMatcher, text: []const u8) DatabaseError!?f32 {
+        return matcher.score(text) catch |err| return mapFtsError(err);
     }
 
     /// Free FTS search results.
@@ -6338,11 +8575,20 @@ pub const Database = struct {
         edge_type: []const u8,
     ) !EdgeId {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         // Validate transaction if provided
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
+        }
+
+        // Both ends must exist as this transaction sees them, or the edge
+        // would point at nothing.
+        if (!try self.nodeVisibleForEdge(txn, source)) return DatabaseError.NotFound;
+        if (target != source and !try self.nodeVisibleForEdge(txn, target)) return DatabaseError.NotFound;
+
+        if (txn) |t| {
             if (self.getTxnOverlay(t)) |overlay| {
                 const type_id = self.symbol_table.intern(edge_type) catch return DatabaseError.IoError;
                 const edge_id = self.edge_store.reserveNextEdgeId();
@@ -6354,11 +8600,6 @@ pub const Database = struct {
                     .properties = emptyProperties(self.allocator) catch return DatabaseError.OutOfMemory,
                 });
                 overlay.markDirty();
-
-                if (self.adjacency_cache) |*cache| {
-                    cache.invalidate(source);
-                }
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return edge_id;
             }
         }
@@ -6405,8 +8646,6 @@ pub const Database = struct {
             cache.invalidate(source);
         }
 
-        // Invalidate query cache (edge types changed)
-        if (self.query_cache) |cache| cache.bumpSchemaVersion();
         return edge_id;
     }
 
@@ -6432,6 +8671,7 @@ pub const Database = struct {
         edge_type: []const u8,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         // Validate transaction if provided
         if (txn) |t| {
@@ -6451,12 +8691,6 @@ pub const Database = struct {
                     .properties = cloneProperties(self.allocator, existing.properties) catch return DatabaseError.OutOfMemory,
                 });
                 overlay.markDirty();
-
-                if (self.adjacency_cache) |*cache| {
-                    cache.invalidate(source);
-                    cache.invalidate(target);
-                }
-                if (self.query_cache) |cache| cache.bumpSchemaVersion();
                 return;
             }
         }
@@ -6519,9 +8753,6 @@ pub const Database = struct {
             cache.invalidate(source);
             cache.invalidate(target);
         }
-
-        // Invalidate query cache (edge types changed)
-        if (self.query_cache) |cache| cache.bumpSchemaVersion();
     }
 
     /// Delete an edge by stable edge ID.
@@ -6532,6 +8763,7 @@ pub const Database = struct {
         edge_id: EdgeId,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
@@ -6551,12 +8783,6 @@ pub const Database = struct {
                         .properties = cloneProperties(self.allocator, owned_state.properties) catch return DatabaseError.OutOfMemory,
                     });
                     overlay.markDirty();
-
-                    if (self.adjacency_cache) |*cache| {
-                        cache.invalidate(owned_state.source);
-                        cache.invalidate(owned_state.target);
-                    }
-                    if (self.query_cache) |cache| cache.bumpSchemaVersion();
                     return;
                 }
                 return DatabaseError.NotFound;
@@ -6607,10 +8833,12 @@ pub const Database = struct {
             cache.invalidate(source);
             cache.invalidate(target);
         }
-        if (self.query_cache) |cache| cache.bumpSchemaVersion();
     }
 
     /// Set a property on an edge by stable edge ID.
+    ///
+    /// A null value removes the property, and does nothing when the edge has
+    /// no such property, as `setNodeProperty` does.
     pub fn setEdgePropertyById(
         self: *Self,
         txn: ?*Transaction,
@@ -6618,55 +8846,28 @@ pub const Database = struct {
         key: []const u8,
         value: PropertyValue,
     ) !void {
+        if (value == .null_val) return self.removeEdgePropertyById(txn, edge_id, key);
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
             if (self.getTxnOverlay(t)) |overlay| {
                 var state = (try self.readVisibleEdgeState(txn, edge_id)) orelse return DatabaseError.NotFound;
-                defer state.deinit(self.allocator);
-                if (!state.exists) return DatabaseError.NotFound;
-
-                const key_id = self.symbol_table.intern(key) catch return DatabaseError.IoError;
-                var new_props: std.ArrayListUnmanaged(node_mod.Property) = .empty;
-                errdefer {
-                    for (new_props.items) |*prop| {
-                        var val = prop.value;
-                        val.deinit(self.allocator);
-                    }
-                    new_props.deinit(self.allocator);
+                if (!state.exists) {
+                    state.deinit(self.allocator);
+                    return DatabaseError.NotFound;
                 }
-
-                var found = false;
-                for (state.properties) |prop| {
-                    if (prop.key_id == key_id) {
-                        new_props.append(self.allocator, .{
-                            .key_id = key_id,
-                            .value = value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                        found = true;
-                    } else {
-                        new_props.append(self.allocator, .{
-                            .key_id = prop.key_id,
-                            .value = prop.value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                    }
-                }
-                if (!found) {
-                    new_props.append(self.allocator, .{
-                        .key_id = key_id,
-                        .value = value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                    }) catch return DatabaseError.OutOfMemory;
-                }
-
-                try self.storeEdgeOverlayState(overlay, edge_id, .{
-                    .exists = true,
-                    .source = state.source,
-                    .target = state.target,
-                    .edge_type = state.edge_type,
-                    .properties = new_props.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory,
-                });
+                const key_id = self.symbol_table.intern(key) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.IoError;
+                };
+                _ = editProperties(self.allocator, &state.properties, key_id, value) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+                try self.storeEdgeOverlayState(overlay, edge_id, state);
                 overlay.markDirty();
                 return;
             }
@@ -6753,10 +8954,8 @@ pub const Database = struct {
             }
         }
 
-        self.edge_store.deleteById(edge_id) catch return DatabaseError.IoError;
-        self.edge_store.createWithId(edge_id, edge.source, edge.target, edge.edge_type, new_props.items) catch |err| {
-            // Best-effort restore of previous state.
-            self.edge_store.createWithId(edge_id, edge.source, edge.target, edge.edge_type, edge.properties) catch {};
+        // All or nothing: a failure leaves the old record in place.
+        self.edge_store.replaceProperties(edge_id, edge.source, edge.target, edge.edge_type, new_props.items) catch |err| {
             return mapEdgeStoreError(err);
         };
         try self.replaceEdgePropertyIndex(
@@ -6776,41 +8975,26 @@ pub const Database = struct {
         key: []const u8,
     ) !void {
         if (self.read_only) return DatabaseError.PermissionDenied;
+        if (txn == null) self.relieveBufferPressure();
 
         if (txn) |t| {
             if (!t.isActive()) return DatabaseError.TransactionNotActive;
             if (t.mode == .read_only) return DatabaseError.TransactionReadOnly;
             if (self.getTxnOverlay(t)) |overlay| {
                 var state = (try self.readVisibleEdgeState(txn, edge_id)) orelse return DatabaseError.NotFound;
-                defer state.deinit(self.allocator);
-                if (!state.exists) return DatabaseError.NotFound;
-
-                const key_id = self.symbol_table.intern(key) catch return DatabaseError.IoError;
-                var new_props: std.ArrayListUnmanaged(node_mod.Property) = .empty;
-                errdefer {
-                    for (new_props.items) |*prop| {
-                        var val = prop.value;
-                        val.deinit(self.allocator);
-                    }
-                    new_props.deinit(self.allocator);
+                if (!state.exists) {
+                    state.deinit(self.allocator);
+                    return DatabaseError.NotFound;
                 }
-
-                for (state.properties) |prop| {
-                    if (prop.key_id != key_id) {
-                        new_props.append(self.allocator, .{
-                            .key_id = prop.key_id,
-                            .value = prop.value.clone(self.allocator) catch return DatabaseError.OutOfMemory,
-                        }) catch return DatabaseError.OutOfMemory;
-                    }
-                }
-
-                try self.storeEdgeOverlayState(overlay, edge_id, .{
-                    .exists = true,
-                    .source = state.source,
-                    .target = state.target,
-                    .edge_type = state.edge_type,
-                    .properties = new_props.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory,
-                });
+                const key_id = self.symbol_table.intern(key) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.IoError;
+                };
+                _ = editProperties(self.allocator, &state.properties, key_id, null) catch {
+                    state.deinit(self.allocator);
+                    return DatabaseError.OutOfMemory;
+                };
+                try self.storeEdgeOverlayState(overlay, edge_id, state);
                 overlay.markDirty();
                 return;
             }
@@ -6893,9 +9077,8 @@ pub const Database = struct {
             }
         }
 
-        self.edge_store.deleteById(edge_id) catch return DatabaseError.IoError;
-        self.edge_store.createWithId(edge_id, edge.source, edge.target, edge.edge_type, new_props.items) catch |err| {
-            self.edge_store.createWithId(edge_id, edge.source, edge.target, edge.edge_type, edge.properties) catch {};
+        // All or nothing: a failure leaves the old record in place.
+        self.edge_store.replaceProperties(edge_id, edge.source, edge.target, edge.edge_type, new_props.items) catch |err| {
             return mapEdgeStoreError(err);
         };
         try self.replaceEdgePropertyIndex(
@@ -7120,6 +9303,79 @@ pub const Database = struct {
         return null;
     }
 
+    /// One property of an edge as `txn` sees it, decoded into `allocator`;
+    /// null when the edge does not exist or lacks the property.
+    ///
+    /// The edge counterpart of getNodePropertyByKeyInTxn, for the query
+    /// engine's per-row reads: getEdgePropertyByIdInTxn copies the whole
+    /// edge, twice, and resolves the key name again, to return one value.
+    pub fn getEdgePropertyByKeyInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        edge_id: EdgeId,
+        key_id: symbols_mod.SymbolId,
+        allocator: Allocator,
+        cache: ?*node_mod.RecordCache,
+    ) DatabaseError!?PropertyValue {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.edge_states.getPtr(edge_id)) |state| {
+                    if (!state.exists) return null;
+                    for (state.properties) |prop| {
+                        if (prop.key_id == key_id) return prop.value.clone(allocator) catch return DatabaseError.OutOfMemory;
+                    }
+                    return null;
+                }
+            }
+        }
+        return self.edge_store.getProperty(edge_id, key_id, allocator, cache) catch |err| switch (err) {
+            edge_mod.EdgeError.NotFound => null,
+            edge_mod.EdgeError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
+    /// An edge's type as `txn` sees it, without reading its properties;
+    /// null when the edge does not exist.
+    pub fn getEdgeTypeInTxn(self: *Self, txn: ?*Transaction, edge_id: EdgeId) DatabaseError!?symbols_mod.SymbolId {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.edge_states.getPtr(edge_id)) |state| {
+                    return if (state.exists) state.edge_type else null;
+                }
+            }
+        }
+        const ref = self.edge_store.getRefById(edge_id) catch |err| return switch (err) {
+            edge_mod.EdgeError.NotFound => null,
+            edge_mod.EdgeError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+        return ref.edge_type;
+    }
+
+    /// A node's label ids as `txn` sees it, copied into `allocator`, without
+    /// reading its properties; null when the node does not exist.
+    pub fn getNodeLabelIdsInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        node_id: NodeId,
+        allocator: Allocator,
+    ) DatabaseError!?[]symbols_mod.SymbolId {
+        if (txn) |t| {
+            if (self.getTxnOverlay(t)) |overlay| {
+                if (overlay.node_states.getPtr(node_id)) |state| {
+                    if (!state.exists) return null;
+                    return allocator.dupe(symbols_mod.SymbolId, state.labels) catch return DatabaseError.OutOfMemory;
+                }
+            }
+        }
+        return self.node_store.getLabelIds(node_id, allocator) catch |err| switch (err) {
+            node_mod.NodeError.NotFound => null,
+            node_mod.NodeError.OutOfMemory => DatabaseError.OutOfMemory,
+            else => DatabaseError.IoError,
+        };
+    }
+
     /// Get all properties for an edge by stable edge ID.
     /// Returns an allocated slice that the caller must free with freePropertyEntries.
     pub fn getEdgeProperties(self: *Self, edge_id: EdgeId) DatabaseError![]PropertyEntry {
@@ -7240,7 +9496,9 @@ pub const Database = struct {
     /// Get cached outgoing edges for a node. If the adjacency cache is enabled
     /// and the node is cached, returns the cached slice directly (no B+Tree access).
     /// On cache miss, populates the cache from the B+Tree and returns the result.
-    /// Falls back to the uncached iterator path if the cache is disabled.
+    /// Returns null if the cache is disabled; the caller then iterates the edges.
+    /// The edges are the committed ones: a transaction's staged edges are not
+    /// in it until it commits. The slice is valid until the next edge change.
     pub fn getOutgoingEdgesCached(self: *Self, node_id: NodeId) !?[]const CachedEdge {
         if (self.adjacency_cache) |*cache| {
             if (cache.get(node_id)) |edges| {
@@ -7386,7 +9644,16 @@ pub const Database = struct {
 
     /// Get all labels for a specific node.
     /// Returns an allocated slice that the caller must free.
+    /// The labels of a committed node, by name, in label id order (the
+    /// order the label index keeps them in); none for a node that does not
+    /// exist. Read from the node's record, one lookup, rather than by
+    /// walking the label index, which made every export quadratic.
     pub fn getNodeLabels(self: *Self, node_id: NodeId) DatabaseError![][]const u8 {
+        var state = (try self.readBaseNodeState(node_id)) orelse
+            return self.allocator.alloc([]const u8, 0) catch return DatabaseError.OutOfMemory;
+        defer state.deinit(self.allocator);
+        std.mem.sortUnstable(symbols_mod.SymbolId, state.labels, {}, std.sort.asc(symbols_mod.SymbolId));
+
         var labels_list: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (labels_list.items) |label| {
@@ -7394,31 +9661,12 @@ pub const Database = struct {
             }
             labels_list.deinit(self.allocator);
         }
-
-        // Iterate the label tree looking for entries with this node_id
-        var iter = self.label_tree.range(null, null) catch {
-            return DatabaseError.IoError;
-        };
-        defer iter.deinit();
-
-        while (true) {
-            const entry = iter.next() catch break;
-            if (entry) |e| {
-                // Parse label key: (label_id: u16, node_id: u64)
-                if (e.key.len >= 10) {
-                    const entry_node_id = std.mem.readInt(u64, e.key[2..10], .big);
-                    if (entry_node_id == node_id) {
-                        const label_id = std.mem.readInt(u16, e.key[0..2], .big);
-                        const label_name = self.symbol_table.resolve(label_id) catch continue;
-                        labels_list.append(self.allocator, label_name) catch {
-                            self.allocator.free(label_name);
-                            return DatabaseError.OutOfMemory;
-                        };
-                    }
-                }
-            } else {
-                break;
-            }
+        for (state.labels) |label_id| {
+            const label_name = self.symbol_table.resolve(label_id) catch continue;
+            labels_list.append(self.allocator, label_name) catch {
+                self.allocator.free(label_name);
+                return DatabaseError.OutOfMemory;
+            };
         }
 
         return labels_list.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
@@ -7647,22 +9895,7 @@ pub const Database = struct {
             };
         };
 
-        const visible_ids = try self.collectVisibleNodeIds(txn);
-        defer self.allocator.free(visible_ids);
-
-        var matches: std.ArrayListUnmanaged(NodeId) = .empty;
-        errdefer matches.deinit(self.allocator);
-
-        for (visible_ids) |node_id| {
-            var state = (try self.readVisibleNodeState(txn, node_id)) orelse continue;
-            defer state.deinit(self.allocator);
-            if (!state.exists) continue;
-            if (containsSymbolId(state.labels, label_id)) {
-                matches.append(self.allocator, node_id) catch return DatabaseError.OutOfMemory;
-            }
-        }
-
-        return matches.toOwnedSlice(self.allocator) catch return DatabaseError.OutOfMemory;
+        return self.getNodesByLabelIdInTxn(txn, label_id);
     }
 
     // ========================================================================
@@ -7805,6 +10038,62 @@ pub const Database = struct {
         return .{ .entries = 0, .hits = 0, .misses = 0 };
     }
 
+    /// A query parsed and analysed once, held for repeated execution.
+    ///
+    /// It pins its query-cache entry, so the parse tree stays put until
+    /// releasePrepared, however full the cache gets.
+    pub const PreparedQuery = struct {
+        entry: *cache_mod.CacheEntry,
+
+        /// Whether running the query could change the database.
+        pub fn writes(self: PreparedQuery) bool {
+            return self.entry.query.writesData();
+        }
+    };
+
+    /// Parse and analyse `cypher` once, through the query cache, for a caller
+    /// that will execute it (the C API's prepared queries).
+    ///
+    /// Null when the query cache is off or every entry is pinned, and when
+    /// the query does not parse or analyse: executing the text then parses
+    /// it and reports the error with its location, as before.
+    pub fn prepareCached(self: *Self, cypher: []const u8) ?PreparedQuery {
+        const cache = self.query_cache orelse return null;
+        const normalized_cypher = normalizeCypher(cypher);
+        if (cache.get(normalized_cypher)) |entry| return .{ .entry = entry };
+
+        const outcome = self.parseQuery(normalized_cypher) catch return null;
+        switch (outcome) {
+            .failure => |failure| {
+                var owned = failure;
+                owned.deinit();
+                return null;
+            },
+            .parsed => |parsed| {
+                if (parsed.entry) |entry| return .{ .entry = entry };
+                var owned = parsed;
+                owned.deinit();
+                return null;
+            },
+        }
+    }
+
+    /// Unpin a query from prepareCached.
+    pub fn releasePrepared(self: *Self, prepared: PreparedQuery) void {
+        _ = self;
+        prepared.entry.unpin();
+    }
+
+    /// Execute a query from prepareCached without parsing it again.
+    pub fn executePreparedDetailedInTxn(
+        self: *Self,
+        txn: ?*Transaction,
+        prepared: PreparedQuery,
+        params: ?*const std.StringHashMap(types.PropertyValue),
+    ) QueryError!QueryDetailedResult {
+        return self.executeParsed(txn, prepared.entry.query, params);
+    }
+
     /// Internal: Execute a query with optional parameters, using the cache when available.
     fn executeQueryDetailed(
         self: *Self,
@@ -7814,115 +10103,120 @@ pub const Database = struct {
     ) QueryError!QueryDetailedResult {
         const normalized_cypher = normalizeCypher(cypher);
 
-        var cache_entry: ?*cache_mod.CacheEntry = null;
-        defer {
-            if (cache_entry) |entry| entry.unpin();
-        }
-        var uncached_cache_arena: ?std.heap.ArenaAllocator = null;
-        defer {
-            if (uncached_cache_arena) |arena| arena.deinit();
-        }
-
-        var ast_query: *lattice.query.ast.Query = undefined;
-        var analysis_vars: []const VariableInfo = &[_]VariableInfo{};
-
-        // Fallback parser/analyzer for cache miss
-        var parser: ?Parser = null;
-        defer {
-            if (parser) |*p| p.deinit();
-        }
-        var analyzer: ?SemanticAnalyzer = null;
-        defer {
-            if (analyzer) |*a| a.deinit();
-        }
-
-        // Try the cache first
         if (self.query_cache) |cache| {
-            cache_entry = cache.get(normalized_cypher);
-        }
-
-        if (cache_entry) |entry| {
-            // Cache hit: use the cached AST and variables
-            ast_query = entry.query;
-            analysis_vars = entry.variables;
-        } else {
-            // Cache miss: parse and analyze
-            if (self.query_cache != null) {
-                // Parse with a cache-owned arena so the AST can be cached
-                var cache_arena = std.heap.ArenaAllocator.init(self.allocator);
-
-                // Copy source into arena so AST slices remain valid
-                const owned_source = cache_arena.allocator().dupe(u8, normalized_cypher) catch {
-                    cache_arena.deinit();
-                    return QueryError.OutOfMemory;
-                };
-
-                var cache_parser = Parser.initWithArena(self.allocator, owned_source, cache_arena);
-                const parse_result = cache_parser.parse();
-
-                if (parse_result.query == null) {
-                    const failure = self.makeParseFailure(parse_result) catch |err| {
-                        cache_parser.errors.deinit(self.allocator);
-                        cache_parser.arena.deinit();
-                        return err;
-                    };
-                    // Parse failed - clean up and return error
-                    cache_parser.errors.deinit(self.allocator);
-                    cache_parser.arena.deinit();
-                    return failure;
-                }
-                ast_query = parse_result.query.?;
-
-                // Semantic analysis
-                var sem = SemanticAnalyzer.init(self.allocator);
-                const analysis = sem.analyze(ast_query);
-                if (!analysis.success) {
-                    const failure = self.makeSemanticFailure(analysis) catch |err| {
-                        sem.deinit();
-                        cache_parser.errors.deinit(self.allocator);
-                        cache_parser.arena.deinit();
-                        return err;
-                    };
-                    sem.deinit();
-                    cache_parser.errors.deinit(self.allocator);
-                    cache_parser.arena.deinit();
-                    return failure;
-                }
-                analysis_vars = analysis.variables;
-
-                // Store in cache (cache takes ownership of the arena)
-                var arena_to_cache = cache_parser.arena;
-                cache_parser.errors.deinit(self.allocator);
-                cache_entry = self.query_cache.?.put(normalized_cypher, ast_query, analysis_vars, &arena_to_cache);
-                if (cache_entry) |entry| {
-                    ast_query = entry.query;
-                    analysis_vars = entry.variables;
-                } else {
-                    // Cache insertion skipped (e.g., all entries pinned). Keep the
-                    // parser arena alive for this execution path.
-                    uncached_cache_arena = arena_to_cache;
-                }
-
-                sem.deinit();
-            } else {
-                // No cache: standard parse path
-                parser = Parser.init(self.allocator, normalized_cypher);
-                const parse_result = parser.?.parse();
-
-                if (parse_result.query == null) {
-                    return self.makeParseFailure(parse_result);
-                }
-                ast_query = parse_result.query.?;
-
-                analyzer = SemanticAnalyzer.init(self.allocator);
-                const analysis = analyzer.?.analyze(ast_query);
-                if (!analysis.success) {
-                    return self.makeSemanticFailure(analysis);
-                }
-                analysis_vars = analysis.variables;
+            if (cache.get(normalized_cypher)) |entry| {
+                defer entry.unpin();
+                return self.executeParsed(txn, entry.query, params);
             }
         }
 
+        switch (try self.parseQuery(normalized_cypher)) {
+            .failure => |failure| return failure,
+            .parsed => |parsed| {
+                var owned = parsed;
+                defer owned.deinit();
+                return self.executeParsed(txn, owned.query, params);
+            },
+        }
+    }
+
+    /// A parse tree that stays valid until deinit: a pinned cache entry, or
+    /// the parser's own memory when the query could not be cached.
+    const ParsedQuery = struct {
+        query: *lattice.query.ast.Query,
+        entry: ?*cache_mod.CacheEntry = null,
+        arena: ?std.heap.ArenaAllocator = null,
+        parser: ?Parser = null,
+
+        fn deinit(self: *ParsedQuery) void {
+            if (self.entry) |entry| entry.unpin();
+            if (self.arena) |*arena| arena.deinit();
+            if (self.parser) |*parser| parser.deinit();
+        }
+    };
+
+    const ParseOutcome = union(enum) {
+        parsed: ParsedQuery,
+        /// A parse or semantic failure, ready to return to the caller.
+        failure: QueryDetailedResult,
+    };
+
+    /// Parse and analyse a query, storing it in the query cache when there
+    /// is one.
+    fn parseQuery(self: *Self, normalized_cypher: []const u8) QueryError!ParseOutcome {
+        if (self.query_cache) |cache| {
+            // Parse with a cache-owned arena so the AST can be cached
+            var cache_arena = std.heap.ArenaAllocator.init(self.allocator);
+
+            // Copy source into arena so AST slices remain valid
+            const owned_source = cache_arena.allocator().dupe(u8, normalized_cypher) catch {
+                cache_arena.deinit();
+                return QueryError.OutOfMemory;
+            };
+
+            var cache_parser = Parser.initWithArena(self.allocator, owned_source, cache_arena);
+            const parse_result = cache_parser.parse();
+
+            if (parse_result.query == null) {
+                defer {
+                    cache_parser.errors.deinit(self.allocator);
+                    cache_parser.arena.deinit();
+                }
+                return .{ .failure = try self.makeParseFailure(parse_result) };
+            }
+            const ast_query = parse_result.query.?;
+
+            var sem = SemanticAnalyzer.init(self.allocator);
+            defer sem.deinit();
+            const analysis = sem.analyze(ast_query);
+            if (!analysis.success) {
+                defer {
+                    cache_parser.errors.deinit(self.allocator);
+                    cache_parser.arena.deinit();
+                }
+                return .{ .failure = try self.makeSemanticFailure(analysis) };
+            }
+
+            // Store in cache (the cache takes the arena). The variables are
+            // copied into it, so nothing points into `sem` afterwards.
+            var arena_to_cache = cache_parser.arena;
+            cache_parser.errors.deinit(self.allocator);
+            if (cache.put(normalized_cypher, ast_query, analysis.variables, &arena_to_cache)) |entry| {
+                // put leaves an empty arena behind.
+                arena_to_cache.deinit();
+                return .{ .parsed = .{ .query = entry.query, .entry = entry } };
+            }
+            // Not cached (e.g. every entry pinned): the arena lives as long
+            // as this execution.
+            return .{ .parsed = .{ .query = ast_query, .arena = arena_to_cache } };
+        }
+
+        // No cache: standard parse path
+        var parser = Parser.init(self.allocator, normalized_cypher);
+        const parse_result = parser.parse();
+        if (parse_result.query == null) {
+            defer parser.deinit();
+            return .{ .failure = try self.makeParseFailure(parse_result) };
+        }
+        const ast_query = parse_result.query.?;
+
+        var analyzer = SemanticAnalyzer.init(self.allocator);
+        defer analyzer.deinit();
+        const analysis = analyzer.analyze(ast_query);
+        if (!analysis.success) {
+            defer parser.deinit();
+            return .{ .failure = try self.makeSemanticFailure(analysis) };
+        }
+        return .{ .parsed = .{ .query = ast_query, .parser = parser } };
+    }
+
+    /// Plan and run a parsed, analysed query.
+    fn executeParsed(
+        self: *Self,
+        txn: ?*Transaction,
+        ast_query: *lattice.query.ast.Query,
+        params: ?*const std.StringHashMap(types.PropertyValue),
+    ) QueryError!QueryDetailedResult {
         // Plan the query
         const storage_ctx = StorageContext{
             .node_tree = &self.node_tree,
@@ -7943,10 +10237,12 @@ pub const Database = struct {
 
         var planner = QueryPlanner.init(query_alloc, storage_ctx);
 
+        // The planner does not read the analysis; validation has already
+        // happened, when the query was parsed.
         const analysis_result = semantic_mod.AnalysisResult{
             .success = true,
             .errors = &[_]semantic_mod.SemanticError{},
-            .variables = analysis_vars,
+            .variables = &[_]VariableInfo{},
             .errors_dropped = false,
         };
 
@@ -7967,9 +10263,9 @@ pub const Database = struct {
         var auto_txn_committed = false;
         if (txn == null and ast_query.writesData() and !self.read_only) {
             auto_txn = self.beginTransaction(.read_write) catch |err| switch (err) {
-                // A database built without transactions still has the old
-                // behaviour available, and refusing the query outright would be
-                // worse than running it the way it has always run.
+                // Every handle that can write has transactions, log or no
+                // log, so this is not reached; were it, running the query
+                // directly would still beat refusing it.
                 DatabaseError.TransactionsNotEnabled => null,
                 DatabaseError.OutOfMemory => return QueryError.OutOfMemory,
                 else => return QueryError.ExecutionError,
@@ -7985,6 +10281,10 @@ pub const Database = struct {
         var exec_ctx = ExecutionContext.initWithStorage(self.allocator, &self.node_store, &self.symbol_table);
         exec_ctx.database = self;
         exec_ctx.txn = if (auto_txn) |*t| t else txn;
+        exec_ctx.stable_reads = !ast_query.writesData();
+        exec_ctx.vector_queries = &planner.vector_queries;
+        var diagnostic: executor_mod.Diagnostic = .{};
+        exec_ctx.diagnostic = &diagnostic;
         defer exec_ctx.deinit();
 
         var binding_iter = planner.bindings.iterator();
@@ -8005,7 +10305,7 @@ pub const Database = struct {
         }
 
         var exec_result = execute(query_alloc, root_op, &exec_ctx) catch |err| {
-            return self.makeExecutionFailure(err);
+            return self.makeExecutionFailure(err, &diagnostic);
         };
 
         // Built before the commit, because the rows are read back through the
@@ -8013,7 +10313,14 @@ pub const Database = struct {
         const converted = try self.convertResult(&exec_result, &planner);
 
         if (auto_txn) |*t| {
-            self.commitTransaction(t) catch return QueryError.ExecutionError;
+            self.commitTransaction(t) catch |err| {
+                // The rows were built for a commit that did not happen.
+                var rows = converted;
+                rows.deinit();
+                var failed = try self.makeFailure(.execution, "Storage error: the query's changes could not be committed", @errorName(err), null);
+                failed.failure.cause = if (err == DatabaseError.OutOfMemory) .out_of_memory else .storage;
+                return failed;
+            };
             auto_txn_committed = true;
         }
 
@@ -8089,8 +10396,28 @@ pub const Database = struct {
         );
     }
 
-    fn makeExecutionFailure(self: *Self, err: anyerror) QueryError!QueryDetailedResult {
-        return self.makeFailure(.execution, "Execution error: query failed", @errorName(err), null);
+    /// An execution failure, described by what the code that found it
+    /// recorded, or by its error when nothing was recorded.
+    fn makeExecutionFailure(self: *Self, err: anyerror, diagnostic: *const executor_mod.Diagnostic) QueryError!QueryDetailedResult {
+        const kind = if (diagnostic.recorded) diagnostic.kind else executor_mod.diagnosticKind(err);
+        const message = diagnostic.message() orelse switch (kind) {
+            .storage => "Storage error: reading the database failed during the query",
+            .out_of_memory => "Out of memory while running the query",
+            .query => "Execution error: query failed",
+        };
+        const code = if (diagnostic.recorded and diagnostic.code.len > 0) diagnostic.code else @errorName(err);
+        const location: ?QueryFailureLocation = if (diagnostic.location) |loc| .{
+            .line = loc.line,
+            .column = loc.column,
+            .length = loc.length,
+        } else null;
+        var result = try self.makeFailure(.execution, message, code, location);
+        result.failure.cause = switch (kind) {
+            .query => .query,
+            .storage => .storage,
+            .out_of_memory => .out_of_memory,
+        };
+        return result;
     }
 
     fn makeFailure(
@@ -8125,19 +10452,27 @@ pub const Database = struct {
         exec_result: *executor_mod.QueryResult,
         planner: *QueryPlanner,
     ) QueryError!QueryResult {
-        // Build column names from planner output columns (set by RETURN clause planning)
-        // Use output_columns when available (from RETURN), otherwise fall back to next_slot
-        const num_cols = if (planner.output_columns > 0) planner.output_columns else planner.next_slot;
+        // The columns are the ones RETURN (or a standalone CALL) names. A
+        // query without them, such as a bare CREATE, returns nothing: its
+        // slots are working state, not results.
+        const num_cols = planner.output_columns;
         var columns = self.allocator.alloc([]const u8, num_cols) catch {
             return QueryError.OutOfMemory;
         };
-        errdefer self.allocator.free(columns);
+        // On failure, free only the names and rows built so far: the rest
+        // are undefined, and freeing them crashed when memory ran out.
+        var columns_named: usize = 0;
+        errdefer {
+            for (columns[0..columns_named]) |name| self.allocator.free(name);
+            self.allocator.free(columns);
+        }
 
         // Initialize columns with slot numbers as names (default)
         for (0..num_cols) |i| {
             columns[i] = std.fmt.allocPrint(self.allocator, "col{}", .{i}) catch {
                 return QueryError.OutOfMemory;
             };
+            columns_named += 1;
         }
 
         // Try to get actual variable names
@@ -8146,38 +10481,47 @@ pub const Database = struct {
             const slot = entry.value_ptr.slot;
             if (slot < num_cols and planner.output_column_names[slot] == null) {
                 // Free default name and use actual variable name
-                self.allocator.free(columns[slot]);
-                columns[slot] = self.allocator.dupe(u8, entry.key_ptr.*) catch {
+                const name = self.allocator.dupe(u8, entry.key_ptr.*) catch {
                     return QueryError.OutOfMemory;
                 };
+                self.allocator.free(columns[slot]);
+                columns[slot] = name;
             }
         }
 
         // Explicit aliases from RETURN take precedence over inferred binding names.
         for (0..num_cols) |i| {
             if (planner.output_column_names[i]) |name| {
-                self.allocator.free(columns[i]);
-                columns[i] = self.allocator.dupe(u8, name) catch {
+                const owned = self.allocator.dupe(u8, name) catch {
                     return QueryError.OutOfMemory;
                 };
+                self.allocator.free(columns[i]);
+                columns[i] = owned;
             }
         }
 
         // Convert rows
-        var rows = self.allocator.alloc(ResultRow, exec_result.rows.items.len) catch {
+        const row_count = if (num_cols == 0) 0 else exec_result.rows.items.len;
+        var rows = self.allocator.alloc(ResultRow, row_count) catch {
             return QueryError.OutOfMemory;
         };
+        var rows_built: usize = 0;
         errdefer {
-            for (rows) |*row| {
+            for (rows[0..rows_built]) |*row| {
                 row.deinit(self.allocator);
             }
             self.allocator.free(rows);
         }
 
-        for (exec_result.rows.items, 0..) |exec_row, row_idx| {
+        for (exec_result.rows.items[0..row_count], 0..) |exec_row, row_idx| {
             var values = self.allocator.alloc(ResultValue, num_cols) catch {
                 return QueryError.OutOfMemory;
             };
+            var values_built: usize = 0;
+            errdefer {
+                for (values[0..values_built]) |*value| value.deinit(self.allocator);
+                self.allocator.free(values);
+            }
 
             for (0..num_cols) |col_idx| {
                 const slot: u8 = @intCast(col_idx);
@@ -8186,9 +10530,11 @@ pub const Database = struct {
                 } else {
                     values[col_idx] = .{ .null_val = {} };
                 }
+                values_built += 1;
             }
 
             rows[row_idx] = ResultRow{ .values = values };
+            rows_built += 1;
         }
 
         return QueryResult{
@@ -8205,7 +10551,75 @@ pub const Database = struct {
             .node_ref => |id| .{ .node_id = id },
             .edge_ref => |id| .{ .edge_id = id },
             .property => |prop| try self.propertyToResultValue(prop),
+            .path => |path| try self.pathToResultValue(path.*),
+            .value => |value| try self.evalToResultValue(value.*),
         };
+    }
+
+    /// A list or map that holds nodes, relationships or paths, with those
+    /// kept as they are rather than turned into ids.
+    fn evalToResultValue(self: *Self, value: lattice.query.expression.EvalResult) QueryError!ResultValue {
+        const a = self.allocator;
+        return switch (value) {
+            .node_ref => |id| .{ .node_id = id },
+            .edge_ref => |id| .{ .edge_id = id },
+            .path_val => |path| try self.pathToResultValue(path.*),
+            .list_val => |list| blk: {
+                const out = a.alloc(ResultValue, list.len) catch return QueryError.OutOfMemory;
+                var done: usize = 0;
+                errdefer {
+                    for (out[0..done]) |*item| item.deinit(a);
+                    a.free(out);
+                }
+                for (list, out) |item, *o| {
+                    o.* = try self.evalToResultValue(item);
+                    done += 1;
+                }
+                break :blk .{ .list_val = out };
+            },
+            .map_val => |map| blk: {
+                const out = a.alloc(ResultValue.MapEntry, map.len) catch return QueryError.OutOfMemory;
+                var done: usize = 0;
+                errdefer {
+                    for (out[0..done]) |*entry| {
+                        a.free(entry.key);
+                        entry.value.deinit(a);
+                    }
+                    a.free(out);
+                }
+                for (map, out) |entry, *o| {
+                    const key = a.dupe(u8, entry.key) catch return QueryError.OutOfMemory;
+                    o.* = .{ .key = key, .value = self.evalToResultValue(entry.value) catch |err| {
+                        a.free(key);
+                        return err;
+                    } };
+                    done += 1;
+                }
+                break :blk .{ .map_val = out };
+            },
+            else => try self.propertyToResultValue(value.toPropertyValue(a) catch return QueryError.OutOfMemory),
+        };
+    }
+
+    /// A path as a result: `{nodes: [node, ...], relationships: [rel, ...]}`.
+    /// The C API has no path type, so a path reaches it as this map (with
+    /// the nodes and relationships as their ids).
+    fn pathToResultValue(self: *Self, path: executor_mod.Path) QueryError!ResultValue {
+        const a = self.allocator;
+        const nodes = a.alloc(ResultValue, path.nodes.len) catch return QueryError.OutOfMemory;
+        errdefer a.free(nodes);
+        for (path.nodes, nodes) |id, *n| n.* = .{ .node_id = id };
+        const edges = a.alloc(ResultValue, path.edges.len) catch return QueryError.OutOfMemory;
+        errdefer a.free(edges);
+        for (path.edges, edges) |id, *e| e.* = .{ .edge_id = id };
+        const entries = a.alloc(ResultValue.MapEntry, 2) catch return QueryError.OutOfMemory;
+        errdefer a.free(entries);
+        const nodes_key = a.dupe(u8, "nodes") catch return QueryError.OutOfMemory;
+        errdefer a.free(nodes_key);
+        const edges_key = a.dupe(u8, "relationships") catch return QueryError.OutOfMemory;
+        entries[0] = .{ .key = nodes_key, .value = .{ .list_val = nodes } };
+        entries[1] = .{ .key = edges_key, .value = .{ .list_val = edges } };
+        return .{ .map_val = entries };
     }
 
     /// Convert a PropertyValue to a ResultValue (recursive for lists/maps).
@@ -8223,8 +10637,15 @@ pub const Database = struct {
                 const result_list = self.allocator.alloc(ResultValue, list.len) catch {
                     return QueryError.OutOfMemory;
                 };
+                // Out of memory part way: free the items already converted.
+                var built: usize = 0;
+                errdefer {
+                    for (result_list[0..built]) |*item| item.deinit(self.allocator);
+                    self.allocator.free(result_list);
+                }
                 for (list, 0..) |item, i| {
                     result_list[i] = try self.propertyToResultValue(item);
+                    built += 1;
                 }
                 break :blk .{ .list_val = result_list };
             },
@@ -8232,11 +10653,19 @@ pub const Database = struct {
                 const result_map = self.allocator.alloc(ResultValue.MapEntry, map.len) catch {
                     return QueryError.OutOfMemory;
                 };
+                var built: usize = 0;
+                errdefer {
+                    for (result_map[0..built]) |*entry| {
+                        self.allocator.free(entry.key);
+                        entry.value.deinit(self.allocator);
+                    }
+                    self.allocator.free(result_map);
+                }
                 for (map, 0..) |entry, i| {
-                    result_map[i] = .{
-                        .key = self.allocator.dupe(u8, entry.key) catch return QueryError.OutOfMemory,
-                        .value = try self.propertyToResultValue(entry.value),
-                    };
+                    const key = self.allocator.dupe(u8, entry.key) catch return QueryError.OutOfMemory;
+                    errdefer self.allocator.free(key);
+                    result_map[i] = .{ .key = key, .value = try self.propertyToResultValue(entry.value) };
+                    built += 1;
                 }
                 break :blk .{ .map_val = result_map };
             },

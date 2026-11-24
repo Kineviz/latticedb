@@ -6,9 +6,11 @@
  */
 
 /**
- * Error codes from lattice.h
+ * Error codes from lattice.h. A plain enum, not a const one, so that the
+ * package exports it as a value: JavaScript callers, and TypeScript compiled
+ * with isolatedModules, cannot read a const enum.
  */
-export const enum LatticeErrorCode {
+export enum LatticeErrorCode {
   Ok = 0,
   Error = -1,
   IoError = -2,
@@ -26,6 +28,57 @@ export const enum LatticeErrorCode {
   Unsupported = -14,
   ValueTooLarge = -15,
   DatabaseLocked = -16,
+  /** A plain node delete was refused: the node still has relationships. */
+  HasRelationships = -17,
+  /** Open options contradict the vector index the database file records. */
+  ConfigMismatch = -18,
+  /**
+   * The file was written by a newer release that does not let this one write
+   * it. It opens with readOnly: true; a writable open writes nothing.
+   */
+  NeedsNewerWriter = -19,
+}
+
+/**
+ * lattice_open_options_v5 enum values. 0 means "not set" for each.
+ */
+export const enum LatticeSyncMode {
+  Default = 0,
+  Full = 1,
+  Normal = 2,
+}
+
+export const enum LatticeFullFsync {
+  Default = 0,
+  Off = 1,
+  On = 2,
+}
+
+export const enum LatticeVectorMetric {
+  Default = 0,
+  Cosine = 1,
+  Euclidean = 2,
+  DotProduct = 3,
+}
+
+/**
+ * lattice_open_options_v5.changefeed_retention values. 0 keeps the file's policy.
+ */
+export const enum LatticeChangefeedRetention {
+  Default = 0,
+  All = 1,
+  Last = 2,
+  Age = 3,
+  Off = 4,
+}
+
+/**
+ * lattice_checkpoint_mode values.
+ */
+export const enum LatticeCheckpointMode {
+  Passive = 0,
+  Full = 1,
+  Truncate = 2,
 }
 
 /**
@@ -54,7 +107,7 @@ export const enum LatticeValueType {
 /**
  * Query diagnostic stages from the C API.
  */
-export const enum QueryErrorStage {
+export enum QueryErrorStage {
   None = 0,
   Parse = 1,
   Semantic = 2,

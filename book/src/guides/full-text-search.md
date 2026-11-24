@@ -6,10 +6,53 @@ LatticeDB includes a BM25-scored inverted index for full-text search. This guide
 
 LatticeDB's full-text search uses:
 
-- **Tokenization** — text is split into terms
-- **Stemming** — terms are reduced to their root form
+- **Tokenization** — text is split into words: runs of letters, digits, combining
+  marks and `_`, in any script. Spaces, punctuation, symbols and emoji separate
+  words, and so do bytes that are not valid UTF-8. Chinese (Han) characters and
+  hiragana are a word each, because those scripts do not put spaces between
+  words. Each word is lowercased (Latin, Greek, Cyrillic and Armenian letters)
+  and its accents are folded, so "Café", "cafe" and "CAFÉ" are one term and
+  "Straße" is stored as "strasse". Single ASCII characters, words longer than 64
+  bytes and English stop words ("the", "and", …) are dropped. A query goes
+  through the same steps, so `"Müller"` and `"muller"` find the same documents.
+- **No stemming** — "run" does not find "running". The engine has an English
+  stemmer, but the C API, the bindings and Cypher cannot turn it on.
 - **Inverted index** — maps terms to the nodes containing them
 - **BM25 scoring** — ranks results by relevance considering term frequency, document frequency, and document length
+
+### Indexes built by 0.16.0 or earlier
+
+The tokenizer above applies to indexes that are new, or empty, in this release.
+An index that already held documents keeps the tokenizer it was built with,
+because its stored terms came from it: only ASCII letters, digits and `_` are
+word characters, so "Müller" was stored as "ller" (and matches "Zöller"), "café"
+as "caf", and Cyrillic or CJK text produced no terms at all. Accents are not
+folded in such an index. Searches against it keep working as they did.
+
+Each index records how it analyses text when its first document goes in, and an
+old index has no record. It switches to the new tokenizer only when every
+document has left it. There is no reindex command; to rebuild an old index with
+the new tokenizer, drop it and declare it again, which reads the property from
+every node afresh:
+
+```python
+db.drop_node_fts_index("Document", "text")
+db.create_node_fts_index("Document", "text")
+```
+
+Opening a database whose log has to be replayed after a crash also rebuilds
+every full-text index, and a rebuilt index takes the new tokenizer.
+
+With the changefeed on, 0.16.0 cannot open a database this release has written
+to at all: see [Opening with 0.16.0](changefeed.md#opening-with-0160). With the
+changefeed off, going back to 0.16.0 works for a database whose full-text
+indexes do not store word positions (indexes 0.16.0 built, and indexes this
+release has only declared), but 0.16.0 splits non-ASCII words its old way, so it
+will not find words with non-ASCII letters that this release indexed. ASCII text
+is unaffected. Once an index that stores positions (every index this release
+fills) holds a document, the file asks for this release or later whatever the
+changefeed setting, and 0.16.0 refuses to open it: 0.16.0 would append entries
+without their positions to pages whose entries carry them, and damage the index.
 
 ## Declaring an Index
 
@@ -35,6 +78,8 @@ with db.write() as txn:
 ```
 
 ```typescript
+await db.createNodeFtsIndex("Document", "text");
+
 await db.write(async (txn) => {
   const node = await txn.createNode({
     labels: ["Document"],
@@ -71,13 +116,61 @@ WHERE d.text @@ "quick fox"
 RETURN d.title
 ```
 
-The property name on the left of `@@` is not actually used. The index holds one
-document per node rather than one per property, so this reads as "does this
-node's indexed text match" no matter which property you name. `d.text`,
-`d.title`, and `d.spelled_wrong` all behave the same way.
+`@@` searches the index declared for that label and property — here
+`Document.text`. The variable needs a label in the pattern, and if no index is
+declared for the label and property you name, the query fails with "No full-text
+index is declared for Document.title" rather than returning nothing.
 
-Name the property that holds the text you indexed anyway, because it tells the
-next person what you meant. Just do not expect a mistake in it to be caught.
+`score(d)` returns the BM25 score the search gave `d`, the same number
+`fts_search` reports, so a query can rank by it or return it:
+
+```cypher
+MATCH (d:Document)
+WHERE d.text @@ "quick fox"
+RETURN d.title, score(d) AS score
+ORDER BY score DESC
+LIMIT 10
+```
+
+It is null for a node no `@@` search scored. See
+[Reading the score](../cypher/full-text-search.md#reading-the-score).
+
+A query with several words matches documents containing every word, so a word no
+document contains gives no results: `"apple zebra"` finds nothing if no document
+has "zebra". Every match is scored, and the best `limit` are returned.
+
+### Query syntax
+
+The same syntax works in `@@`, `fts_search` and `fts_search_fuzzy`:
+
+| Query | Matches |
+|---|---|
+| `quick fox` | both words |
+| `quick OR fox` | either; `OR` must be in capitals. `a b OR c` is `(a b) OR c` |
+| `fox -dog` | "fox" and not "dog"; `-"lazy dog"` excludes a phrase |
+| `"quick brown"` | the words next to each other, in that order |
+| `data*` | any word starting with "data" (at least two characters before the `*`) |
+| `databse~`, `databse~1` | words within two edits, or one (`~0`: exactly; more than two counts as two); words under four characters match exactly |
+| `\-fox`, `fox\*`, `fox\~`, `\"` | a backslash makes the next character literal; inside quotes nothing is an operator |
+
+Words go through the same tokenizer as the indexed text, so punctuation separates
+words (`well-known` asks for "well" and "known"), and stop words ask for nothing. A query
+made only of exclusions (`-dog`) is an error rather than "everything except dog":
+in Cypher write `NOT d.text @@ "dog"`. There are no parentheses.
+
+A Cypher string reads a backslash as the start of an escape, so to pass one
+through to the search write it twice: `d.text @@ '\\-fox'` searches for the
+word "fox" written `-fox`, where `'\-fox'` arrives as `-fox`, an exclusion.
+
+Phrases need word positions, which indexes created in 0.17.0 or later store; they
+cost a few percent more space (about 1% at 100,000 documents). An index created
+earlier has none, and a phrase query against it is an error rather than a search
+for the words in any order ("Full-text query '"quick brown"' has a phrase, and the
+index on Document.text stores no word positions to match one"); drop and
+re-create the index to store them.
+
+Releases before 0.17.0 treated quotes, `-`, `*` and `~` as punctuation and `OR` as
+a stop word, so `fox -quick` asked for both words and `cats OR dogs` for both.
 
 ## Fuzzy Search
 
@@ -92,6 +185,8 @@ results = db.fts_search_fuzzy("Document", "text", "machin lerning", limit=10)
 
 ```python
 results = db.fts_search_fuzzy(
+    "Document",
+    "text",
     "machne",
     limit=10,
     max_distance=2,      # Max edit distance (default: 2)
@@ -108,7 +203,14 @@ const results = await db.ftsSearchFuzzy("Document", "text", "machne", {
 ```
 
 - **max_distance** — maximum Levenshtein edit distance. Higher values find more matches but may include irrelevant results.
-- **min_term_length** — minimum term length to apply fuzzy matching. Short terms (like "a", "the") are matched exactly.
+- **min_term_length** — minimum term length to apply fuzzy matching. Shorter terms are matched exactly.
+
+Unlike plain search, fuzzy search matches a document that contains **any** of the
+query words or a near spelling of one. Each query word scores a document by its
+best-matching spelling in that document, and the words' scores add up, so a
+document matching more of the query ranks higher. A spelling further from the
+query word keeps less of its score: with a maximum of two edits, one edit keeps
+89% and two edits 56%.
 
 ## Combining with Vector Search
 
@@ -125,13 +227,16 @@ LIMIT 10
 
 ## Performance
 
-Full-text search in LatticeDB is fast:
+Top-10 BM25 searches through the C API, on synthetic 50-word documents (0.17.0,
+Apple M5; [Benchmarks](../performance/benchmarks.md#full-text-search) has the method):
 
-| Operation | Latency |
-|-----------|---------|
-| FTS search (100 docs) | 19 us |
+| Documents | One word: p50 / p99 | Two words: p50 / p99 |
+|----------:|--------------------:|---------------------:|
+| 10,000 | 8.5 us / 103 us | 9.0 us / 70 us |
+| 100,000 | 104 us / 1.2 ms | 78 us / 0.70 ms |
 
-This is ~300x faster than SQLite FTS5 and competitive with Tantivy, a dedicated Rust search library. See [Benchmarks](../performance/benchmarks.md) for details.
+Ranking reads every posting of the query's words, so a search costs in proportion
+to how many documents contain them; the p99 is the most common words.
 
 ### Write the query so it can use the index
 
@@ -160,7 +265,29 @@ MATCH (d:Document) WHERE d.title @@ "sourdough" OR d.body @@ "sourdough" RETURN 
 ```
 
 If an `OR` against a non-text condition is slow on a large label, the usual fix is
-two queries and a `UNION`, so each side can use the index that suits it.
+to split it with `UNION`, so each side can use the index that suits it:
+
+```cypher
+MATCH (d:Document) WHERE d.body @@ "sourdough" RETURN d.title AS title
+UNION
+MATCH (d:Document) WHERE d.year > 2020 RETURN d.title AS title
+```
+
+### Asking for the best few
+
+When `@@` is the whole `WHERE` and the `RETURN` has a `LIMIT`, with no `ORDER BY`
+or with `ORDER BY score(d) DESC`, the search keeps only the best `SKIP + LIMIT`
+matches as it scores them instead of producing every match and sorting it:
+
+```cypher
+MATCH (d:Document) WHERE d.text @@ "quick fox"
+RETURN d.title, score(d) AS s ORDER BY s DESC LIMIT 10
+```
+
+With a word every one of 50,000 documents contains, `LIMIT 10` this way takes
+about 6 ms, where sorting every match took about 19 ms. Another `ORDER BY`,
+`DISTINCT`, an aggregation, or another condition beside the `@@` brings back the
+full sort; the answer is the same either way.
 
 ### Rare terms cost less than common ones
 

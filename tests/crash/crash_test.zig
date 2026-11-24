@@ -61,6 +61,47 @@ fn simulateCrash(path: []const u8) !void {
     try file.setLength(4096);
 }
 
+/// Leave the files exactly as a killed process would.
+///
+/// Copies the database and its WAL while the handle is still open, so the copy
+/// holds what had been written at that moment and nothing `close()` adds
+/// later: no final root save, no flush. Opening the copy is what the next
+/// process sees after `kill -9`.
+fn copyAsIfKilled(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    try copyFile(allocator, src, dst);
+
+    var src_wal_buf: [256]u8 = undefined;
+    var dst_wal_buf: [256]u8 = undefined;
+    const src_wal = try std.fmt.bufPrint(&src_wal_buf, "{s}-wal", .{src});
+    const dst_wal = try std.fmt.bufPrint(&dst_wal_buf, "{s}-wal", .{dst});
+    try copyFile(allocator, src_wal, dst_wal);
+}
+
+/// Windows enforces the database's file lock on reads, so the file of a
+/// database that is still open cannot be copied there. A test that needs such
+/// a copy is skipped on Windows.
+fn skipIfLockedOnWindows(err: anyerror) anyerror {
+    if (@import("builtin").os.tag == .windows and err == error.LockViolation) return error.SkipZigTest;
+    return err;
+}
+
+fn copyFile(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    _ = allocator;
+    const fs = @import("compat").fs;
+    const in = try fs.cwd().openFile(src, .{});
+    defer in.close();
+    const out = try fs.cwd().createFile(dst, .{ .truncate = true });
+    defer out.close();
+    var buf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = in.preadAll(&buf, offset) catch |err| return skipIfLockedOnWindows(err);
+        if (n == 0) break;
+        try out.pwriteAll(buf[0..n], offset);
+        offset += n;
+    }
+}
+
 /// Clean up database and WAL files.
 fn cleanup(path: []const u8) void {
     @import("compat").fs.cwd().deleteFile(path) catch {};
@@ -78,6 +119,9 @@ fn openCrashTestDb(allocator: std.mem.Allocator, path: []const u8, create: bool)
             .enable_wal = true,
             .enable_fts = false,
             .enable_vector = false,
+            // These tests wipe the data file after a close and expect the
+            // log to rebuild it, so nothing may truncate the log for them.
+            .auto_checkpoint = null,
         },
     });
 }
@@ -85,6 +129,613 @@ fn openCrashTestDb(allocator: std.mem.Allocator, path: []const u8, create: bool)
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "committed nodes survive a kill after an automatic checkpoint" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_autockpt.ltdb";
+    const killed = "/tmp/lattice_crash_autockpt_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    // Enough single-node commits to split the node tree's root several times
+    // and to cross the checkpoint threshold many times over.
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = false,
+        .auto_checkpoint = .{ .max_wal_frames = 64 },
+    };
+    const count = 1500;
+    const ids = try allocator.alloc(NodeId, count);
+    defer allocator.free(ids);
+
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        for (ids, 0..) |*id, i| {
+            var txn = try db.beginTransaction(.read_write);
+            id.* = try db.createNode(&txn, &.{"Person"});
+            try db.setNodeProperty(&txn, id.*, "seq", .{ .int_val = @intCast(i) });
+            try db.commitTransaction(&txn);
+        }
+        // The checkpoints really ran: the log holds far fewer frames than
+        // 1500 commits wrote.
+        try std.testing.expect(db.wal.?.header.frame_count < 200);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    var db = try Database.open(allocator, killed, .{ .config = config });
+    defer db.close();
+    for (ids) |id| {
+        try std.testing.expect(try db.nodeExists(id));
+    }
+    const people = try db.getNodesByLabel("Person");
+    defer allocator.free(people);
+    try std.testing.expectEqual(@as(usize, count), people.len);
+
+    // The id allocator must not hand out an id that is already taken.
+    var txn = try db.beginTransaction(.read_write);
+    const fresh = try db.createNode(&txn, &.{"Person"});
+    try db.commitTransaction(&txn);
+    for (ids) |id| try std.testing.expect(id != fresh);
+}
+
+test "committed vectors survive a kill after an automatic checkpoint" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_autockpt_vec.ltdb";
+    const killed = "/tmp/lattice_crash_autockpt_vec_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    const dims = 8;
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = true,
+        .vector_dimensions = dims,
+        .auto_checkpoint = .{ .max_wal_frames = 64 },
+    };
+    const count = 400;
+    const ids = try allocator.alloc(NodeId, count);
+    defer allocator.free(ids);
+
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        for (ids, 0..) |*id, i| {
+            var vector = [_]f32{0} ** dims;
+            vector[i % dims] = 1;
+            vector[(i + 1) % dims] = @floatFromInt(i + 1);
+            var txn = try db.beginTransaction(.read_write);
+            id.* = try db.createNode(&txn, &.{"Chunk"});
+            try db.setNodeVectorInTxn(&txn, id.*, &vector);
+            try db.commitTransaction(&txn);
+        }
+        try std.testing.expect(db.wal.?.header.frame_count < 200);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    var db = try Database.open(allocator, killed, .{ .config = config });
+    defer db.close();
+    // Every vector is reachable: a search wide enough to return them all does.
+    var probe = [_]f32{1} ** dims;
+    const results = try db.vectorSearch(&probe, count, count);
+    defer db.freeVectorSearchResults(results);
+    try std.testing.expectEqual(@as(usize, count), results.len);
+}
+
+test "deleting a node leaves a database without vectors openable" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_delete_novec.ltdb";
+    const killed = "/tmp/lattice_crash_delete_novec_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    var kept: NodeId = undefined;
+    var deleted: NodeId = undefined;
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        kept = try db.createNode(&txn, &.{"Person"});
+        deleted = try db.createNode(&txn, &.{"Person"});
+        try db.commitTransaction(&txn);
+        txn = try db.beginTransaction(.read_write);
+        try db.deleteNode(&txn, deleted);
+        try db.commitTransaction(&txn);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // After a kill.
+    {
+        var db = try openCrashTestDb(allocator, killed, false);
+        defer db.close();
+        try std.testing.expect(try db.nodeExists(kept));
+        try std.testing.expect(!try db.nodeExists(deleted));
+    }
+    // After a clean close, which leaves the log in place for the next open.
+    {
+        var db = try openCrashTestDb(allocator, path, false);
+        defer db.close();
+        try std.testing.expect(try db.nodeExists(kept));
+        try std.testing.expect(!try db.nodeExists(deleted));
+    }
+}
+
+test "a vector removal logged by 0.16.0 is skipped when the file has no vectors" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_legacy_vector_remove.ltdb";
+    const killed = "/tmp/lattice_crash_legacy_vector_remove_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    var node_id: NodeId = undefined;
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        node_id = try db.createNode(&txn, &.{"Person"});
+        // What 0.16.0 wrote for every node delete, vectors or not.
+        const payload = try lattice.transaction.wal_payload.serializeVectorMutationAlloc(allocator, node_id, null);
+        defer allocator.free(payload);
+        _ = try db.txn_manager.?.logOperation(&txn, .update, payload);
+        try db.commitTransaction(&txn);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    var db = try openCrashTestDb(allocator, killed, false);
+    defer db.close();
+    try std.testing.expect(try db.nodeExists(node_id));
+}
+
+test "a vector removal is replayed when the file has vectors and the open does not ask for them" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_vector_remove_replayed.ltdb";
+    const killed = "/tmp/lattice_crash_vector_remove_replayed_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    const dims = 8;
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = true,
+        .vector_dimensions = dims,
+        .vector_metric = .euclidean,
+        .auto_checkpoint = null,
+    };
+    var removed: NodeId = undefined;
+    var kept: NodeId = undefined;
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        var vector = [_]f32{0} ** dims;
+        vector[0] = 1;
+        var txn = try db.beginTransaction(.read_write);
+        removed = try db.createNode(&txn, &.{"Chunk"});
+        try db.setNodeVectorInTxn(&txn, removed, &vector);
+        kept = try db.createNode(&txn, &.{"Chunk"});
+        vector[0] = 4;
+        try db.setNodeVectorInTxn(&txn, kept, &vector);
+        try db.commitTransaction(&txn);
+        // Fold the vectors into the file and empty the log, so the removal
+        // below is the only vector record left in it.
+        _ = try db.checkpoint(.truncate);
+        txn = try db.beginTransaction(.read_write);
+        try db.deleteNode(&txn, removed);
+        try db.commitTransaction(&txn);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // 0.16.0 refused this open: without vector options it had no index to
+    // replay the removal into. The file now says what its index is.
+    var db = try openCrashTestDb(allocator, killed, false);
+    defer db.close();
+    try std.testing.expect(!try db.nodeExists(removed));
+    try std.testing.expectEqual(lattice.storage.database.VectorMetric.euclidean, db.vectorConfig().?.metric);
+    const probe = [_]f32{0} ** dims;
+    const results = try db.vectorSearch(&probe, 10, null);
+    defer db.freeVectorSearchResults(results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(kept, results[0].node_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), results[0].distance, 1e-4);
+}
+
+test "a committed vector removal survives a kill and replays" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lvc_crash_vector_remove.ltdb";
+    const killed = "/tmp/lvc_crash_vector_remove_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    const dims = 4;
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = true,
+        .vector_dimensions = dims,
+        .vector_metric = .euclidean,
+        .auto_checkpoint = null,
+    };
+    const near = [_]f32{ 1, 0, 0, 0 };
+    const far = [_]f32{ 0, 0, 0, 5 };
+    var removed: NodeId = undefined;
+    var kept: NodeId = undefined;
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        removed = try db.createNode(&txn, &.{"Chunk"});
+        try db.setNodeProperty(&txn, removed, "name", .{ .string_val = "first" });
+        try db.setNodeVectorInTxn(&txn, removed, &near);
+        kept = try db.createNode(&txn, &.{"Chunk"});
+        try db.setNodeVectorInTxn(&txn, kept, &far);
+        try db.commitTransaction(&txn);
+        // Fold the vectors into the file, so only the log knows of the
+        // removal below.
+        _ = try db.checkpoint(.truncate);
+        txn = try db.beginTransaction(.read_write);
+        try db.removeNodeVectorInTxn(&txn, removed);
+        try db.commitTransaction(&txn);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    var db = try Database.open(allocator, killed, .{ .config = config });
+    defer db.close();
+    // The node and its property are there; its vector is not.
+    try std.testing.expect(try db.nodeExists(removed));
+    var name = (try db.getNodePropertyInTxn(null, removed, "name")).?;
+    defer name.deinit(db.allocator);
+    try std.testing.expectEqualStrings("first", name.string_val);
+    try std.testing.expect((try db.getNodeVectorInTxn(null, removed)) == null);
+    const results = try db.vectorSearch(&near, 10, null);
+    defer db.freeVectorSearchResults(results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(kept, results[0].node_id);
+}
+
+test "vectors added to an existing file survive a kill before any checkpoint" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_vector_added.ltdb";
+    const killed = "/tmp/lattice_crash_vector_added_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        db.close();
+    }
+    const dims = 4;
+    var node_id: NodeId = undefined;
+    {
+        var db = try Database.open(allocator, path, .{ .config = .{
+            .enable_fts = false,
+            .enable_vector = true,
+            .vector_dimensions = dims,
+            .vector_metric = .dot_product,
+            .auto_checkpoint = null,
+        } });
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        node_id = try db.createNode(&txn, &.{"Chunk"});
+        try db.setNodeVectorInTxn(&txn, node_id, &[_]f32{ 1, 2, 3, 4 });
+        try db.commitTransaction(&txn);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // Opened with no vector options, the file says there is an index for the
+    // log's vector records to go into.
+    var db = try openCrashTestDb(allocator, killed, false);
+    defer db.close();
+    try std.testing.expectEqual(lattice.storage.database.VectorMetric.dot_product, db.vectorConfig().?.metric);
+    const results = try db.vectorSearch(&[_]f32{ 1, 1, 1, 1 }, 1, null);
+    defer db.freeVectorSearchResults(results);
+    try std.testing.expectEqual(node_id, results[0].node_id);
+}
+
+test "a transaction that writes nothing leaves the log untouched" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_readonly_nolog.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+
+    var db = try openCrashTestDb(allocator, path, true);
+    defer db.close();
+
+    var txn = try db.beginTransaction(.read_write);
+    const node_id = try db.createNode(&txn, &.{"Person"});
+    try db.commitTransaction(&txn);
+
+    const wal = &db.wal.?;
+    const lsn_before = wal.getCurrentLsn();
+    const frames_before = wal.header.frame_count;
+
+    // Committed and aborted readers, and a writer that changed nothing.
+    var reader = try db.beginTransaction(.read_only);
+    try std.testing.expect(try db.nodeExistsInTxn(&reader, node_id));
+    try db.commitTransaction(&reader);
+    reader = try db.beginTransaction(.read_only);
+    try db.abortTransaction(&reader);
+    var idle_writer = try db.beginTransaction(.read_write);
+    try db.commitTransaction(&idle_writer);
+
+    try std.testing.expectEqual(lsn_before, wal.getCurrentLsn());
+    try std.testing.expectEqual(frames_before, wal.header.frame_count);
+
+    // A real write still gets its begin record, its data and its commit.
+    txn = try db.beginTransaction(.read_write);
+    _ = try db.createNode(&txn, &.{"Person"});
+    try db.commitTransaction(&txn);
+    try std.testing.expect(wal.getCurrentLsn() >= lsn_before + 3);
+}
+
+test "the log is empty after a clean close and after recovery" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_log_emptied.ltdb";
+    const killed = "/tmp/lattice_crash_log_emptied_killed.ltdb";
+    const killed_again = "/tmp/lattice_crash_log_emptied_killed2.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+    cleanup(killed_again);
+    defer cleanup(killed_again);
+
+    // Default checkpoint policy: the threshold is far away, so only open and
+    // close can be what empties the log here.
+    const config = DatabaseConfig{ .enable_fts = false, .enable_vector = false };
+    var node_id: NodeId = undefined;
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        node_id = try db.createNode(&txn, &.{"Person"});
+        try db.commitTransaction(&txn);
+        try std.testing.expect(db.wal.?.header.frame_count > 0);
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // Clean close: nothing left to replay.
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 0), db.wal.?.header.frame_count);
+        try std.testing.expect(try db.nodeExists(node_id));
+    }
+
+    // Kill: recovery replays the log, then folds it into the file. A second
+    // kill straight after that open must find the node in the file itself.
+    {
+        var db = try Database.open(allocator, killed, .{ .config = config });
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 0), db.wal.?.header.frame_count);
+        try std.testing.expect(try db.nodeExists(node_id));
+        try copyAsIfKilled(allocator, killed, killed_again);
+    }
+    {
+        var db = try Database.open(allocator, killed_again, .{ .config = config });
+        defer db.close();
+        try std.testing.expect(try db.nodeExists(node_id));
+    }
+}
+
+test "transaction ids continue above those already in the log" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_txn_ids.ltdb";
+    const killed = "/tmp/lattice_crash_txn_ids_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    var last_id: u64 = 0;
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        defer db.close();
+        for (0..3) |_| {
+            var txn = try db.beginTransaction(.read_write);
+            _ = try db.createNode(&txn, &.{"Person"});
+            last_id = txn.id;
+            try db.commitTransaction(&txn);
+        }
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // The helper keeps the log in place, so this session appends to a log
+    // that still holds the first session's transactions.
+    var db = try openCrashTestDb(allocator, killed, false);
+    defer db.close();
+    var txn = try db.beginTransaction(.read_write);
+    defer db.abortTransaction(&txn) catch {};
+    try std.testing.expect(txn.id > last_id);
+}
+
+test "an open reader does not hold back automatic checkpoints" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_reader_ckpt.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+
+    var db = try Database.open(allocator, path, .{ .create = true, .config = .{
+        .enable_fts = false,
+        .enable_vector = false,
+        .auto_checkpoint = .{ .max_wal_frames = 16 },
+    } });
+    defer db.close();
+
+    var reader = try db.beginTransaction(.read_only);
+    for (0..200) |_| {
+        var txn = try db.beginTransaction(.read_write);
+        _ = try db.createNode(&txn, &.{"Person"});
+        try db.commitTransaction(&txn);
+    }
+    try std.testing.expect(db.wal.?.header.frame_count < 64);
+    try db.commitTransaction(&reader);
+}
+
+test "a checkpoint is refused while a transaction has records in the log" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_ckpt_refused.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+
+    var db = try openCrashTestDb(allocator, path, true);
+    defer db.close();
+
+    // Log through the transaction manager directly, the way the paths
+    // without an overlay do: the record is in the log before commit.
+    const tm = &db.txn_manager.?;
+    var txn = try tm.begin(.read_write, .snapshot);
+    const payload = try lattice.transaction.wal_payload.serializeVectorMutationAlloc(allocator, 1, null);
+    defer allocator.free(payload);
+    _ = try tm.logOperation(&txn, .update, payload);
+
+    try std.testing.expectError(error.TransactionConflict, db.checkpoint(.truncate));
+
+    try tm.abort(&txn);
+    _ = try db.checkpoint(.truncate);
+}
+
+test "a commit is durable before it is applied, and a failed apply stops the handle" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_commit_point.ltdb";
+    const killed = "/tmp/lattice_crash_commit_point_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    var before: NodeId = undefined;
+    var during: NodeId = undefined;
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        defer db.close();
+
+        var txn = try db.beginTransaction(.read_write);
+        before = try db.createNode(&txn, &.{"Person"});
+        try db.commitTransaction(&txn);
+
+        // This commit reaches the log and then fails where it would have
+        // been applied to the trees.
+        txn = try db.beginTransaction(.read_write);
+        during = try db.createNode(&txn, &.{"Person"});
+        db.fail_next_apply_for_testing = true;
+        try std.testing.expectError(error.IoError, db.commitTransaction(&txn));
+
+        // The handle no longer matches its log, so it takes no more work,
+        // and it does not write that state into the file.
+        try std.testing.expectError(error.IoError, db.beginTransaction(.read_only));
+        try std.testing.expectError(error.IoError, db.beginTransaction(.read_write));
+        try std.testing.expectError(error.IoError, db.checkpoint(.truncate));
+        try std.testing.expectError(error.IoError, db.sync());
+        try std.testing.expect(!try db.nodeExists(during));
+
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    // The commit record was durable before the failure, so both a kill and a
+    // close leave a database that recovers the transaction.
+    for ([_][]const u8{ killed, path }) |reopened| {
+        var db = try openCrashTestDb(allocator, reopened, false);
+        defer db.close();
+        try std.testing.expect(try db.nodeExists(before));
+        try std.testing.expect(try db.nodeExists(during));
+        var txn = try db.beginTransaction(.read_write);
+        _ = try db.createNode(&txn, &.{"Person"});
+        try db.commitTransaction(&txn);
+    }
+}
+
+test "commits in normal sync mode survive a kill" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_sync_normal.ltdb";
+    const killed = "/tmp/lattice_crash_sync_normal_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    // Past the checkpoint threshold several times, so both the commits still
+    // in the log and the ones a checkpoint folded into the file are covered.
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = false,
+        .sync_mode = .normal,
+        .auto_checkpoint = .{ .max_wal_frames = 64 },
+    };
+    const count = 300;
+    const ids = try allocator.alloc(NodeId, count);
+    defer allocator.free(ids);
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        try std.testing.expect(!db.txn_manager.?.sync_on_commit);
+        for (ids) |*id| {
+            var txn = try db.beginTransaction(.read_write);
+            id.* = try db.createNode(&txn, &.{"Person"});
+            try db.commitTransaction(&txn);
+        }
+        try copyAsIfKilled(allocator, path, killed);
+    }
+
+    var db = try Database.open(allocator, killed, .{ .config = config });
+    defer db.close();
+    for (ids) |id| try std.testing.expect(try db.nodeExists(id));
+}
+
+test "fragmented vector replacements and removals replay from WAL" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_vectors.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = true,
+        .vector_dimensions = 1536,
+        .auto_checkpoint = null,
+    };
+    var original = [_]f32{0} ** 1536;
+    original[0] = 1;
+    var replacement = [_]f32{0} ** 1536;
+    replacement[1] = 1;
+    var keep_id: NodeId = undefined;
+    var remove_id: NodeId = undefined;
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        keep_id = try db.createNode(&txn, &.{"EvidenceChunk"});
+        remove_id = try db.createNode(&txn, &.{"EvidenceChunk"});
+        try db.setNodeVectorInTxn(&txn, keep_id, &original);
+        try db.setNodeVectorInTxn(&txn, remove_id, &original);
+        try db.commitTransaction(&txn);
+        txn = try db.beginTransaction(.read_write);
+        try db.setNodeVectorInTxn(&txn, keep_id, &replacement);
+        try db.deleteNode(&txn, remove_id);
+        try db.commitTransaction(&txn);
+    }
+    // Discard all persisted trees/vector pages so the answer must come from WAL.
+    try simulateCrash(path);
+    var db = try Database.open(allocator, path, .{ .config = config });
+    defer db.close();
+    try std.testing.expect(try db.nodeExists(keep_id));
+    try std.testing.expect(!try db.nodeExists(remove_id));
+    const results = try db.vectorSearch(&replacement, 10, null);
+    defer db.freeVectorSearchResults(results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(keep_id, results[0].node_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), results[0].distance, 0.00001);
+}
 
 test "committed transaction recovered after crash" {
     const allocator = std.testing.allocator;
@@ -1326,4 +1977,510 @@ test "symbol table recovered - edge types resolved after crash" {
         defer db.symbol_table.freeString(resolved);
         try std.testing.expectEqualStrings("KNOWS", resolved);
     }
+}
+
+test "committed data survives a kill while the buffer pool is evicting" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_evict.ltdb";
+    const killed = "/tmp/lattice_crash_evict_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    // A pool far smaller than the data, so dirty pages are pushed out of it
+    // all the time, between checkpoints that each empty the log. Whatever
+    // eviction writes after a checkpoint lands on top of the image that
+    // checkpoint left, with nothing in the log to rebuild what it displaces.
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = false,
+        .buffer_pool_size = 48 * 4096,
+        .auto_checkpoint = .{ .max_wal_frames = 300 },
+    };
+    const count = 4000;
+    const snapshots = [_]usize{ 250, 700, 1130, 1500, 1870, 2600, 3140, 3999 };
+    const ids = try allocator.alloc(NodeId, count);
+    defer allocator.free(ids);
+
+    var payload: [300]u8 = undefined;
+    @memset(&payload, 'x');
+
+    var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+    defer db.close();
+    var next_snapshot: usize = 0;
+    for (ids, 0..) |*id, i| {
+        var txn = try db.beginTransaction(.read_write);
+        id.* = try db.createNode(&txn, &.{"Person"});
+        try db.setNodeProperty(&txn, id.*, "seq", .{ .int_val = @intCast(i) });
+        try db.setNodeProperty(&txn, id.*, "pad", .{ .string_val = &payload });
+        try db.commitTransaction(&txn);
+
+        if (next_snapshot < snapshots.len and i == snapshots[next_snapshot]) {
+            next_snapshot += 1;
+            cleanup(killed);
+            try copyAsIfKilled(allocator, path, killed);
+
+            var reopened = try Database.open(allocator, killed, .{ .config = config });
+            defer reopened.close();
+            for (ids[0 .. i + 1], 0..) |committed, seq| {
+                try std.testing.expect(try reopened.nodeExists(committed));
+                var value = (try reopened.getNodeProperty(committed, "seq")).?;
+                defer value.deinit(allocator);
+                try std.testing.expectEqual(@as(i64, @intCast(seq)), value.int_val);
+            }
+            const people = try reopened.getNodesByLabel("Person");
+            defer allocator.free(people);
+            try std.testing.expectEqual(i + 1, people.len);
+        }
+    }
+}
+
+test "committed creates, updates and deletes survive a kill while the buffer pool is evicting" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_evict_mixed.ltdb";
+    const killed = "/tmp/lattice_crash_evict_mixed_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    // Values large enough to live in overflow chains, so that updates and
+    // deletes free pages and later writes reuse them, all between checkpoints
+    // that empty the log, in a pool that cannot hold the data.
+    const config = DatabaseConfig{
+        .enable_fts = false,
+        .enable_vector = false,
+        .buffer_pool_size = 48 * 4096,
+        .auto_checkpoint = .{ .max_wal_frames = 200 },
+    };
+
+    const Expected = struct { id: NodeId, version: i64, alive: bool };
+    var model: std.ArrayListUnmanaged(Expected) = .empty;
+    defer model.deinit(allocator);
+
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const random = prng.random();
+    var payload: [6000]u8 = undefined;
+
+    var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+    defer db.close();
+
+    const rounds = 1200;
+    for (0..rounds) |round| {
+        var txn = try db.beginTransaction(.read_write);
+        const choice = random.uintLessThan(u8, 10);
+        if (model.items.len < 20 or choice < 5) {
+            const id = try db.createNode(&txn, &.{"Doc"});
+            const size = 200 + random.uintLessThan(usize, payload.len - 200);
+            @memset(payload[0..size], 'a' + @as(u8, @intCast(round % 26)));
+            try db.setNodeProperty(&txn, id, "version", .{ .int_val = 0 });
+            try db.setNodeProperty(&txn, id, "body", .{ .string_val = payload[0..size] });
+            try model.append(allocator, .{ .id = id, .version = 0, .alive = true });
+        } else {
+            const entry = &model.items[random.uintLessThan(usize, model.items.len)];
+            if (!entry.alive) {
+                // Nothing to do to a deleted node; commit an empty transaction.
+            } else if (choice < 8) {
+                const size = 200 + random.uintLessThan(usize, payload.len - 200);
+                @memset(payload[0..size], 'A' + @as(u8, @intCast(round % 26)));
+                entry.version += 1;
+                try db.setNodeProperty(&txn, entry.id, "version", .{ .int_val = entry.version });
+                try db.setNodeProperty(&txn, entry.id, "body", .{ .string_val = payload[0..size] });
+            } else {
+                try db.deleteNode(&txn, entry.id);
+                entry.alive = false;
+            }
+        }
+        try db.commitTransaction(&txn);
+
+        if (round % 97 != 96 and round != rounds - 1) continue;
+
+        cleanup(killed);
+        try copyAsIfKilled(allocator, path, killed);
+        var reopened = try Database.open(allocator, killed, .{ .config = config });
+        defer reopened.close();
+        var alive: usize = 0;
+        for (model.items) |expected| {
+            try std.testing.expectEqual(expected.alive, try reopened.nodeExists(expected.id));
+            if (!expected.alive) continue;
+            alive += 1;
+            var version = (try reopened.getNodeProperty(expected.id, "version")).?;
+            defer version.deinit(allocator);
+            try std.testing.expectEqual(expected.version, version.int_val);
+            var body = (try reopened.getNodeProperty(expected.id, "body")).?;
+            defer body.deinit(allocator);
+            try std.testing.expect(body.string_val.len >= 200);
+        }
+        const docs = try reopened.getNodesByLabel("Doc");
+        defer allocator.free(docs);
+        try std.testing.expectEqual(alive, docs.len);
+    }
+}
+
+test "a flush interrupted partway is finished from the journal at the next open" {
+    const allocator = std.testing.allocator;
+    const journal_mod = lattice.storage.journal;
+    const path = "/tmp/lattice_crash_torn_flush.ltdb";
+    const torn = "/tmp/lattice_crash_torn_flush_torn.ltdb";
+    const torn_journal = torn ++ "-journal";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(torn);
+    defer cleanup(torn);
+    @import("compat").fs.cwd().deleteFile(torn_journal) catch {};
+    defer @import("compat").fs.cwd().deleteFile(torn_journal) catch {};
+
+    const config = DatabaseConfig{ .enable_fts = false, .enable_vector = false };
+    const first = 300;
+    const total = 900;
+    const ids = try allocator.alloc(NodeId, total);
+    defer allocator.free(ids);
+    var payload: [300]u8 = undefined;
+    @memset(&payload, 'x');
+
+    // The image before the flush: a closed database.
+    {
+        var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+        defer db.close();
+        for (ids[0..first], 0..) |*id, i| {
+            var txn = try db.beginTransaction(.read_write);
+            id.* = try db.createNode(&txn, &.{"Person"});
+            try db.setNodeProperty(&txn, id.*, "seq", .{ .int_val = @intCast(i) });
+            try db.setNodeProperty(&txn, id.*, "pad", .{ .string_val = &payload });
+            try db.commitTransaction(&txn);
+        }
+    }
+    try copyAsIfKilled(allocator, path, torn);
+
+    // The image after it: the same database with more in it, closed again.
+    {
+        var db = try Database.open(allocator, path, .{ .config = config });
+        defer db.close();
+        for (ids[first..], first..) |*id, i| {
+            var txn = try db.beginTransaction(.read_write);
+            id.* = try db.createNode(&txn, &.{"Person"});
+            try db.setNodeProperty(&txn, id.*, "seq", .{ .int_val = @intCast(i) });
+            try db.setNodeProperty(&txn, id.*, "pad", .{ .string_val = &payload });
+            try db.commitTransaction(&txn);
+        }
+    }
+
+    // What a crash in the middle of the flush between the two leaves behind:
+    // the journal complete, and only some of the pages written in place.
+    const fs = @import("compat").fs;
+    const after_file = try fs.cwd().openFile(path, .{});
+    const after = try after_file.readToEndAlloc(allocator, 1 << 30);
+    after_file.close();
+    defer allocator.free(after);
+    const page_size = 4096;
+    const page_count = after.len / page_size;
+    try std.testing.expect(page_count > 20);
+
+    {
+        var posix = lattice.storage.vfs.PosixVfs.init(allocator);
+        const images = try allocator.alloc(journal_mod.PageImage, page_count);
+        defer allocator.free(images);
+        for (images, 0..) |*image, i| {
+            image.* = .{ .page_id = @intCast(i), .data = after[i * page_size ..][0..page_size] };
+        }
+        var header: FileHeader = undefined;
+        @memcpy(std.mem.asBytes(&header), after[0..@sizeOf(FileHeader)]);
+        var journal = try journal_mod.Journal.open(allocator, posix.vfs(), torn_journal);
+        defer journal.deinit();
+        try journal.write(header.file_uuid, page_size, images);
+
+        const torn_file = try fs.cwd().openFile(torn, .{ .mode = .read_write });
+        defer torn_file.close();
+        var i: usize = 0;
+        while (i < page_count) : (i += 3) {
+            try torn_file.pwriteAll(after[i * page_size ..][0..page_size], i * page_size);
+        }
+    }
+
+    var db = try Database.open(allocator, torn, .{ .config = config });
+    defer db.close();
+    for (ids, 0..) |id, i| {
+        try std.testing.expect(try db.nodeExists(id));
+        var value = (try db.getNodeProperty(id, "seq")).?;
+        defer value.deinit(allocator);
+        try std.testing.expectEqual(@as(i64, @intCast(i)), value.int_val);
+    }
+    const people = try db.getNodesByLabel("Person");
+    defer allocator.free(people);
+    try std.testing.expectEqual(@as(usize, total), people.len);
+}
+
+test "committed vectors and indexed text survive a kill while the buffer pool is evicting" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_evict_search.ltdb";
+    const killed = "/tmp/lattice_crash_evict_search_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    const dims = 8;
+    const config = DatabaseConfig{
+        .enable_fts = true,
+        .enable_vector = true,
+        .vector_dimensions = dims,
+        .buffer_pool_size = 64 * 4096,
+        .auto_checkpoint = .{ .max_wal_frames = 150 },
+    };
+    const count = 900;
+    const ids = try allocator.alloc(NodeId, count);
+    defer allocator.free(ids);
+
+    var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+    defer db.close();
+    try db.createNodeFtsIndex("Chunk", "text");
+
+    for (ids, 0..) |*id, i| {
+        var vector = [_]f32{0} ** dims;
+        vector[i % dims] = 1;
+        vector[(i + 3) % dims] = @floatFromInt(i + 1);
+        var text_buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&text_buf, "shared marker{d} filler words to give the posting lists some bulk", .{i});
+
+        var txn = try db.beginTransaction(.read_write);
+        id.* = try db.createNode(&txn, &.{"Chunk"});
+        try db.setNodeProperty(&txn, id.*, "text", .{ .string_val = text });
+        try db.setNodeVectorInTxn(&txn, id.*, &vector);
+        try db.commitTransaction(&txn);
+
+        if (i % 149 != 148 and i != count - 1) continue;
+
+        cleanup(killed);
+        try copyAsIfKilled(allocator, path, killed);
+        var reopened = try Database.open(allocator, killed, .{ .config = config });
+        defer reopened.close();
+
+        const committed = i + 1;
+        for (ids[0..committed]) |node_id| try std.testing.expect(try reopened.nodeExists(node_id));
+
+        // Every vector is reachable.
+        var probe = [_]f32{1} ** dims;
+        const nearest = try reopened.vectorSearch(&probe, @intCast(committed), @intCast(@min(committed, 65535)));
+        defer reopened.freeVectorSearchResults(nearest);
+        try std.testing.expectEqual(committed, nearest.len);
+
+        // Every document is indexed: all of them hold "shared", and each
+        // holds its own marker.
+        const everyone = try reopened.ftsSearchIndex(.node, "Chunk", "text", "shared", @intCast(committed + 10));
+        defer reopened.freeFtsSearchResults(everyone);
+        try std.testing.expectEqual(committed, everyone.len);
+        var marker_buf: [32]u8 = undefined;
+        const marker = try std.fmt.bufPrint(&marker_buf, "marker{d}", .{i});
+        const one = try reopened.ftsSearchIndex(.node, "Chunk", "text", marker, 10);
+        defer reopened.freeFtsSearchResults(one);
+        try std.testing.expectEqual(@as(usize, 1), one.len);
+        try std.testing.expectEqual(ids[i], one[0].doc_id);
+    }
+}
+
+test "index declarations and drops that returned survive a kill" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/s3_lattice_crash_index_decl.ltdb";
+    const killed = "/tmp/s3_lattice_crash_index_decl_killed.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+    cleanup(killed);
+    defer cleanup(killed);
+
+    const config = DatabaseConfig{ .enable_fts = true, .enable_vector = false };
+    var db = try Database.open(allocator, path, .{ .create = true, .config = config });
+    defer db.close();
+
+    var txn = try db.beginTransaction(.read_write);
+    const node = try db.createNode(&txn, &.{"Person"});
+    try db.setNodeProperty(&txn, node, "email", .{ .string_val = "a@example.com" });
+    try db.setNodeProperty(&txn, node, "bio", .{ .string_val = "graph databases" });
+    try db.commitTransaction(&txn);
+    try db.createNodeFtsIndex("Person", "bio");
+    try db.sync();
+
+    // Nothing is written after each call returns: no commit, no flush, no
+    // close. What it did has to be in the file already.
+    try db.createNodePropertyIndex("Person", "email");
+    try copyAsIfKilled(allocator, path, killed);
+    {
+        var reopened = try Database.open(allocator, killed, .{ .config = config });
+        defer reopened.close();
+        try std.testing.expect(try reopened.hasNodePropertyIndex("Person", "email"));
+        try std.testing.expect(try reopened.nodeExists(node));
+    }
+    cleanup(killed);
+
+    try db.dropNodePropertyIndex("Person", "email");
+    try db.dropNodeFtsIndex("Person", "bio");
+    try copyAsIfKilled(allocator, path, killed);
+    {
+        var reopened = try Database.open(allocator, killed, .{ .config = config });
+        defer reopened.close();
+        try std.testing.expect(!try reopened.hasNodePropertyIndex("Person", "email"));
+        try std.testing.expect(!try reopened.hasNodeFtsIndex("Person", "bio"));
+    }
+}
+
+/// The edges a node leaves by and arrives by, as ids, for comparing with
+/// what a test created.
+fn expectEdgesOnce(db: *Database, allocator: std.mem.Allocator, nodes: []const NodeId, edges: []const [3]u64) !void {
+    var out_total: usize = 0;
+    var in_total: usize = 0;
+    for (nodes) |node| {
+        const out = try db.getOutgoingEdgeRefsInTxn(null, node);
+        defer allocator.free(out);
+        const in = try db.getIncomingEdgeRefsInTxn(null, node);
+        defer allocator.free(in);
+        out_total += out.len;
+        in_total += in.len;
+        for (edges) |edge| {
+            var seen_out: usize = 0;
+            for (out) |ref| {
+                if (ref.id == edge[0]) seen_out += 1;
+            }
+            var seen_in: usize = 0;
+            for (in) |ref| {
+                if (ref.id == edge[0]) seen_in += 1;
+            }
+            try std.testing.expectEqual(@as(usize, @intFromBool(edge[1] == node)), seen_out);
+            try std.testing.expectEqual(@as(usize, @intFromBool(edge[2] == node)), seen_in);
+        }
+    }
+    try std.testing.expectEqual(edges.len, out_total);
+    try std.testing.expectEqual(edges.len, in_total);
+    // Two traversal keys and one record for each edge, and nothing else but
+    // the id counter the id index keeps under key 0.
+    try std.testing.expectEqual(@as(u64, edges.len * 2), (try db.edge_tree.spaceStats()).entries);
+    try std.testing.expectEqual(@as(u64, edges.len + 1), (try db.edge_id_tree.spaceStats()).entries);
+}
+
+test "a large commit cut short among its sorted traversal keys recovers whole" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_sorted_keys.ltdb";
+    const killed = "/tmp/lattice_crash_sorted_keys_killed.ltdb";
+    defer cleanup(path);
+    defer cleanup(killed);
+
+    const new_edges = 4 * Database.sorted_edge_apply_min;
+    // How many of the transaction's traversal keys reach the file before the
+    // apply fails: none, one, some, all but one. The records never do.
+    for ([_]usize{ 0, 1, new_edges / 2 + 3, new_edges, 2 * new_edges - 1 }) |keys_written| {
+        cleanup(path);
+        cleanup(killed);
+
+        var nodes: [20]NodeId = undefined;
+        // id, source, target of every edge the database should end up with.
+        var edges: std.ArrayListUnmanaged([3]u64) = .empty;
+        defer edges.deinit(allocator);
+        var updated: EdgeId = undefined;
+        var deleted: EdgeId = undefined;
+        {
+            var db = try openCrashTestDb(allocator, path, true);
+            defer db.close();
+
+            var txn = try db.beginTransaction(.read_write);
+            for (&nodes) |*node| node.* = try db.createNode(&txn, &.{"P"});
+            for (0..10) |i| {
+                const source = nodes[i];
+                const target = nodes[(i * 7 + 3) % nodes.len];
+                const id = try db.createEdgeAndGetId(&txn, source, target, "OLD");
+                try edges.append(allocator, .{ id, source, target });
+            }
+            try db.commitTransaction(&txn);
+            // The first transaction is in the file, whole.
+            try db.sync();
+            const keys_before = (try db.edge_tree.spaceStats()).entries;
+
+            txn = try db.beginTransaction(.read_write);
+            updated = edges.items[2][0];
+            try db.setEdgePropertyById(&txn, updated, "w", .{ .int_val = 42 });
+            deleted = edges.orderedRemove(5)[0];
+            try db.deleteEdgeById(&txn, deleted);
+            var state: u64 = keys_written + 1;
+            for (0..new_edges) |i| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                const source = nodes[@intCast((state >> 33) % nodes.len)];
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                const target = nodes[@intCast((state >> 33) % nodes.len)];
+                const id = try db.createEdgeAndGetId(&txn, source, target, "NEW");
+                if (i % 4 == 0) try db.setEdgePropertyById(&txn, id, "w", .{ .int_val = @intCast(i) });
+                try edges.append(allocator, .{ id, source, target });
+            }
+
+            db.fail_apply_after_edge_keys_for_testing = keys_written;
+            try std.testing.expectError(error.IoError, db.commitTransaction(&txn));
+
+            // The file now holds exactly that many of the new traversal
+            // keys, and not one of the new records: nothing is left dirty in
+            // the pool, and the stores read what was written.
+            try std.testing.expectEqual(@as(usize, 0), db.buffer_pool.dirtyCount());
+            try std.testing.expectEqual(keys_before + keys_written, (try db.edge_tree.spaceStats()).entries);
+            try std.testing.expectError(error.NotFound, db.edge_store.getById(edges.items[edges.items.len - 1][0]));
+            try std.testing.expectError(error.IoError, db.beginTransaction(.read_only));
+
+            copyAsIfKilled(allocator, path, killed) catch |err| return skipIfLockedOnWindows(err);
+        }
+
+        // Killed there, or closed there: the log finishes the transaction.
+        for ([_][]const u8{ killed, path }) |reopened| {
+            var db = try openCrashTestDb(allocator, reopened, false);
+            defer db.close();
+            try expectEdgesOnce(db, allocator, &nodes, edges.items);
+            try std.testing.expectError(error.NotFound, db.edge_store.getById(deleted));
+
+            var changed = try db.edge_store.getById(updated);
+            defer changed.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 1), changed.properties.len);
+            try std.testing.expectEqual(@as(i64, 42), changed.properties[0].value.int_val);
+
+            var weighted: usize = 0;
+            for (edges.items) |edge| {
+                var stored = try db.edge_store.getById(edge[0]);
+                defer stored.deinit(allocator);
+                try std.testing.expectEqual(edge[1], stored.source);
+                try std.testing.expectEqual(edge[2], stored.target);
+                weighted += stored.properties.len;
+            }
+            try std.testing.expectEqual(@as(usize, 1 + new_edges / 4), weighted);
+
+            // And the database goes on from there.
+            var txn = try db.beginTransaction(.read_write);
+            _ = try db.createEdgeAndGetId(&txn, nodes[0], nodes[1], "AFTER");
+            try db.commitTransaction(&txn);
+        }
+    }
+}
+
+test "a large commit of edges is rebuilt from the log alone" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/lattice_crash_sorted_rebuild.ltdb";
+    cleanup(path);
+    defer cleanup(path);
+
+    var nodes: [12]NodeId = undefined;
+    var edges: std.ArrayListUnmanaged([3]u64) = .empty;
+    defer edges.deinit(allocator);
+    {
+        var db = try openCrashTestDb(allocator, path, true);
+        defer db.close();
+        var txn = try db.beginTransaction(.read_write);
+        for (&nodes) |*node| node.* = try db.createNode(&txn, &.{"P"});
+        try db.commitTransaction(&txn);
+
+        txn = try db.beginTransaction(.read_write);
+        for (0..3 * Database.sorted_edge_apply_min) |i| {
+            const source = nodes[i % nodes.len];
+            const target = nodes[(i * 5 + 1) % nodes.len];
+            const id = try db.createEdgeAndGetId(&txn, source, target, "R");
+            try edges.append(allocator, .{ id, source, target });
+        }
+        try db.commitTransaction(&txn);
+    }
+    try simulateCrash(path);
+
+    var db = try openCrashTestDb(allocator, path, false);
+    defer db.close();
+    try expectEdgesOnce(db, allocator, &nodes, edges.items);
 }

@@ -69,12 +69,15 @@ def _find_library() -> Optional[Path]:
     if package_lib.exists():
         return package_lib
 
-    # 3. Installed prefix override
+    # 3. Installed prefix override. An installed Windows DLL sits in bin/,
+    # with only the import library under lib/.
     prefix = os.environ.get("LATTICE_PREFIX")
     if prefix:
-        prefix_lib = Path(prefix) / "lib" / lib_name
-        if prefix_lib.exists():
-            return prefix_lib
+        prefix_dirs = ["bin", "lib"] if sys.platform == "win32" else ["lib"]
+        for prefix_dir in prefix_dirs:
+            prefix_lib = Path(prefix) / prefix_dir / lib_name
+            if prefix_lib.exists():
+                return prefix_lib
 
     # 4. Development: relative to bindings (zig-out/lib). Windows keeps the DLL
     # beside the executables and leaves only the import library under lib/.
@@ -138,6 +141,9 @@ LATTICE_ERROR_OUT_OF_MEMORY = -13
 LATTICE_ERROR_UNSUPPORTED = -14
 LATTICE_ERROR_VALUE_TOO_LARGE = -15
 LATTICE_ERROR_DATABASE_LOCKED = -16
+LATTICE_ERROR_HAS_RELATIONSHIPS = -17
+LATTICE_ERROR_CONFIG_MISMATCH = -18
+LATTICE_ERROR_NEEDS_NEWER_WRITER = -19
 
 
 # Exception classes
@@ -201,6 +207,39 @@ class LatticeDatabaseLockedError(LatticeError):
     pass
 
 
+class LatticeHasRelationshipsError(LatticeError):
+    """A plain delete was refused because the node still has relationships.
+
+    Deleting the node alone would leave edges pointing at nothing. Use
+    ``delete_node(node_id, detach=True)`` to delete the node with its
+    relationships.
+    """
+
+    pass
+
+
+class LatticeConfigMismatchError(LatticeError):
+    """The open options contradict the vector index the database file records.
+
+    Raised when ``vector_dimensions`` (with vectors enabled), ``vector_metric``,
+    ``vector_m`` or ``vector_ef_construction`` differ from the file's index.
+    Nothing was read with the wrong configuration.
+    """
+
+    pass
+
+
+class LatticeNeedsNewerWriterError(LatticeError):
+    """The database file was written by a newer release that does not let this
+    one write it.
+
+    The file opens with ``read_only=True``. A writable open fails with this
+    error and writes nothing.
+    """
+
+    pass
+
+
 class LatticeReadOnlyError(LatticeError):
     """Cannot write to read-only database/transaction."""
 
@@ -243,6 +282,16 @@ class LatticeValueTooLargeError(LatticeError):
     pass
 
 
+class LatticeChangesTrimmedError(LatticeNotFoundError):
+    """The changefeed no longer holds the events after the position read from.
+
+    Its retention policy, or a trim, dropped them: the reader has missed
+    changes. Reading from ``after_sequence=0`` starts at the oldest event held.
+    """
+
+    pass
+
+
 class LatticeQueryError(LatticeError):
     """Rich query execution error with stage-aware diagnostics."""
 
@@ -279,6 +328,9 @@ _ERROR_MAP = {
     LATTICE_ERROR_UNSUPPORTED: LatticeUnsupportedError,
     LATTICE_ERROR_VALUE_TOO_LARGE: LatticeValueTooLargeError,
     LATTICE_ERROR_DATABASE_LOCKED: LatticeDatabaseLockedError,
+    LATTICE_ERROR_HAS_RELATIONSHIPS: LatticeHasRelationshipsError,
+    LATTICE_ERROR_CONFIG_MISMATCH: LatticeConfigMismatchError,
+    LATTICE_ERROR_NEEDS_NEWER_WRITER: LatticeNeedsNewerWriterError,
 }
 
 
@@ -450,6 +502,57 @@ class OpenOptionsV4(Structure):
     ]
 
 
+# lattice_open_options_v5 enum values. 0 means "not set" for each.
+LATTICE_SYNC_MODE_FULL = 1
+LATTICE_SYNC_MODE_NORMAL = 2
+LATTICE_FULL_FSYNC_OFF = 1
+LATTICE_FULL_FSYNC_ON = 2
+LATTICE_VECTOR_METRIC_COSINE = 1
+LATTICE_VECTOR_METRIC_EUCLIDEAN = 2
+LATTICE_VECTOR_METRIC_DOT_PRODUCT = 3
+LATTICE_CHANGEFEED_RETENTION_ALL = 1
+LATTICE_CHANGEFEED_RETENTION_LAST = 2
+LATTICE_CHANGEFEED_RETENTION_AGE = 3
+LATTICE_CHANGEFEED_RETENTION_OFF = 4
+
+
+class OpenOptionsV5(Structure):
+    _fields_ = [
+        ("struct_size", c_size_t),
+        ("create", c_bool),
+        ("read_only", c_bool),
+        ("cache_size_mb", c_uint32),
+        ("page_size", c_uint32),
+        ("enable_vector", c_bool),
+        ("vector_dimensions", c_uint16),
+        ("enable_wal", c_bool),
+        ("enable_adjacency_cache", c_bool),
+        ("lock", c_bool),
+        ("sync_mode", ctypes.c_uint8),
+        ("full_fsync", ctypes.c_uint8),
+        ("vector_metric", ctypes.c_uint8),
+        ("vector_m", c_uint16),
+        ("vector_ef_construction", c_uint16),
+        ("changefeed_retention", ctypes.c_uint8),
+        ("changefeed_retention_value", c_uint64),
+    ]
+
+
+# lattice_checkpoint_mode values.
+LATTICE_CHECKPOINT_PASSIVE = 0
+LATTICE_CHECKPOINT_FULL = 1
+LATTICE_CHECKPOINT_TRUNCATE = 2
+
+
+class LatticeCheckpointStats(Structure):
+    _fields_ = [
+        ("pages_flushed", c_uint32),
+        ("duration_ns", c_uint64),
+        ("checkpoint_lsn", c_uint64),
+        ("wal_truncated", c_bool),
+    ]
+
+
 # Type aliases
 LatticeDatabase = c_void_p
 LatticeTxn = c_void_p
@@ -491,8 +594,15 @@ class LatticeLib:
         self._has_lattice_open_v2 = hasattr(self._lib, "lattice_open_v2")
         self._has_lattice_open_v3 = hasattr(self._lib, "lattice_open_v3")
         self._has_lattice_open_v4 = hasattr(self._lib, "lattice_open_v4")
+        self._has_lattice_open_v5 = hasattr(self._lib, "lattice_open_v5")
+        self._has_node_detach_delete = hasattr(self._lib, "lattice_node_detach_delete")
         self._has_serialize = hasattr(self._lib, "lattice_serialize")
+        self._has_changefeed_status = hasattr(self._lib, "lattice_changefeed_status")
         self._has_deserialize_borrowed = hasattr(self._lib, "lattice_deserialize_borrowed")
+        self._has_deserialize_v5 = hasattr(self._lib, "lattice_deserialize_v5")
+        self._has_deserialize_borrowed_v5 = hasattr(self._lib, "lattice_deserialize_borrowed_v5")
+        self._has_checkpoint = hasattr(self._lib, "lattice_checkpoint")
+        self._has_set_auto_checkpoint = hasattr(self._lib, "lattice_set_auto_checkpoint")
         self._setup_functions()
 
     def _setup_functions(self) -> None:
@@ -529,6 +639,26 @@ class LatticeLib:
             ]
             self._lib.lattice_open_v4.restype = c_int
 
+        if self._has_lattice_open_v5:
+            self._lib.lattice_open_v5.argtypes = [
+                c_char_p,
+                POINTER(OpenOptionsV5),
+                POINTER(LatticeDatabase),
+            ]
+            self._lib.lattice_open_v5.restype = c_int
+
+        if self._has_changefeed_status:
+            self._lib.lattice_changefeed_status.argtypes = [
+                LatticeDatabase,
+                POINTER(ctypes.c_uint8),
+                POINTER(c_uint64),
+                POINTER(c_uint64),
+                POINTER(c_uint64),
+            ]
+            self._lib.lattice_changefeed_status.restype = c_int
+            self._lib.lattice_changefeed_trim.argtypes = [LatticeDatabase, POINTER(c_uint64)]
+            self._lib.lattice_changefeed_trim.restype = c_int
+
         if self._has_serialize:
             self._lib.lattice_serialize.argtypes = [
                 LatticeDatabase,
@@ -555,9 +685,43 @@ class LatticeLib:
             ]
             self._lib.lattice_deserialize_borrowed.restype = c_int
 
+        if self._has_deserialize_v5:
+            self._lib.lattice_deserialize_v5.argtypes = [
+                POINTER(c_ubyte),
+                c_size_t,
+                POINTER(OpenOptionsV5),
+                POINTER(LatticeDatabase),
+            ]
+            self._lib.lattice_deserialize_v5.restype = c_int
+
+        if self._has_deserialize_borrowed_v5:
+            self._lib.lattice_deserialize_borrowed_v5.argtypes = [
+                POINTER(c_ubyte),
+                c_size_t,
+                POINTER(OpenOptionsV5),
+                POINTER(LatticeDatabase),
+            ]
+            self._lib.lattice_deserialize_borrowed_v5.restype = c_int
+
         # lattice_close
         self._lib.lattice_close.argtypes = [LatticeDatabase]
         self._lib.lattice_close.restype = c_int
+
+        if self._has_checkpoint:
+            self._lib.lattice_checkpoint.argtypes = [
+                LatticeDatabase,
+                c_int,
+                POINTER(LatticeCheckpointStats),
+            ]
+            self._lib.lattice_checkpoint.restype = c_int
+
+        if self._has_set_auto_checkpoint:
+            self._lib.lattice_set_auto_checkpoint.argtypes = [
+                LatticeDatabase,
+                c_uint64,
+                c_uint64,
+            ]
+            self._lib.lattice_set_auto_checkpoint.restype = c_int
 
         # lattice_begin
         self._lib.lattice_begin.argtypes = [
@@ -602,6 +766,10 @@ class LatticeLib:
         # lattice_node_delete
         self._lib.lattice_node_delete.argtypes = [LatticeTxn, LatticeNodeId]
         self._lib.lattice_node_delete.restype = c_int
+
+        if self._has_node_detach_delete:
+            self._lib.lattice_node_detach_delete.argtypes = [LatticeTxn, LatticeNodeId]
+            self._lib.lattice_node_detach_delete.restype = c_int
 
         # lattice_node_set_property
         self._lib.lattice_node_set_property.argtypes = [
@@ -815,6 +983,31 @@ class LatticeLib:
             c_uint32,
         ]
         self._lib.lattice_node_set_vector.restype = c_int
+
+        # lattice_node_get_vector
+        self._lib.lattice_node_get_vector.argtypes = [
+            LatticeTxn,
+            LatticeNodeId,
+            c_char_p,
+            POINTER(POINTER(ctypes.c_float)),
+            POINTER(c_uint32),
+        ]
+        self._lib.lattice_node_get_vector.restype = c_int
+
+        # lattice_free_vector
+        self._lib.lattice_free_vector.argtypes = [
+            POINTER(ctypes.c_float),
+            c_uint32,
+        ]
+        self._lib.lattice_free_vector.restype = None
+
+        # lattice_node_remove_vector
+        self._lib.lattice_node_remove_vector.argtypes = [
+            LatticeTxn,
+            LatticeNodeId,
+            c_char_p,
+        ]
+        self._lib.lattice_node_remove_vector.restype = c_int
 
         # lattice_batch_insert
         self._lib.lattice_batch_insert.argtypes = [
@@ -1083,7 +1276,8 @@ class LatticeLib:
             c_uint32,
             POINTER(LatticeNodeId),
             POINTER(LatticeNodeId),
-            POINTER(c_char_p),
+            # A (pointer, length) pair, read by length: not a C string.
+            POINTER(c_void_p),
             POINTER(c_uint32),
         ]
         self._lib.lattice_edge_result_get.restype = c_int
@@ -1283,6 +1477,32 @@ def check_error(code: int) -> None:
     raise exc_class(message, code)
 
 
+NO_VECTOR_INDEX_MESSAGE = (
+    "the database was created without a vector index; open it with "
+    "enable_vectors=True and vector_dimensions=<n> to add one"
+)
+
+
+def check_vector_error(code: int, action: str) -> None:
+    """Check the code of a call that needs the vector index.
+
+    Such a call returns LATTICE_ERROR_UNSUPPORTED on a database created
+    without one (LATTICE_ERROR_IO before 0.18.1), and the library's text for
+    that code does not say so.
+
+    Args:
+        code: The error code returned by the C API function.
+        action: What the call does, for the message ("set a vector").
+
+    Raises:
+        LatticeUnsupportedError: If the database has no vector index.
+        LatticeError: For any other error.
+    """
+    if code == LATTICE_ERROR_UNSUPPORTED:
+        raise LatticeUnsupportedError(f"cannot {action}: {NO_VECTOR_INDEX_MESSAGE}", code)
+    check_error(code)
+
+
 def check_query_error(code: int, query_ptr: Any) -> None:
     """Check query error code and raise query diagnostics when available.
 
@@ -1437,6 +1657,9 @@ def _python_to_value(py_val: Any, c_value: LatticeValue, refs: list[Any]) -> Non
         c_value.type = LATTICE_VALUE_BOOL
         c_value.data.bool_val = py_val
     elif isinstance(py_val, int):
+        # ctypes stores an out-of-range int modulo 2**64 without complaint.
+        if not -(2**63) <= py_val < 2**63:
+            raise OverflowError(f"integer {py_val} does not fit in a signed 64-bit value")
         c_value.type = LATTICE_VALUE_INT
         c_value.data.int_val = py_val
     elif isinstance(py_val, float):
